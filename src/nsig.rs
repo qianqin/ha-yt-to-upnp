@@ -97,6 +97,8 @@ fn decode_nsig_cached_at(
                         discard_cache(&player_hash, disk_cache.as_deref());
                     }
                 })?;
+            // An unusable answer from a player that ran is not a cache fault.
+            check_decoded(&n_value, &result.decoded)?;
 
             // Cache the preprocessed player if we got one back
             if let Some(ref pp) = result.preprocessed {
@@ -111,6 +113,18 @@ fn decode_nsig_cached_at(
         .map_err(|e| format!("spawn solver thread: {}", e))?
         .join()
         .map_err(|_| "solver thread panicked".to_string())?
+}
+
+fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
+    if decoded.is_empty() || decoded == n_value {
+        return Err(format!("nsig decode returned invalid result: '{}'", decoded));
+    }
+    tracing::info!(
+        "[nsig] decoded: {} -> {}",
+        n_value,
+        &decoded[..decoded.floor_char_boundary(16)]
+    );
+    Ok(())
 }
 
 /// A cached player that fails to run is never retried: drop it from memory
@@ -240,19 +254,10 @@ fn decode_nsig_inner(
             .ok_or_else(|| {
                 format!(
                     "unexpected jsc response: {}",
-                    &result_json[..result_json.len().min(300)]
+                    &result_json[..result_json.floor_char_boundary(300)]
                 )
             })?;
 
-        if decoded.is_empty() || decoded == n_value {
-            return Err(format!("nsig decode returned invalid result: '{}'", decoded));
-        }
-
-        tracing::info!(
-            "[nsig] decoded: {} -> {}",
-            n_value,
-            &decoded[..decoded.len().min(16)]
-        );
         Ok(DecodeResult {
             decoded: decoded.to_string(),
             preprocessed,
@@ -273,7 +278,7 @@ fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, _e: rquickjs::Error, stage: &str) -> St
                 "{} failed: {} | {}",
                 stage,
                 msg,
-                &stack[..stack.len().min(300)]
+                &stack[..stack.floor_char_boundary(300)]
             )
         } else {
             format!("{} failed: {}", stage, msg)
@@ -332,6 +337,14 @@ mod tests {
         assert!(logs.contains("WARN"), "{logs}");
         assert!(logs.contains(path.to_str().unwrap()), "{logs}");
         assert!(!logs.contains("PREPROCESSED-PLAYER-BODY"), "{logs}");
+    }
+
+    #[test]
+    fn decoded_value_must_differ_from_input() {
+        assert!(check_decoded("abc", "").is_err());
+        assert!(check_decoded("abc", "abc").is_err());
+        // Multi-byte char across the 16-byte log cut.
+        check_decoded("abc", &format!("{}\u{20ac}tail", "x".repeat(15))).unwrap();
     }
 
     #[test]

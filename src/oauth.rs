@@ -124,12 +124,7 @@ async fn extract_client_credentials(
     // or simply <script ... src="..." ...> where src contains the base JS
     let base_js_url = extract_base_js_url(&tv_html)?;
 
-    // Make absolute URL if relative
-    let full_url = if base_js_url.starts_with("http") {
-        base_js_url
-    } else {
-        format!("https://www.youtube.com{}", base_js_url)
-    };
+    let full_url = base_js_full_url(&base_js_url)?;
 
     tracing::debug!("[oauth] fetching base.js from {}", full_url);
 
@@ -146,6 +141,26 @@ async fn extract_client_credentials(
     // Step 4: Extract client_id and client_secret
     // YouTube.js regex: clientId:"(?<client_id>[^"]+)",[^"]*?:"(?<client_secret>[^"]+)"
     extract_credentials_from_js(&base_js)
+}
+
+/// Absolute base.js URL to fetch; relative ones are on www.youtube.com.
+///
+/// An absolute URL comes from the /tv page and is only fetched from a Google
+/// host; errors and logs name the host only.
+fn base_js_full_url(base_js_url: &str) -> Result<String, String> {
+    if base_js_url.starts_with("http") {
+        if crate::sabr::stream::is_trusted_google_host(base_js_url) {
+            return Ok(base_js_url.to_string());
+        }
+        let host = reqwest::Url::parse(base_js_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "<unparseable>".to_owned());
+        tracing::warn!("[oauth] refusing base.js on untrusted host {}", host);
+        Err(format!("base.js URL on untrusted host {}", host))
+    } else {
+        Ok(format!("https://www.youtube.com{}", base_js_url))
+    }
 }
 
 fn extract_base_js_url(html: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,7 +213,7 @@ fn extract_credentials_from_js(
             // Now find the client_secret — it's the next quoted value after a ":"
             let after_cid = &rest[cid_end + 1..];
             // Look for :"..." pattern within the next ~200 chars
-            let search_range = &after_cid[..after_cid.len().min(200)];
+            let search_range = &after_cid[..after_cid.floor_char_boundary(200)];
             if let Some(sec_pos) = search_range.find(":\"") {
                 let sec_rest = &search_range[sec_pos + 2..];
                 if let Some(sec_end) = sec_rest.find('"') {
@@ -572,6 +587,40 @@ mod tests {
         assert!(logs.contains("extracted client credentials"), "{logs}");
         assert!(!logs.contains("CLIENT-ID"), "{logs}");
         assert!(!logs.contains("CLIENT-SECRET"), "{logs}");
+    }
+
+    #[test]
+    fn credential_extraction_survives_multibyte_char_at_search_cut() {
+        // The secret search window ends at byte 200 after the client_id's
+        // closing quote; put a 3-byte char across that cut.
+        let after_cid = format!(",y:\"SEC\"{}\u{20ac}rest", "a".repeat(191));
+        assert!(!after_cid.is_char_boundary(200));
+        let js = format!("x={{clientId:\"ID\"{after_cid}}}");
+        let (client_id, client_secret) = extract_credentials_from_js(&js).unwrap();
+        assert_eq!((client_id.as_str(), client_secret.as_str()), ("ID", "SEC"));
+    }
+
+    #[test]
+    fn base_js_url_must_be_on_a_google_host() {
+        assert_eq!(
+            base_js_full_url("/s/player/abc/base.js").unwrap(),
+            "https://www.youtube.com/s/player/abc/base.js"
+        );
+        assert_eq!(
+            base_js_full_url("https://www.youtube.com/s/player/abc/base.js").unwrap(),
+            "https://www.youtube.com/s/player/abc/base.js"
+        );
+        for url in ["https://evil.example/s/player/abc/base.js?k=SECRET", "http://www.youtube.com/base.js"] {
+            let err = base_js_full_url(url).unwrap_err();
+            assert!(!err.contains("SECRET") && !err.contains("/s/player"), "{err}");
+        }
+        let mut result = None;
+        let logs = capture_logs(|| {
+            result = Some(base_js_full_url("https://evil.example/s/player/abc/base.js?k=SECRET"))
+        });
+        assert!(result.unwrap().unwrap_err().contains("evil.example"));
+        assert!(logs.contains("evil.example"), "{logs}");
+        assert!(!logs.contains("SECRET"), "{logs}");
     }
 
     // Needles are split with concat! so this test does not match itself.
