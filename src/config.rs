@@ -108,7 +108,7 @@ impl Config {
         Self::path_for(crate::storage::data_dir_env().as_deref())
     }
 
-    fn path_for(data_dir: Option<&str>) -> Result<PathBuf> {
+    fn path_for(data_dir: Option<&std::path::Path>) -> Result<PathBuf> {
         let config_dir = crate::storage::config_dir(data_dir).ok_or(ConfigError::NoHomeDir)?;
         Ok(config_dir.join("ytcast-lite.json"))
     }
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn saved_under_data_dir_and_read_back() {
         let tmp = TempDir::new("config-roundtrip");
-        let path = Config::path_for(Some(tmp.as_str())).unwrap();
+        let path = Config::path_for(Some(tmp.path())).unwrap();
         assert_eq!(path, tmp.path().join("ytcast-lite.json"));
 
         let config = Config {

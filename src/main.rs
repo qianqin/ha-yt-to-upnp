@@ -82,6 +82,9 @@ fn log_memory() {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Init logging
     tracing_subscriber::fmt::init();
+    if let Some(dir) = storage::data_dir_env() {
+        storage::warn_if_relative_data_dir(&dir);
+    }
 
     // 2. Load/create config
     let mut config = config::Config::load()?;
@@ -258,7 +261,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         uuid: config.uuid.clone(),
         local_ip,
         port: dial_port,
-        http_client: http_client.clone(),
         ctt: std::sync::RwLock::new(None),
         yt_cookies: yt_cookies.clone(),
         yt_session: yt_session.clone(),
@@ -1408,7 +1410,13 @@ async fn test_oauth_player(
                     let mut proto_buf = Vec::new();
                     sabr_req.encode(&mut proto_buf)?;
 
-                    let sabr_full_url = format!("{}&rn=0", sabr_url);
+                    let sabr_full_url = match sabr_probe_url(sabr_url) {
+                        Ok(url) => url,
+                        Err(host) => {
+                            println!("SABR probe: refusing untrusted host {}", host);
+                            continue;
+                        }
+                    };
                     println!("SABR POST to host: {}", url_host(&sabr_full_url));
 
                     // Try SABR: no auth first (baseline), then with Bearer (Premium test)
@@ -1431,15 +1439,17 @@ async fn test_oauth_player(
                                 .header("Authorization", format!("Bearer {}", token));
                         }
 
+                        // Signed streaming URLs are credentials; reqwest errors would print them.
                         let sabr_resp = sabr_req_builder
                             .body(proto_buf.clone())
                             .send()
-                            .await?;
+                            .await
+                            .map_err(|e| e.without_url())?;
 
                     println!("  HTTP: {}", sabr_resp.status());
 
                     if sabr_resp.status().is_success() {
-                        let sabr_bytes = sabr_resp.bytes().await?;
+                        let sabr_bytes = sabr_resp.bytes().await.map_err(|e| e.without_url())?;
                         println!("  Response: {} bytes", sabr_bytes.len());
 
                         // Parse UMP response using the real YouTube varint format
@@ -1505,6 +1515,17 @@ async fn test_oauth_player(
     Ok(())
 }
 
+/// The SABR probe URL, or the host to report if `sabr_url` is not on a Google
+/// host: the probe attaches the OAuth Bearer token, so it must not follow a
+/// server-supplied URL anywhere else.
+fn sabr_probe_url(sabr_url: &str) -> Result<String, String> {
+    if sabr::stream::is_trusted_google_host(sabr_url) {
+        Ok(format!("{}&rn=0", sabr_url))
+    } else {
+        Err(url_host(sabr_url))
+    }
+}
+
 /// Host part of a URL for diagnostics; the full URL carries session parameters.
 fn url_host(url: &str) -> String {
     reqwest::Url::parse(url)
@@ -1534,6 +1555,22 @@ mod log_hygiene_tests {
         ] {
             assert!(!src.contains(needle), "secret-logging format string found: {needle}");
         }
+    }
+
+    #[test]
+    fn sabr_probe_refuses_untrusted_host() {
+        assert_eq!(
+            super::sabr_probe_url("https://evil.example/videoplayback?sig=SECRET"),
+            Err("evil.example".to_string())
+        );
+        assert_eq!(
+            super::sabr_probe_url("http://rr1---sn-abc.googlevideo.com/videoplayback?sig=SECRET"),
+            Err("rr1---sn-abc.googlevideo.com".to_string())
+        );
+        assert_eq!(
+            super::sabr_probe_url("https://rr1---sn-abc.googlevideo.com/videoplayback?sig=S"),
+            Ok("https://rr1---sn-abc.googlevideo.com/videoplayback?sig=S&rn=0".to_string())
+        );
     }
 
     #[test]

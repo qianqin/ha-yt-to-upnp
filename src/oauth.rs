@@ -131,7 +131,7 @@ async fn extract_client_credentials(
         format!("https://www.youtube.com{}", base_js_url)
     };
 
-    tracing::info!("[oauth] fetching base.js from {}", full_url);
+    tracing::debug!("[oauth] fetching base.js from {}", full_url);
 
     // Step 3: Fetch base.js
     let base_js = http
@@ -205,11 +205,7 @@ fn extract_credentials_from_js(
                     let client_secret = sec_rest[..sec_end].to_string();
 
                     if !client_id.is_empty() && !client_secret.is_empty() {
-                        tracing::info!(
-                            "[oauth] extracted client_id={}, secret={}...",
-                            &client_id[..client_id.len().min(20)],
-                            &client_secret[..client_secret.len().min(10)],
-                        );
+                        tracing::info!("[oauth] extracted client credentials");
                         return Ok((client_id, client_secret));
                     }
                 }
@@ -495,7 +491,7 @@ pub fn credentials_path() -> Result<std::path::PathBuf, Box<dyn std::error::Erro
 }
 
 fn credentials_path_for(
-    data_dir: Option<&str>,
+    data_dir: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let config_dir =
         crate::storage::config_dir(data_dir).ok_or("could not determine config directory")?;
@@ -566,6 +562,33 @@ mod tests {
     }
 
     #[test]
+    fn credential_extraction_logs_no_credential_fragments() {
+        let js = r#"x={clientId:"CLIENT-ID-1234567890-abcdef.apps.example",y:"CLIENT-SECRET-xyz"}"#;
+        let mut extracted = None;
+        let logs = capture_logs(|| extracted = Some(extract_credentials_from_js(js).unwrap()));
+        let (client_id, client_secret) = extracted.unwrap();
+        assert_eq!(client_id, "CLIENT-ID-1234567890-abcdef.apps.example");
+        assert_eq!(client_secret, "CLIENT-SECRET-xyz");
+        assert!(logs.contains("extracted client credentials"), "{logs}");
+        assert!(!logs.contains("CLIENT-ID"), "{logs}");
+        assert!(!logs.contains("CLIENT-SECRET"), "{logs}");
+    }
+
+    // Needles are split with concat! so this test does not match itself.
+    #[test]
+    fn credential_log_formats_are_gone() {
+        let src = include_str!("oauth.rs");
+        for needle in [
+            concat!("extracted client_id", "={}"),
+            concat!("secret", "={}..."),
+            concat!("&client_secret[..", "client_secret.len()"),
+            concat!("info!(\"[oauth] fetching base.js", " from"),
+        ] {
+            assert!(!src.contains(needle), "credential-logging format string found: {needle}");
+        }
+    }
+
+    #[test]
     fn path_unchanged_without_data_dir() {
         assert_eq!(
             credentials_path_for(None).unwrap(),
@@ -576,7 +599,7 @@ mod tests {
     #[test]
     fn saved_under_data_dir_privately_and_read_back() {
         let tmp = TempDir::new("oauth-roundtrip");
-        let path = credentials_path_for(Some(tmp.as_str())).unwrap();
+        let path = credentials_path_for(Some(tmp.path())).unwrap();
         assert_eq!(path, tmp.path().join("ytcast-oauth.json"));
 
         save_credentials_to(&sample(), &path).unwrap();

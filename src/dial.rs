@@ -33,8 +33,6 @@ pub struct DialState {
     pub local_ip: std::net::Ipv4Addr,
     /// Port this DIAL server listens on.
     pub port: u16,
-    /// Shared HTTP client for outbound requests (e.g. SABR streaming).
-    pub http_client: reqwest::Client,
     /// Credential transfer token from the casting session (YTM Premium auth).
     pub ctt: std::sync::RwLock<Option<String>>,
     /// YouTube cookies for Premium auth (only sent with WEB_REMIX /player calls).
@@ -370,7 +368,6 @@ mod tests {
             uuid: "00000000-0000-0000-0000-000000000000".to_string(),
             local_ip: Ipv4Addr::new(192, 0, 2, 1),
             port: 8008,
-            http_client: reqwest::Client::new(),
             ctt: std::sync::RwLock::new(None),
             yt_cookies: None,
             yt_session: None,

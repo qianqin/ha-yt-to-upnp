@@ -27,19 +27,15 @@ fn cache_path(player_hash: &str) -> Option<PathBuf> {
     cache_path_in(crate::storage::data_dir_env().as_deref(), player_hash)
 }
 
-fn cache_path_in(data_dir: Option<&str>, player_hash: &str) -> Option<PathBuf> {
+fn cache_path_in(data_dir: Option<&std::path::Path>, player_hash: &str) -> Option<PathBuf> {
     crate::storage::nsig_cache_dir(data_dir)
         .map(|d| d.join(format!("nsig-preprocessed-{}.js", player_hash)))
-}
-
-/// Load preprocessed player from disk cache.
-fn load_disk_cache(player_hash: &str) -> Option<String> {
-    load_disk_cache_at(&cache_path(player_hash)?)
 }
 
 fn load_disk_cache_at(path: &std::path::Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(s) if !s.is_empty() => {
+            crate::storage::warn_if_loose_permissions(path);
             tracing::info!("[nsig] loaded disk cache: {} ({} bytes)", path.display(), s.len());
             Some(s)
         }
@@ -47,18 +43,10 @@ fn load_disk_cache_at(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Save preprocessed player to disk cache.
-fn save_disk_cache(player_hash: &str, preprocessed: &str) {
-    if let Some(path) = cache_path(player_hash) {
-        save_disk_cache_at(&path, preprocessed);
-    }
-}
-
+/// The cached JS is executed later, so it is written like a credential:
+/// atomically, 0600, replacing (not following) whatever is at `path`.
 fn save_disk_cache_at(path: &std::path::Path, preprocessed: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = crate::storage::create_private_dir_all(parent);
-    }
-    match std::fs::write(path, preprocessed) {
+    match crate::storage::write_private_atomic(path, preprocessed.as_bytes()) {
         Ok(()) => tracing::info!("[nsig] saved disk cache: {} ({} bytes)", path.display(), preprocessed.len()),
         Err(e) => tracing::warn!("[nsig] failed to save disk cache: {}", e),
     }
@@ -71,6 +59,15 @@ fn save_disk_cache_at(path: &std::path::Path, preprocessed: &str) {
 /// Subsequent calls (same hash) reuse cached preprocessed player (~0.6s).
 /// Cache persists to disk so reboots don't trigger re-parse.
 pub fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<String, String> {
+    decode_nsig_cached_at(player_js, n_value, player_hash, cache_path(player_hash))
+}
+
+fn decode_nsig_cached_at(
+    player_js: &str,
+    n_value: &str,
+    player_hash: &str,
+    disk_cache: Option<PathBuf>,
+) -> Result<String, String> {
     let player_js = player_js.to_owned();
     let n_value = n_value.to_owned();
     let player_hash = player_hash.to_owned();
@@ -88,18 +85,25 @@ pub fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<
             None
         }
     };
-    let cached = cached.or_else(|| load_disk_cache(&player_hash));
+    let cached = cached.or_else(|| load_disk_cache_at(disk_cache.as_deref()?));
 
     std::thread::Builder::new()
         .name("nsig-solver".into())
         .stack_size(SOLVER_STACK_SIZE)
         .spawn(move || {
-            let result = decode_nsig_inner(&player_js, &n_value, cached.as_deref())?;
+            let result = decode_nsig_inner(&player_js, &n_value, cached.as_deref())
+                .inspect_err(|_| {
+                    if cached.is_some() {
+                        discard_cache(&player_hash, disk_cache.as_deref());
+                    }
+                })?;
 
             // Cache the preprocessed player if we got one back
             if let Some(ref pp) = result.preprocessed {
                 *PREPROCESSED_CACHE.lock().unwrap() = Some((player_hash.clone(), pp.clone()));
-                save_disk_cache(&player_hash, pp);
+                if let Some(ref path) = disk_cache {
+                    save_disk_cache_at(path, pp);
+                }
             }
 
             Ok(result.decoded)
@@ -107,6 +111,23 @@ pub fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<
         .map_err(|e| format!("spawn solver thread: {}", e))?
         .join()
         .map_err(|_| "solver thread panicked".to_string())?
+}
+
+/// A cached player that fails to run is never retried: drop it from memory
+/// and disk so the next call re-parses base.js.
+fn discard_cache(player_hash: &str, disk_cache: Option<&std::path::Path>) {
+    let mut guard = PREPROCESSED_CACHE.lock().unwrap();
+    if guard.as_ref().is_some_and(|(h, _)| h == player_hash) {
+        *guard = None;
+    }
+    drop(guard);
+    if let Some(path) = disk_cache {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::warn!("[nsig] discarded failing disk cache: {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("[nsig] failed to remove disk cache {}: {}", path.display(), e),
+        }
+    }
 }
 
 struct DecodeResult {
@@ -278,12 +299,52 @@ mod tests {
     #[test]
     fn cache_written_under_data_dir() {
         let tmp = TempDir::new("nsig-cache");
-        let path = cache_path_in(Some(tmp.as_str()), "abc").unwrap();
+        let path = cache_path_in(Some(tmp.path()), "abc").unwrap();
         assert_eq!(path, tmp.path().join("nsig-cache").join("nsig-preprocessed-abc.js"));
 
         save_disk_cache_at(&path, "preprocessed");
         assert_eq!(load_disk_cache_at(&path).as_deref(), Some("preprocessed"));
         #[cfg(unix)]
         assert_eq!(crate::storage::test_util::mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_file_is_private() {
+        let tmp = TempDir::new("nsig-mode");
+        let path = tmp.path().join("nsig-preprocessed-abc.js");
+        save_disk_cache_at(&path, "preprocessed");
+        assert_eq!(crate::storage::test_util::mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_cache_file_warns_with_path_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("nsig-loose");
+        let path = tmp.path().join("nsig-preprocessed-abc.js");
+        std::fs::write(&path, "PREPROCESSED-PLAYER-BODY").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let logs = crate::storage::test_util::capture_logs(|| {
+            assert!(load_disk_cache_at(&path).is_some());
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(path.to_str().unwrap()), "{logs}");
+        assert!(!logs.contains("PREPROCESSED-PLAYER-BODY"), "{logs}");
+    }
+
+    #[test]
+    fn corrupt_cache_is_removed_after_failed_run() {
+        let tmp = TempDir::new("nsig-corrupt");
+        let path = tmp.path().join("nsig-preprocessed-corrupt.js");
+        std::fs::write(&path, "this is not a preprocessed player").unwrap();
+
+        // Empty player JS: the fresh path is never taken, so no network or
+        // real base.js is involved.
+        let result = decode_nsig_cached_at("", "abc", "test-corrupt-cache", Some(path.clone()));
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!path.exists(), "corrupt cache file was kept");
     }
 }

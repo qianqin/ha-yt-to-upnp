@@ -13,34 +13,51 @@ use std::path::{Path, PathBuf};
 pub const DATA_DIR_ENV: &str = "YTCAST_DATA_DIR";
 
 /// The `YTCAST_DATA_DIR` value, if set and non-empty.
-pub fn data_dir_env() -> Option<String> {
-    std::env::var(DATA_DIR_ENV).ok().filter(|s| !s.is_empty())
+pub fn data_dir_env() -> Option<PathBuf> {
+    normalize_data_dir(std::env::var(DATA_DIR_ENV).ok())
+}
+
+/// An empty `YTCAST_DATA_DIR` means "unset".
+pub fn normalize_data_dir(value: Option<String>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// A relative data dir resolves against the working directory, which is
+/// rarely what a service wants; it is still used, but worth a startup warning.
+pub fn warn_if_relative_data_dir(dir: &Path) {
+    if !dir.is_absolute() {
+        tracing::warn!(
+            "{}={} is not an absolute path; it resolves against the working directory",
+            DATA_DIR_ENV,
+            dir.display()
+        );
+    }
 }
 
 /// Directory for config and OAuth credentials.
-pub fn config_dir(data_dir: Option<&str>) -> Option<PathBuf> {
+pub fn config_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
     match data_dir {
-        Some(d) => Some(PathBuf::from(d)),
+        Some(d) => Some(d.to_path_buf()),
         None => dirs::config_dir(),
     }
 }
 
 /// Directory for the preprocessed nsig player cache.
-pub fn nsig_cache_dir(data_dir: Option<&str>) -> Option<PathBuf> {
+pub fn nsig_cache_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
     match data_dir {
-        Some(d) => Some(Path::new(d).join("nsig-cache")),
+        Some(d) => Some(d.join("nsig-cache")),
         None => dirs::cache_dir().map(|d| d.join("ytcast")),
     }
 }
 
 /// Cookie file path: `YTM_COOKIES` wins, then `<data dir>/ytm-cookies.txt`,
 /// then `~/ytm-cookies.txt`.
-pub fn cookie_path(ytm_cookies: Option<&str>, data_dir: Option<&str>) -> String {
+pub fn cookie_path(ytm_cookies: Option<&str>, data_dir: Option<&Path>) -> String {
     if let Some(p) = ytm_cookies {
         return p.to_string();
     }
     let base = match data_dir {
-        Some(d) => Some(PathBuf::from(d)),
+        Some(d) => Some(d.to_path_buf()),
         None => dirs::home_dir(),
     };
     base.map(|b| b.join("ytm-cookies.txt").to_string_lossy().to_string())
@@ -93,8 +110,26 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.write_all(contents)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    sync_parent_dir(path);
+    Ok(())
 }
+
+/// Persist the rename itself. Best-effort: the file content is already
+/// synced, so a failure here only weakens crash durability.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
+        tracing::debug!("fsync of {} failed: {}", parent.display(), e);
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// Warn (path only, never contents) if a secret file is readable by group or
 /// others. Startup is not refused.
@@ -145,10 +180,6 @@ pub(crate) mod test_util {
 
         pub fn path(&self) -> &std::path::Path {
             &self.0
-        }
-
-        pub fn as_str(&self) -> &str {
-            self.0.to_str().unwrap()
         }
     }
 
@@ -209,21 +240,43 @@ mod tests {
 
     #[test]
     fn data_dir_set_moves_everything_under_it() {
-        assert_eq!(config_dir(Some("/data")), Some(PathBuf::from("/data")));
-        assert_eq!(nsig_cache_dir(Some("/data")), Some(Path::new("/data").join("nsig-cache")));
+        let data = Some(Path::new("/data"));
+        assert_eq!(config_dir(data), Some(PathBuf::from("/data")));
+        assert_eq!(nsig_cache_dir(data), Some(Path::new("/data").join("nsig-cache")));
+    }
+
+    #[test]
+    fn empty_data_dir_is_unset() {
+        assert_eq!(normalize_data_dir(None), None);
+        assert_eq!(normalize_data_dir(Some(String::new())), None);
+        assert_eq!(normalize_data_dir(Some("/data".into())), Some(PathBuf::from("/data")));
+        assert_eq!(
+            normalize_data_dir(Some("relative/dir".into())),
+            Some(PathBuf::from("relative/dir"))
+        );
+    }
+
+    #[test]
+    fn relative_data_dir_warns_absolute_does_not() {
+        let logs = capture_logs(|| warn_if_relative_data_dir(Path::new("relative/dir")));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("relative/dir"), "{logs}");
+        assert!(logs.contains(DATA_DIR_ENV), "{logs}");
+
+        assert_eq!(capture_logs(|| warn_if_relative_data_dir(Path::new("/data"))), "");
     }
 
     #[test]
     fn cookie_path_defaults_to_data_dir() {
         assert_eq!(
-            PathBuf::from(cookie_path(None, Some("/x"))),
+            PathBuf::from(cookie_path(None, Some(Path::new("/x")))),
             Path::new("/x").join("ytm-cookies.txt")
         );
     }
 
     #[test]
     fn cookie_path_env_wins_over_data_dir() {
-        assert_eq!(cookie_path(Some("/y/c.txt"), Some("/x")), "/y/c.txt");
+        assert_eq!(cookie_path(Some("/y/c.txt"), Some(Path::new("/x"))), "/y/c.txt");
         assert_eq!(cookie_path(Some("/y/c.txt"), None), "/y/c.txt");
     }
 
