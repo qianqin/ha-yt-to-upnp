@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,8 +65,10 @@ impl Config {
     /// Load config from disk, or create a new one with defaults if the file
     /// does not exist.
     pub fn load() -> Result<Self> {
-        let path = Self::path()?;
+        Self::load_from(&Self::path()?)
+    }
 
+    fn load_from(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(&path) {
             Ok(data) => {
                 let config: Config = serde_json::from_str(&data)?;
@@ -79,7 +81,7 @@ impl Config {
                     screen_id: String::new(),
                     screen_id_m: String::new(),
                 };
-                config.save()?;
+                config.save_to(path)?;
                 tracing::info!("created new config at {}", path.display());
                 Ok(config)
             }
@@ -87,26 +89,74 @@ impl Config {
         }
     }
 
-    /// Save config to disk, creating parent directories if needed.
-    /// Save config atomically: write to temp file, then rename.
+    /// Save config atomically (temp file + rename) as a private 0600 file.
     /// Prevents corruption on power loss (important for a Pi running 24/7).
     pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)
+    }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+    fn save_to(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::storage::write_private_atomic(path, json.as_bytes())?;
         Ok(())
     }
 
-    /// Get the config file path: `~/.config/ytcast-lite.json`
+    /// Config file path: `$YTCAST_DATA_DIR/ytcast-lite.json`, else
+    /// `~/.config/ytcast-lite.json`.
     fn path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir().ok_or(ConfigError::NoHomeDir)?;
+        Self::path_for(crate::storage::data_dir_env().as_deref())
+    }
+
+    fn path_for(data_dir: Option<&str>) -> Result<PathBuf> {
+        let config_dir = crate::storage::config_dir(data_dir).ok_or(ConfigError::NoHomeDir)?;
         Ok(config_dir.join("ytcast-lite.json"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_util::*;
+
+    #[test]
+    fn path_unchanged_without_data_dir() {
+        assert_eq!(
+            Config::path_for(None).unwrap(),
+            dirs::config_dir().unwrap().join("ytcast-lite.json")
+        );
+    }
+
+    #[test]
+    fn saved_under_data_dir_and_read_back() {
+        let tmp = TempDir::new("config-roundtrip");
+        let path = Config::path_for(Some(tmp.as_str())).unwrap();
+        assert_eq!(path, tmp.path().join("ytcast-lite.json"));
+
+        let config = Config {
+            uuid: "u".into(),
+            screen_id: "s".into(),
+            screen_id_m: "m".into(),
+        };
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.uuid, "u");
+        assert_eq!(loaded.screen_id, "s");
+        assert_eq!(loaded.screen_id_m, "m");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn missing_config_is_created_privately() {
+        let tmp = TempDir::new("config-create");
+        let path = tmp.path().join("sub/ytcast-lite.json");
+        let config = Config::load_from(&path).unwrap();
+        assert!(!config.uuid.is_empty());
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&tmp.path().join("sub")), 0o700);
+        }
     }
 }

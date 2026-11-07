@@ -45,6 +45,7 @@ pub fn load_cookie_file(
     path: &str,
 ) -> Result<Option<YtCookies>, Box<dyn std::error::Error + Send + Sync>> {
     let content = std::fs::read_to_string(path)?;
+    crate::storage::warn_if_loose_permissions(std::path::Path::new(path));
     let mut cookies = Vec::new();
     let mut sapisid: Option<String> = None;
     let mut sapisid_1p: Option<String> = None;

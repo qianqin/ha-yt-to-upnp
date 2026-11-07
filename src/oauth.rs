@@ -488,30 +488,44 @@ impl OAuthState {
 // Config persistence
 // ---------------------------------------------------------------------------
 
-/// Path for OAuth credentials: ~/.config/ytcast-oauth.json
+/// Path for OAuth credentials: `$YTCAST_DATA_DIR/ytcast-oauth.json`, else
+/// `~/.config/ytcast-oauth.json`.
 pub fn credentials_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let config_dir = dirs::config_dir().ok_or("could not determine config directory")?;
+    credentials_path_for(crate::storage::data_dir_env().as_deref())
+}
+
+fn credentials_path_for(
+    data_dir: Option<&str>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let config_dir =
+        crate::storage::config_dir(data_dir).ok_or("could not determine config directory")?;
     Ok(config_dir.join("ytcast-oauth.json"))
 }
 
 /// Load OAuth credentials from disk.
 pub fn load_credentials() -> OAuthCredentials {
-    let path = match credentials_path() {
-        Ok(p) => p,
-        Err(_) => return OAuthCredentials::default(),
-    };
+    match credentials_path() {
+        Ok(p) => load_credentials_from(&p),
+        Err(_) => OAuthCredentials::default(),
+    }
+}
 
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str(&data) {
-            Ok(creds) => {
-                tracing::info!("[oauth] loaded credentials from {}", path.display());
-                creds
+fn load_credentials_from(path: &std::path::Path) -> OAuthCredentials {
+    match std::fs::read_to_string(path) {
+        Ok(data) => {
+            crate::storage::warn_if_loose_permissions(path);
+            match serde_json::from_str(&data) {
+                Ok(creds) => {
+                    tracing::info!("[oauth] loaded credentials from {}", path.display());
+                    creds
+                }
+                // serde_json errors carry line/column only, never the input.
+                Err(e) => {
+                    tracing::warn!("[oauth] failed to parse {}: {}", path.display(), e);
+                    OAuthCredentials::default()
+                }
             }
-            Err(e) => {
-                tracing::warn!("[oauth] failed to parse {}: {}", path.display(), e);
-                OAuthCredentials::default()
-            }
-        },
+        }
         Err(_) => {
             tracing::info!("[oauth] no credentials at {}", path.display());
             OAuthCredentials::default()
@@ -519,20 +533,99 @@ pub fn load_credentials() -> OAuthCredentials {
     }
 }
 
-/// Save OAuth credentials to disk (atomic write).
+/// Save OAuth credentials to disk (atomic write, private 0600 file).
 pub fn save_credentials(
     creds: &OAuthCredentials,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = credentials_path()?;
+    save_credentials_to(creds, &credentials_path()?)
+}
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
+fn save_credentials_to(
+    creds: &OAuthCredentials,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let json = serde_json::to_string_pretty(creds)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::storage::write_private_atomic(path, json.as_bytes())?;
     tracing::info!("[oauth] saved credentials to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_util::*;
+
+    fn sample() -> OAuthCredentials {
+        OAuthCredentials {
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+            refresh_token: "REFRESH-TOKEN-VALUE".into(),
+            access_token: "ACCESS-TOKEN-VALUE".into(),
+            expiry_date: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn path_unchanged_without_data_dir() {
+        assert_eq!(
+            credentials_path_for(None).unwrap(),
+            dirs::config_dir().unwrap().join("ytcast-oauth.json")
+        );
+    }
+
+    #[test]
+    fn saved_under_data_dir_privately_and_read_back() {
+        let tmp = TempDir::new("oauth-roundtrip");
+        let path = credentials_path_for(Some(tmp.as_str())).unwrap();
+        assert_eq!(path, tmp.path().join("ytcast-oauth.json"));
+
+        save_credentials_to(&sample(), &path).unwrap();
+        let loaded = load_credentials_from(&path);
+        assert_eq!(loaded.refresh_token, "REFRESH-TOKEN-VALUE");
+        assert_eq!(loaded.access_token, "ACCESS-TOKEN-VALUE");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn save_and_load_never_log_token_values() {
+        let tmp = TempDir::new("oauth-nolog");
+        let path = tmp.path().join("ytcast-oauth.json");
+        let logs = capture_logs(|| {
+            save_credentials_to(&sample(), &path).unwrap();
+            load_credentials_from(&path);
+        });
+        assert!(!logs.contains("TOKEN-VALUE"), "{logs}");
+        assert!(!logs.contains("csecret"), "{logs}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_loose_file_makes_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("oauth-overwrite");
+        let path = tmp.path().join("ytcast-oauth.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_credentials_to(&sample(), &path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_loose_file_warns_with_path_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("oauth-loose");
+        let path = tmp.path().join("ytcast-oauth.json");
+        std::fs::write(&path, serde_json::to_string(&sample()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut loaded = OAuthCredentials::default();
+        let logs = capture_logs(|| loaded = load_credentials_from(&path));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(path.to_str().unwrap()), "{logs}");
+        assert!(!logs.contains("TOKEN-VALUE"), "{logs}");
+        // Loose permissions warn but do not refuse.
+        assert_eq!(loaded.refresh_token, "REFRESH-TOKEN-VALUE");
+    }
 }

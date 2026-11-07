@@ -9,6 +9,7 @@ mod nsig;
 mod oauth;
 mod sabr;
 mod ssdp;
+mod storage;
 
 use std::sync::Arc;
 
@@ -88,7 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.uuid = uuid::Uuid::new_v4().to_string();
         config.save()?;
     }
-    tracing::info!("[init] UUID: {}", config.uuid);
 
     // 3. Read env vars
     let device_name = std::env::var("DEVICE_NAME").unwrap_or_else(|_| "Living Room Pi".into());
@@ -100,11 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dial_port: u16 = 8008;
 
     // 4. Load YouTube cookies (for Premium auth — bypasses PoToken requirement)
-    let cookie_path = std::env::var("YTM_COOKIES").unwrap_or_else(|_| {
-        dirs::home_dir()
-            .map(|h| h.join("ytm-cookies.txt").to_string_lossy().to_string())
-            .unwrap_or_else(|| "ytm-cookies.txt".into())
-    });
+    let cookie_path = storage::cookie_path(
+        std::env::var("YTM_COOKIES").ok().as_deref(),
+        storage::data_dir_env().as_deref(),
+    );
 
     let yt_cookies = if std::path::Path::new(&cookie_path).exists() {
         match cookies::load_cookie_file(&cookie_path) {
@@ -1075,7 +1074,7 @@ async fn test_oauth_player(
     // 1. Get access token (login if needed)
     let token = match oauth.get_access_token().await {
         Some(t) => {
-            println!("Bearer token: {}...{}", &t[..8.min(t.len())], &t[t.len().saturating_sub(4)..]);
+            println!("Bearer token: present");
             t
         }
         None => {
@@ -1085,7 +1084,6 @@ async fn test_oauth_player(
     };
 
     let visitor_data = oauth::generate_visitor_data();
-    println!("Visitor data: {}", &visitor_data[..20.min(visitor_data.len())]);
 
     // 2. Test each client
     let clients: &[(&str, &str, &str, i32, &str)] = &[
@@ -1158,7 +1156,7 @@ async fn test_oauth_player(
 
         if !status_code.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            println!("Error body: {}", &text[..text.len().min(200)]);
+            println!("Error body: {} bytes", text.len());
             continue;
         }
 
@@ -1191,7 +1189,7 @@ async fn test_oauth_player(
 
         // SABR URL
         if let Some(sabr_url) = sd["serverAbrStreamingUrl"].as_str() {
-            println!("SABR URL: {}...{}", &sabr_url[..60.min(sabr_url.len())], &sabr_url[sabr_url.len().saturating_sub(30)..]);
+            println!("SABR URL: host {}", url_host(sabr_url));
         } else {
             println!("SABR URL: none");
         }
@@ -1410,7 +1408,7 @@ async fn test_oauth_player(
                     sabr_req.encode(&mut proto_buf)?;
 
                     let sabr_full_url = format!("{}&rn=0", sabr_url);
-                    println!("SABR POST to: {}...{}", &sabr_full_url[..60.min(sabr_full_url.len())], &sabr_full_url[sabr_full_url.len().saturating_sub(20)..]);
+                    println!("SABR POST to host: {}", url_host(&sabr_full_url));
 
                     // Try SABR: no auth first (baseline), then with Bearer (Premium test)
                     let sabr_attempts: &[(&str, bool)] = &[
@@ -1468,9 +1466,6 @@ async fn test_oauth_player(
 
                             // Decode SABR_ERROR to see what went wrong
                             if part_type == 44 {
-                                // Print hex for debugging
-                                let hex: String = part_data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                println!("    SABR_ERROR hex: {}", hex);
                                 // Try protobuf decode: SabrError has fields like error_code, etc.
                                 if let Ok(err) = <sabr::proto::vs::SabrError as prost::Message>::decode(part_data.as_slice()) {
                                     println!("    SABR_ERROR decoded: {:?}", err);
@@ -1491,7 +1486,7 @@ async fn test_oauth_player(
                         }
                     } else {
                         let err_text = sabr_resp.text().await.unwrap_or_default();
-                        println!("  Error: {}", &err_text[..err_text.len().min(200)]);
+                        println!("  Error body: {} bytes", err_text.len());
                     }
                     } // end sabr_attempts loop
                 } else {
@@ -1509,6 +1504,13 @@ async fn test_oauth_player(
     Ok(())
 }
 
+/// Host part of a URL for diagnostics; the full URL carries session parameters.
+fn url_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<unparseable>".into())
+}
 
 #[cfg(test)]
 mod log_hygiene_tests {
@@ -1521,8 +1523,25 @@ mod log_hygiene_tests {
             concat!("ctt received", ": {}"),
             concat!("Generated screen_id (cl)", ": {}"),
             concat!("Generated screen_id (m)", ": {}"),
+            concat!("[init] UUID", ": {}"),
+            // --test mode: token, visitor_data, full URLs and body previews.
+            concat!("Bearer token", ": {}"),
+            concat!("Visitor data", ": {}"),
+            concat!("SABR URL", ": {}..."),
+            concat!("SABR POST to", ": {}..."),
+            concat!("SABR_ERROR hex", ": {}"),
+            concat!("len().min(", "200)"),
         ] {
             assert!(!src.contains(needle), "secret-logging format string found: {needle}");
         }
+    }
+
+    #[test]
+    fn url_host_drops_path_and_query() {
+        assert_eq!(
+            super::url_host("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRET"),
+            "rr1---sn-abc.googlevideo.com"
+        );
+        assert_eq!(super::url_host("not a url"), "<unparseable>");
     }
 }

@@ -21,15 +21,24 @@ const SOLVER_STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
 /// In-memory cache: (player_hash, preprocessed_player_js)
 static PREPROCESSED_CACHE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
-/// Disk cache file path: ~/.cache/ytcast/nsig-preprocessed-{hash}.js
+/// Disk cache file path: `$YTCAST_DATA_DIR/nsig-cache/` or `~/.cache/ytcast/`,
+/// file `nsig-preprocessed-{hash}.js`.
 fn cache_path(player_hash: &str) -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("ytcast").join(format!("nsig-preprocessed-{}.js", player_hash)))
+    cache_path_in(crate::storage::data_dir_env().as_deref(), player_hash)
+}
+
+fn cache_path_in(data_dir: Option<&str>, player_hash: &str) -> Option<PathBuf> {
+    crate::storage::nsig_cache_dir(data_dir)
+        .map(|d| d.join(format!("nsig-preprocessed-{}.js", player_hash)))
 }
 
 /// Load preprocessed player from disk cache.
 fn load_disk_cache(player_hash: &str) -> Option<String> {
-    let path = cache_path(player_hash)?;
-    match std::fs::read_to_string(&path) {
+    load_disk_cache_at(&cache_path(player_hash)?)
+}
+
+fn load_disk_cache_at(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
         Ok(s) if !s.is_empty() => {
             tracing::info!("[nsig] loaded disk cache: {} ({} bytes)", path.display(), s.len());
             Some(s)
@@ -41,13 +50,17 @@ fn load_disk_cache(player_hash: &str) -> Option<String> {
 /// Save preprocessed player to disk cache.
 fn save_disk_cache(player_hash: &str, preprocessed: &str) {
     if let Some(path) = cache_path(player_hash) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::write(&path, preprocessed) {
-            Ok(()) => tracing::info!("[nsig] saved disk cache: {} ({} bytes)", path.display(), preprocessed.len()),
-            Err(e) => tracing::warn!("[nsig] failed to save disk cache: {}", e),
-        }
+        save_disk_cache_at(&path, preprocessed);
+    }
+}
+
+fn save_disk_cache_at(path: &std::path::Path, preprocessed: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = crate::storage::create_private_dir_all(parent);
+    }
+    match std::fs::write(path, preprocessed) {
+        Ok(()) => tracing::info!("[nsig] saved disk cache: {} ({} bytes)", path.display(), preprocessed.len()),
+        Err(e) => tracing::warn!("[nsig] failed to save disk cache: {}", e),
     }
 }
 
@@ -246,5 +259,31 @@ fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, _e: rquickjs::Error, stage: &str) -> St
         }
     } else {
         format!("{} failed: {:?}", stage, caught)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_util::TempDir;
+
+    #[test]
+    fn cache_path_unchanged_without_data_dir() {
+        assert_eq!(
+            cache_path_in(None, "abc"),
+            dirs::cache_dir().map(|d| d.join("ytcast").join("nsig-preprocessed-abc.js"))
+        );
+    }
+
+    #[test]
+    fn cache_written_under_data_dir() {
+        let tmp = TempDir::new("nsig-cache");
+        let path = cache_path_in(Some(tmp.as_str()), "abc").unwrap();
+        assert_eq!(path, tmp.path().join("nsig-cache").join("nsig-preprocessed-abc.js"));
+
+        save_disk_cache_at(&path, "preprocessed");
+        assert_eq!(load_disk_cache_at(&path).as_deref(), Some("preprocessed"));
+        #[cfg(unix)]
+        assert_eq!(crate::storage::test_util::mode(path.parent().unwrap()), 0o700);
     }
 }
