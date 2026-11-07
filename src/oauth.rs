@@ -143,24 +143,19 @@ async fn extract_client_credentials(
     extract_credentials_from_js(&base_js)
 }
 
-/// Absolute base.js URL to fetch; relative ones are on www.youtube.com.
-///
-/// An absolute URL comes from the /tv page and is only fetched from a Google
-/// host; errors and logs name the host only.
-fn base_js_full_url(base_js_url: &str) -> Result<String, String> {
-    if base_js_url.starts_with("http") {
-        if crate::sabr::stream::is_trusted_google_host(base_js_url) {
-            return Ok(base_js_url.to_string());
-        }
-        let host = reqwest::Url::parse(base_js_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .unwrap_or_else(|| "<unparseable>".to_owned());
-        tracing::warn!("[oauth] refusing base.js on untrusted host {}", host);
-        Err(format!("base.js URL on untrusted host {}", host))
-    } else {
-        Ok(format!("https://www.youtube.com{}", base_js_url))
+/// The base.js URL from the /tv page, resolved against www.youtube.com like a
+/// browser would (absolute, scheme-relative or path), and only accepted on a
+/// Google host; errors and logs name the host only.
+fn base_js_full_url(base_js_src: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse("https://www.youtube.com/")
+        .and_then(|base| base.join(base_js_src))
+        .map_err(|_| "unparseable base.js URL".to_string())?;
+    if crate::sabr::stream::is_trusted_google_host(url.as_str()) {
+        return Ok(url.into());
     }
+    let host = crate::sabr::stream::host_for_log(url.as_str());
+    tracing::warn!("[oauth] refusing base.js on untrusted host {}", host);
+    Err(format!("base.js URL on untrusted host {}", host))
 }
 
 fn extract_base_js_url(html: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -602,25 +597,32 @@ mod tests {
 
     #[test]
     fn base_js_url_must_be_on_a_google_host() {
-        assert_eq!(
-            base_js_full_url("/s/player/abc/base.js").unwrap(),
-            "https://www.youtube.com/s/player/abc/base.js"
-        );
-        assert_eq!(
-            base_js_full_url("https://www.youtube.com/s/player/abc/base.js").unwrap(),
-            "https://www.youtube.com/s/player/abc/base.js"
-        );
-        for url in ["https://evil.example/s/player/abc/base.js?k=SECRET", "http://www.youtube.com/base.js"] {
-            let err = base_js_full_url(url).unwrap_err();
-            assert!(!err.contains("SECRET") && !err.contains("/s/player"), "{err}");
+        for (src, expected) in [
+            ("/s/player/abc/base.js", "https://www.youtube.com/s/player/abc/base.js"),
+            ("https://www.youtube.com/s/player/abc/base.js", "https://www.youtube.com/s/player/abc/base.js"),
+            // Host-like path prefixes stay paths on www.youtube.com.
+            (".evil.example/player.js", "https://www.youtube.com/.evil.example/player.js"),
+            ("@evil.example/player.js", "https://www.youtube.com/@evil.example/player.js"),
+        ] {
+            assert_eq!(base_js_full_url(src).as_deref(), Ok(expected), "{src}");
         }
-        let mut result = None;
-        let logs = capture_logs(|| {
-            result = Some(base_js_full_url("https://evil.example/s/player/abc/base.js?k=SECRET"))
-        });
-        assert!(result.unwrap().unwrap_err().contains("evil.example"));
-        assert!(logs.contains("evil.example"), "{logs}");
-        assert!(!logs.contains("SECRET"), "{logs}");
+
+        for src in [
+            "https://evil.example/player.js?k=SECRET",
+            "HTTPS://evil.example/player.js?k=SECRET",
+            "//evil.example/player.js?k=SECRET",
+            "https://www.youtube.com@evil.example/player.js?k=SECRET",
+        ] {
+            let mut result = None;
+            let logs = capture_logs(|| result = Some(base_js_full_url(src)));
+            let err = result.unwrap().unwrap_err();
+            assert!(err.contains("evil.example"), "{src}: {err}");
+            for text in [&err, &logs] {
+                assert!(!text.contains("SECRET") && !text.contains("player.js"), "{src}: {text}");
+            }
+            assert!(logs.contains("evil.example"), "{src}: {logs}");
+        }
+        assert!(base_js_full_url("http://www.youtube.com/base.js").is_err());
     }
 
     // Needles are split with concat! so this test does not match itself.

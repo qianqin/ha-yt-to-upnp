@@ -239,7 +239,7 @@ pub(crate) fn is_trusted_google_host(url: &str) -> bool {
 
 /// Host part of a URL for log/error messages (never the full URL: query
 /// strings carry tokens).
-fn host_for_log(url: &str) -> String {
+pub(crate) fn host_for_log(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))

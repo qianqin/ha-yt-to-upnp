@@ -1192,7 +1192,7 @@ async fn test_oauth_player(
 
         // SABR URL
         if let Some(sabr_url) = sd["serverAbrStreamingUrl"].as_str() {
-            println!("SABR URL: host {}", url_host(sabr_url));
+            println!("SABR URL: host {}", sabr::stream::host_for_log(sabr_url));
         } else {
             println!("SABR URL: none");
         }
@@ -1417,7 +1417,7 @@ async fn test_oauth_player(
                             continue;
                         }
                     };
-                    println!("SABR POST to host: {}", url_host(&sabr_full_url));
+                    println!("SABR POST to host: {}", sabr::stream::host_for_log(&sabr_full_url));
 
                     // Try SABR: no auth first (baseline), then with Bearer (Premium test)
                     let sabr_attempts: &[(&str, bool)] = &[
@@ -1522,16 +1522,8 @@ fn sabr_probe_url(sabr_url: &str) -> Result<String, String> {
     if sabr::stream::is_trusted_google_host(sabr_url) {
         Ok(format!("{}&rn=0", sabr_url))
     } else {
-        Err(url_host(sabr_url))
+        Err(sabr::stream::host_for_log(sabr_url))
     }
-}
-
-/// Host part of a URL for diagnostics; the full URL carries session parameters.
-fn url_host(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| "<unparseable>".into())
 }
 
 #[cfg(test)]
@@ -1574,11 +1566,11 @@ mod log_hygiene_tests {
     }
 
     #[test]
-    fn url_host_drops_path_and_query() {
+    fn host_for_log_drops_path_and_query() {
         assert_eq!(
-            super::url_host("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRET"),
+            super::sabr::stream::host_for_log("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRET"),
             "rr1---sn-abc.googlevideo.com"
         );
-        assert_eq!(super::url_host("not a url"), "<unparseable>");
+        assert_eq!(super::sabr::stream::host_for_log("not a url"), "<unparseable>");
     }
 }

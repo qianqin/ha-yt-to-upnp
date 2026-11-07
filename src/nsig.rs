@@ -117,7 +117,10 @@ fn decode_nsig_cached_at(
 
 fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
     if decoded.is_empty() || decoded == n_value {
-        return Err(format!("nsig decode returned invalid result: '{}'", decoded));
+        return Err(format!(
+            "nsig decode returned invalid result: '{}'",
+            &decoded[..decoded.floor_char_boundary(64)]
+        ));
     }
     tracing::info!(
         "[nsig] decoded: {} -> {}",
@@ -345,6 +348,26 @@ mod tests {
         assert!(check_decoded("abc", "abc").is_err());
         // Multi-byte char across the 16-byte log cut.
         check_decoded("abc", &format!("{}\u{20ac}tail", "x".repeat(15))).unwrap();
+    }
+
+    #[test]
+    fn invalid_result_error_is_truncated() {
+        let decoded = format!("{}\u{20ac}{}", "x".repeat(63), "TAIL".repeat(50));
+        let err = check_decoded(&decoded, &decoded).unwrap_err();
+        assert!(!err.contains("TAIL"), "{err}");
+    }
+
+    #[test]
+    fn cached_player_returning_unchanged_n_keeps_cache() {
+        let tmp = TempDir::new("nsig-identity");
+        let path = tmp.path().join("nsig-preprocessed-identity.js");
+        // A preprocessed player whose n function is the identity.
+        std::fs::write(&path, "_result.n = function (n) { return n; };").unwrap();
+
+        let result = decode_nsig_cached_at("", "abc", "test-identity-player", Some(path.clone()));
+
+        assert!(result.unwrap_err().contains("invalid result"));
+        assert!(path.exists(), "cache was discarded for a player that ran");
     }
 
     #[test]
