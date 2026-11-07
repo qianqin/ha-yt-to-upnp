@@ -1151,6 +1151,17 @@ fn handle_stream_protection(data: &[u8]) -> Result<(), SabrError> {
 // Single SABR request/response cycle
 // ---------------------------------------------------------------------------
 
+/// Error bodies are reported by length only: they can echo request data, and
+/// slicing them by bytes is not UTF-8 safe.
+fn http_error_message(status: reqwest::StatusCode, state: &SabrState, body_len: usize) -> String {
+    format!(
+        "SABR HTTP {} (client={}, has_potoken={}, has_cookie={}): body {} bytes",
+        status, state.client_config.client_name,
+        state.po_token.is_some(), state.playback_cookie.is_some(),
+        body_len,
+    )
+}
+
 async fn sabr_request_cycle(
     http: &reqwest::Client,
     state: &mut SabrState,
@@ -1189,14 +1200,8 @@ async fn sabr_request_cycle(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body_preview = resp.text().await.unwrap_or_default();
-        let preview = &body_preview[..body_preview.len().min(200)];
-        return Err(format!(
-            "SABR HTTP {} (client={}, has_potoken={}, has_cookie={}): {}",
-            status, state.client_config.client_name,
-            state.po_token.is_some(), state.playback_cookie.is_some(),
-            preview,
-        ).into());
+        let body_len = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
+        return Err(http_error_message(status, state, body_len).into());
     }
 
     let mut parser = UmpParser::new();
@@ -1755,6 +1760,20 @@ mod tests {
             assert!(!text.contains("secret-sig"), "{text}");
             assert!(!text.contains("secret-lsig"), "{text}");
         }
+    }
+
+    #[test]
+    fn http_error_reports_body_length_not_text() {
+        // 3-byte chars: byte 200 is not a char boundary.
+        let body = format!("SECRET-BODY-{}", "\u{20ac}".repeat(80));
+        assert!(body.len() > 200 && !body.is_char_boundary(200));
+        let state = test_state(GOOD_URL);
+
+        let msg = http_error_message(reqwest::StatusCode::FORBIDDEN, &state, body.len());
+
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains(&format!("body {} bytes", body.len())), "{msg}");
+        assert!(!msg.contains("SECRET-BODY"), "{msg}");
     }
 
     // -- HTTP redirects --------------------------------------------------------
