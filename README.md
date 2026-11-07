@@ -82,11 +82,20 @@ export DEVICE_NAME="Living Room Pi"
 export MPD_HOST=localhost
 export MPD_PORT=6600
 
+# Optional: keep config, OAuth credentials and nsig cache in one directory
+# (default: OS config dir, nsig cache in OS cache dir under ytcast/)
+export YTCAST_DATA_DIR=/data
+
+# Optional: cookie file (default: $YTCAST_DATA_DIR/ytm-cookies.txt if set, else ~/ytm-cookies.txt)
+export YTM_COOKIES=/data/ytm-cookies.txt
+
 # Run
 ./ytcast-open
 ```
 
 Open YouTube Music on your phone, tap Cast, and select your device.
+
+With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config), `ytcast-oauth.json` (OAuth credentials) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and credential files are written with mode 0600 and created directories with 0700; if a config, OAuth or cookie file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
 
 ## Building
 
@@ -114,11 +123,12 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
 | `cookies.rs` | ~410 | Cookie loading, YouTube Music session extraction (ytcfg), triple SAPISIDHASH auth |
 | `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
-| `nsig.rs` | ~250 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
+| `nsig.rs` | ~290 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
 | `dial.rs` | ~420 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
-| `config.rs` | ~110 | JSON config (UUID, screen_id, screen_id_m) load/save |
+| `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
+| `storage.rs` | ~300 | Data/cookie path resolution (`YTCAST_DATA_DIR`, `YTM_COOKIES`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
 | `sabr/stream.rs` | ~1840 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (cookies, OAuth, PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
