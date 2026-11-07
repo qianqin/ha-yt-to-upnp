@@ -71,6 +71,7 @@ impl Config {
     fn load_from(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(&path) {
             Ok(data) => {
+                crate::storage::warn_if_loose_permissions(path);
                 let config: Config = serde_json::from_str(&data)?;
                 tracing::info!("loaded config from {}", path.display());
                 Ok(config)
@@ -144,6 +145,23 @@ mod tests {
         assert_eq!(loaded.screen_id_m, "m");
         #[cfg(unix)]
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_loose_config_warns_with_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("config-loose");
+        let path = tmp.path().join("ytcast-lite.json");
+        std::fs::write(&path, r#"{"uuid":"u","screen_id":"SCREEN-ID-VALUE"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut loaded = None;
+        let logs = capture_logs(|| loaded = Some(Config::load_from(&path).unwrap()));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(path.to_str().unwrap()), "{logs}");
+        assert!(!logs.contains("SCREEN-ID-VALUE"), "{logs}");
+        assert_eq!(loaded.unwrap().screen_id, "SCREEN-ID-VALUE");
     }
 
     #[test]

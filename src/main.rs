@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.uuid = uuid::Uuid::new_v4().to_string();
         config.save()?;
     }
+    tracing::info!("[init] UUID: {}", config.uuid);
 
     // 3. Read env vars
     let device_name = std::env::var("DEVICE_NAME").unwrap_or_else(|_| "Living Room Pi".into());
@@ -1523,7 +1524,6 @@ mod log_hygiene_tests {
             concat!("ctt received", ": {}"),
             concat!("Generated screen_id (cl)", ": {}"),
             concat!("Generated screen_id (m)", ": {}"),
-            concat!("[init] UUID", ": {}"),
             // --test mode: token, visitor_data, full URLs and body previews.
             concat!("Bearer token", ": {}"),
             concat!("Visitor data", ": {}"),

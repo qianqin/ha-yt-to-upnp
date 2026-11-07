@@ -210,12 +210,15 @@ mod tests {
     #[test]
     fn data_dir_set_moves_everything_under_it() {
         assert_eq!(config_dir(Some("/data")), Some(PathBuf::from("/data")));
-        assert_eq!(nsig_cache_dir(Some("/data")), Some(PathBuf::from("/data/nsig-cache")));
+        assert_eq!(nsig_cache_dir(Some("/data")), Some(Path::new("/data").join("nsig-cache")));
     }
 
     #[test]
     fn cookie_path_defaults_to_data_dir() {
-        assert_eq!(cookie_path(None, Some("/x")), "/x/ytm-cookies.txt");
+        assert_eq!(
+            PathBuf::from(cookie_path(None, Some("/x"))),
+            Path::new("/x").join("ytm-cookies.txt")
+        );
     }
 
     #[test]
