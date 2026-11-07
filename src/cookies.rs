@@ -407,3 +407,32 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_util::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_cookie_file_warns_with_path_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("cookies-loose");
+        let path = tmp.path().join("ytm-cookies.txt");
+        std::fs::write(
+            &path,
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tSECRET-SAPISID-VALUE\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut loaded = None;
+        let logs = capture_logs(|| loaded = load_cookie_file(path.to_str().unwrap()).unwrap());
+
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(path.to_str().unwrap()), "{logs}");
+        assert!(!logs.contains("SECRET-SAPISID-VALUE"), "{logs}");
+        // Loose permissions warn but do not refuse.
+        assert_eq!(loaded.unwrap().sapisid, "SECRET-SAPISID-VALUE");
+    }
+}
