@@ -25,8 +25,6 @@ pub struct DialState {
     pub pairing_tx: mpsc::Sender<String>,
     /// Channel to deliver pairing codes for the "m" (YouTube Music) session.
     pub pairing_tx_m: mpsc::Sender<String>,
-    /// Player command channel for debug endpoint.
-    pub player_cmd_tx: Option<mpsc::Sender<crate::lounge::PlayerCommand>>,
     /// Human-readable name shown during discovery (e.g. "Living Room Pi").
     pub device_name: String,
     /// UPnP UUID for this device (without the "uuid:" prefix).
@@ -62,18 +60,7 @@ pub async fn run_dial_server(
     state: Arc<DialState>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let app = Router::new()
-        .route("/ssdp/device-desc.xml", get(device_description))
-        .route("/apps/YouTube", get(app_status))
-        .route("/apps/YouTube", post(app_launch))
-        .route("/apps/YouTube/run", delete(app_stop))
-        .route("/stream/{video_id}", get(stream_audio))
-        .route("/debug/play/{video_id}", get(debug_play))
-        .route("/debug/pause", get(debug_pause))
-        .route("/debug/resume", get(debug_resume))
-        .route("/debug/seek/{seconds}", get(debug_seek))
-        .route("/debug/stop", get(debug_stop))
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("DIAL server listening on 0.0.0.0:{port}");
@@ -96,6 +83,23 @@ pub async fn run_dial_server(
     .await?;
 
     Ok(())
+}
+
+fn build_router(state: Arc<DialState>) -> Router {
+    Router::new()
+        .route("/ssdp/device-desc.xml", get(device_description))
+        .route("/apps/YouTube", get(app_status))
+        .route("/apps/YouTube", post(app_launch))
+        .route("/apps/YouTube/run", delete(app_stop))
+        .route("/stream/{video_id}", get(stream_audio))
+        .with_state(state)
+}
+
+/// `/stream` is only meant for the local MPD; the server binds 0.0.0.0 for
+/// DIAL, so the peer address is the only thing keeping LAN clients out.
+fn is_loopback_peer(peer: SocketAddr) -> bool {
+    // to_canonical() folds IPv4-mapped IPv6 (::ffff:127.x) back to IPv4.
+    peer.ip().to_canonical().is_loopback()
 }
 
 // ---------------------------------------------------------------------------
@@ -252,90 +256,19 @@ async fn app_stop(
 }
 
 // ---------------------------------------------------------------------------
-// GET /debug/play/:video_id -- CLI test endpoint (simulates a cast)
-// ---------------------------------------------------------------------------
-
-async fn debug_play(
-    axum::extract::Path(video_id): axum::extract::Path<String>,
-    State(state): State<Arc<DialState>>,
-) -> Response {
-    use crate::lounge::PlayerCommand;
-
-    let tx = match &state.player_cmd_tx {
-        Some(tx) => tx,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response(),
-    };
-
-    // Use stored ctt from last real cast (if any)
-    let ctt = state.ctt.read().unwrap().clone();
-    tracing::info!("[debug] play {} (ctt={})", video_id, ctt.is_some());
-
-    // Simulate remote connect + play
-    let _ = tx.send(PlayerCommand::RemoteConnected { theme: "cl".to_string() }).await;
-    let _ = tx.send(PlayerCommand::SetPlaylist {
-        video_id: video_id.clone(),
-        video_ids: vec![video_id],
-        index: 0,
-        current_time: 0.0,
-        list_id: String::new(),
-        ctt,
-        params: None,
-    }).await;
-
-    (StatusCode::OK, "playing").into_response()
-}
-
-async fn debug_pause(State(state): State<Arc<DialState>>) -> Response {
-    let tx = match &state.player_cmd_tx {
-        Some(tx) => tx,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response(),
-    };
-    tracing::info!("[debug] pause");
-    let _ = tx.send(crate::lounge::PlayerCommand::Pause).await;
-    (StatusCode::OK, "paused").into_response()
-}
-
-async fn debug_resume(State(state): State<Arc<DialState>>) -> Response {
-    let tx = match &state.player_cmd_tx {
-        Some(tx) => tx,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response(),
-    };
-    tracing::info!("[debug] resume");
-    let _ = tx.send(crate::lounge::PlayerCommand::Play).await;
-    (StatusCode::OK, "resumed").into_response()
-}
-
-async fn debug_seek(
-    axum::extract::Path(seconds): axum::extract::Path<f64>,
-    State(state): State<Arc<DialState>>,
-) -> Response {
-    let tx = match &state.player_cmd_tx {
-        Some(tx) => tx,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response(),
-    };
-    tracing::info!("[debug] seek to {}s", seconds);
-    let _ = tx.send(crate::lounge::PlayerCommand::SeekTo { position: seconds }).await;
-    (StatusCode::OK, format!("seeked to {}s", seconds)).into_response()
-}
-
-async fn debug_stop(State(state): State<Arc<DialState>>) -> Response {
-    let tx = match &state.player_cmd_tx {
-        Some(tx) => tx,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response(),
-    };
-    tracing::info!("[debug] stop");
-    let _ = tx.send(crate::lounge::PlayerCommand::Stop).await;
-    (StatusCode::OK, "stopped").into_response()
-}
-
-// ---------------------------------------------------------------------------
 // GET /stream/:video_id -- SABR audio stream
 // ---------------------------------------------------------------------------
 
 async fn stream_audio(
     axum::extract::Path(video_id): axum::extract::Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<DialState>>,
 ) -> Response {
+    if !is_loopback_peer(peer) {
+        tracing::warn!("[stream] rejected non-loopback peer {}", peer);
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     // Validate video ID (11 chars, alphanumeric + - + _)
     if !video_id
         .chars()
@@ -412,5 +345,135 @@ async fn stream_audio(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn peer(ip: IpAddr) -> SocketAddr {
+        SocketAddr::new(ip, 40000)
+    }
+
+    fn test_state() -> Arc<DialState> {
+        let (pairing_tx, _) = mpsc::channel(1);
+        let (pairing_tx_m, _) = mpsc::channel(1);
+        Arc::new(DialState {
+            running: AtomicBool::new(false),
+            pairing_tx,
+            pairing_tx_m,
+            device_name: "Test Receiver".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            local_ip: Ipv4Addr::new(192, 0, 2, 1),
+            port: 8008,
+            http_client: reqwest::Client::new(),
+            ctt: std::sync::RwLock::new(None),
+            yt_cookies: None,
+            yt_session: None,
+            oauth_state: None,
+            screen_id: "test-screen".to_string(),
+        })
+    }
+
+    /// Serve the real router on an ephemeral loopback port while pretending the
+    /// TCP peer is `peer_addr`, then issue a GET for `path`.
+    async fn get_as(peer_addr: SocketAddr, path: &str) -> StatusCode {
+        let app = build_router(test_state()).layer(MockConnectInfo(peer_addr));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        let status = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        server.abort();
+        StatusCode::from_u16(status.as_u16()).unwrap()
+    }
+
+    fn lan_peers() -> Vec<SocketAddr> {
+        vec![
+            peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+            peer(IpAddr::V6("fd00::5".parse().unwrap())),
+            peer(IpAddr::V6("2001:db8::5".parse().unwrap())),
+            peer(IpAddr::V6("::ffff:192.0.2.10".parse().unwrap())),
+        ]
+    }
+
+    #[test]
+    fn loopback_peers_are_recognised() {
+        assert!(is_loopback_peer(peer(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        assert!(is_loopback_peer(peer(IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3)))));
+        assert!(is_loopback_peer(peer(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_loopback() {
+        assert!(is_loopback_peer(peer(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()))));
+    }
+
+    #[test]
+    fn lan_peers_are_not_loopback() {
+        for p in lan_peers() {
+            assert!(!is_loopback_peer(p), "{p} must not be treated as loopback");
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_endpoints_are_gone() {
+        let local = peer(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        for path in [
+            "/debug/play/abc",
+            "/debug/pause",
+            "/debug/resume",
+            "/debug/seek/10",
+            "/debug/stop",
+        ] {
+            assert_eq!(get_as(local, path).await, StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_from_lan_is_forbidden() {
+        // A well-formed video id: without the peer check this would start a
+        // YouTube fetch, so 403 proves the request was stopped before that.
+        for p in lan_peers() {
+            assert_eq!(
+                get_as(p, "/stream/dQw4w9WgXcQ").await,
+                StatusCode::FORBIDDEN,
+                "{p}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_from_loopback_is_not_rejected() {
+        // Invalid id so the handler answers 400 without any network fetch,
+        // which proves the request got past the peer check.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
+        ] {
+            assert_eq!(
+                get_as(peer(ip), "/stream/bad").await,
+                StatusCode::BAD_REQUEST,
+                "{ip}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_stays_reachable_from_lan() {
+        let lan = peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(get_as(lan, "/ssdp/device-desc.xml").await, StatusCode::OK);
+        assert_eq!(get_as(lan, "/apps/YouTube").await, StatusCode::OK);
     }
 }

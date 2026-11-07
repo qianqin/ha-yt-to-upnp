@@ -254,7 +254,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         running: std::sync::atomic::AtomicBool::new(false),
         pairing_tx: pairing_cl_tx,
         pairing_tx_m: pairing_m_tx,
-        player_cmd_tx: Some(player_cmd_tx.clone()),
         device_name: device_name.clone(),
         uuid: config.uuid.clone(),
         local_ip,
