@@ -1,0 +1,18 @@
+ha-yt-to-upnp
+=============
+
+This project is a fork of ytcast-open:
+  https://github.com/mthwJsmith/ytcast-open
+
+ytcast-open was written by mthwJsmith (the git author of the upstream
+commits). Copyright (c) mthwJsmith.
+
+The upstream README states that ytcast-open is licensed under the MIT
+License. The upstream repository does not ship a LICENSE file; the README's
+"License: MIT" statement is the only license grant. Upstream copyright and
+attribution are retained for all code derived from ytcast-open, and the
+modifications in this fork are distributed under the same MIT terms.
+
+Third-party projects credited by upstream (sabr-rs, googlevideo, yt-dlp/ejs,
+bgutil-ytdlp-pot-provider-rs, rustypipe-botguard, yt-cast-receiver,
+plaincast, ytm-mpd) are listed in the "Credits" section of README.md.
