@@ -62,7 +62,6 @@ The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions 
 - Full YouTube Music session context (fetches live ytcfg from music.youtube.com for WEB_REMIX /player)
 - n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver in QuickJS
 - Dual Lounge sessions (YouTube + YouTube Music themes) for broad compatibility
-- Debug HTTP endpoints for testing without a phone (`/debug/play/VIDEO_ID`, `/debug/pause`, etc.)
 
 ## Requirements
 
@@ -118,7 +117,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `nsig.rs` | ~250 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
-| `dial.rs` | ~420 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint |
+| `dial.rs` | ~420 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
 | `config.rs` | ~110 | JSON config (UUID, screen_id, screen_id_m) load/save |
 | `sabr/stream.rs` | ~1450 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |

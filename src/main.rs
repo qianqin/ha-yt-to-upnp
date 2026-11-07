@@ -186,12 +186,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if config.screen_id.is_empty() {
         config.screen_id = lounge::generate_screen_id(&http_client).await?;
         config_changed = true;
-        tracing::info!("[init] Generated screen_id (cl): {}", config.screen_id);
+        tracing::info!("[init] Generated screen_id (cl)");
     }
     if config.screen_id_m.is_empty() {
         config.screen_id_m = lounge::generate_screen_id(&http_client).await?;
         config_changed = true;
-        tracing::info!("[init] Generated screen_id (m): {}", config.screen_id_m);
+        tracing::info!("[init] Generated screen_id (m)");
     }
     if config_changed {
         config.save()?;
@@ -637,8 +637,8 @@ async fn handle_command(
             playlist.last_state = messages::PlayerState::Idle;
 
             // Store ctt in shared DIAL state so the SABR handler can use it.
-            if let Some(ref token) = ctt {
-                tracing::info!("[player] ctt received: {}", token);
+            if ctt.is_some() {
+                tracing::info!("[player] ctt received from cast session");
             }
             *dial_state.ctt.write().unwrap() = ctt;
 
@@ -1509,3 +1509,20 @@ async fn test_oauth_player(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod log_hygiene_tests {
+    // Pairing identities and session tokens must never reach the logs. The
+    // needles are split with concat! so this test does not match itself.
+    #[test]
+    fn secrets_are_not_logged() {
+        let src = include_str!("main.rs");
+        for needle in [
+            concat!("ctt received", ": {}"),
+            concat!("Generated screen_id (cl)", ": {}"),
+            concat!("Generated screen_id (m)", ": {}"),
+        ] {
+            assert!(!src.contains(needle), "secret-logging format string found: {needle}");
+        }
+    }
+}

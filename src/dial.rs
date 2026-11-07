@@ -213,7 +213,8 @@ async fn app_launch(
     State(state): State<Arc<DialState>>,
     body: String,
 ) -> Response {
-    tracing::debug!("DIAL {} {} from {} body={}", method, uri, addr, body);
+    // The body carries the pairing code, so only its size is logged.
+    tracing::debug!("DIAL {} {} from {} ({} byte body)", method, uri, addr, body.len());
 
     // Body is form-urlencoded: pairingCode=XXX&theme=m&v=VIDEO_ID&t=0
     let params: Vec<(String, String)> =
@@ -468,6 +469,48 @@ mod tests {
                 "{ip}"
             );
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_launch_does_not_log_pairing_code() {
+        const CODE: &str = "SECRETPAIRCODE123";
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        // Current-thread test runtime: the handler runs on this thread, so a
+        // thread-local default subscriber sees all of its events.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let status = app_launch(
+            Method::POST,
+            "/apps/YouTube".parse().unwrap(),
+            ConnectInfo(peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))),
+            State(test_state()),
+            format!("pairingCode={CODE}&theme=m&v=dQw4w9WgXcQ&t=0"),
+        )
+        .await
+        .status();
+
+        assert_eq!(status, StatusCode::CREATED);
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("DIAL"), "log capture is not working: {logs:?}");
+        assert!(!logs.contains(CODE), "pairing code leaked into logs: {logs}");
     }
 
     #[tokio::test]
