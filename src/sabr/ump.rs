@@ -75,15 +75,15 @@ pub fn write_varint(out: &mut Vec<u8>, value: u32) {
     if value < 128 {
         // 1 byte
         out.push(value as u8);
-    } else if value < 128 + 64 * 256 {
-        // 2 bytes: value = (b0 & 0x3F) + 64 * b1
+    } else if value < 1 << 14 {
+        // 2 bytes: value = (b0 & 0x3F) + 64 * b1, max 0x3F + 64 * 255 = 2^14 - 1
         // b0 high bits = 10xx_xxxx (128..192)
         let lo = value % 64;
         let hi = value / 64;
         out.push(128 | lo as u8);
         out.push(hi as u8);
-    } else if value < 32 + 32 * 256 * 256 {
-        // 3 bytes: value = (b0 & 0x1F) + 32 * (b1 + 256 * b2)
+    } else if value < 1 << 21 {
+        // 3 bytes: value = (b0 & 0x1F) + 32 * (b1 + 256 * b2), max 2^21 - 1
         // b0 high bits = 110x_xxxx (192..224)
         let lo = value % 32;
         let rest = value / 32;
@@ -92,8 +92,8 @@ pub fn write_varint(out: &mut Vec<u8>, value: u32) {
         out.push(192 | lo as u8);
         out.push(b1 as u8);
         out.push(b2 as u8);
-    } else if value < 16 + 16 * 256 * 256 * 256 {
-        // 4 bytes: value = (b0 & 0x0F) + 16 * (b1 + 256 * (b2 + 256 * b3))
+    } else if value < 1 << 28 {
+        // 4 bytes: value = (b0 & 0x0F) + 16 * (b1 + 256 * (b2 + 256 * b3)), max 2^28 - 1
         // b0 high bits = 1110_xxxx (224..240)
         let lo = value % 16;
         let rest = value / 16;
@@ -182,50 +182,104 @@ mod tests {
 
     // -- varint round-trip ---------------------------------------------------
 
-    fn roundtrip(value: u32) {
+    /// Encode then decode `value`, asserting it round-trips in exactly `len` bytes.
+    fn roundtrip(value: u32, len: usize) {
         let mut buf = Vec::new();
         write_varint(&mut buf, value);
+        assert_eq!(buf.len(), len, "encoded length mismatch for {value}");
         let (decoded, consumed) = read_varint(&buf).expect("should decode");
         assert_eq!(decoded, value, "value mismatch for {value}");
-        assert_eq!(consumed, buf.len(), "consumed length mismatch for {value}");
+        assert_eq!(consumed, len, "consumed length mismatch for {value}");
     }
 
     #[test]
     fn varint_1_byte() {
-        roundtrip(0);
-        roundtrip(1);
-        roundtrip(127);
+        roundtrip(0, 1);
+        roundtrip(1, 1);
+        roundtrip(127, 1);
     }
 
     #[test]
     fn varint_2_bytes() {
-        roundtrip(128);
-        roundtrip(1000);
-        // Max 2-byte: (0x3F) + 64 * 255 = 63 + 16320 = 16383
-        roundtrip(16383);
+        roundtrip(128, 2);
+        roundtrip(1000, 2);
+        // Max 2-byte: 0x3F + 64 * 255 = 16383 = 2^14 - 1
+        roundtrip(16383, 2);
     }
 
     #[test]
     fn varint_3_bytes() {
-        roundtrip(16384);
-        roundtrip(100_000);
-        // Max 3-byte: 31 + 32 * (255 + 256 * 255) = 31 + 32 * 65535 = 2097151
-        roundtrip(2_097_151);
+        roundtrip(16384, 3);
+        roundtrip(16511, 3);
+        roundtrip(100_000, 3);
+        // Max 3-byte: 0x1F + 32 * (255 + 256 * 255) = 2^21 - 1
+        roundtrip(2_097_151, 3);
     }
 
     #[test]
     fn varint_4_bytes() {
-        roundtrip(2_097_152);
-        roundtrip(10_000_000);
-        // Max 4-byte: 15 + 16 * (255 + 256 * (255 + 256 * 255))
-        //           = 15 + 16 * 16_777_215 = 268_435_455
-        roundtrip(268_435_455);
+        roundtrip(2_097_152, 4);
+        roundtrip(2_097_183, 4);
+        roundtrip(10_000_000, 4);
+        // Max 4-byte: 0x0F + 16 * (255 + 256 * (255 + 256 * 255)) = 2^28 - 1
+        roundtrip(268_435_455, 4);
     }
 
     #[test]
     fn varint_5_bytes() {
-        roundtrip(268_435_456);
-        roundtrip(u32::MAX);
+        roundtrip(268_435_456, 5);
+        roundtrip(268_435_471, 5);
+        roundtrip(u32::MAX, 5);
+    }
+
+    // -- reference vectors ---------------------------------------------------
+    //
+    // Derived from the googlevideo / YouTube.js UMP reader: the leading 1-bits of
+    // the first byte give the length, the remaining low bits of the first byte are
+    // the least-significant bits, and following bytes are little-endian.
+
+    const REFERENCE_VECTORS: &[(&[u8], u32)] = &[
+        (&[0x00], 0),
+        (&[0x7F], 127),
+        (&[0x80, 0x01], 64),
+        (&[0x80, 0x02], 128),
+        (&[0xBF, 0xFF], 16_383),
+        (&[0xC0, 0x00, 0x02], 16_384),
+        (&[0xDF, 0xFF, 0xFF], 2_097_151),
+        (&[0xE0, 0x00, 0x00, 0x02], 2_097_152),
+        (&[0xEF, 0xFF, 0xFF, 0xFF], 268_435_455),
+        (&[0xF0, 0x00, 0x00, 0x00, 0x10], 268_435_456),
+        (&[0xF0, 0xFF, 0xFF, 0xFF, 0xFF], u32::MAX),
+    ];
+
+    #[test]
+    fn decoder_matches_reference_vectors() {
+        for &(bytes, expected) in REFERENCE_VECTORS {
+            assert_eq!(
+                read_varint(bytes),
+                Some((expected, bytes.len())),
+                "decoding {bytes:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_ignores_low_bits_of_5_byte_prefix() {
+        assert_eq!(read_varint(&[0xFF, 0x01, 0x00, 0x00, 0x00]), Some((1, 5)));
+    }
+
+    #[test]
+    fn encoder_matches_reference_vectors() {
+        for &(bytes, value) in REFERENCE_VECTORS {
+            // [0x80, 0x01] is a valid (non-minimal) encoding of 64; the encoder
+            // uses the shortest form, so skip it here.
+            if value == 64 {
+                continue;
+            }
+            let mut out = Vec::new();
+            write_varint(&mut out, value);
+            assert_eq!(out, bytes, "encoding {value}");
+        }
     }
 
     // -- read_varint edge cases ----------------------------------------------
