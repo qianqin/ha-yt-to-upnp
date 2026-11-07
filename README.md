@@ -65,7 +65,7 @@ The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions 
 
 ## Requirements
 
-- **MPD** (Music Player Daemon) running and accessible
+- **MPD** (Music Player Daemon) running on the same host - audio is served to MPD via `http://localhost:8008/stream/...`, which only answers loopback connections
 - **Linux** (tested on Raspberry Pi Zero 2W with Debian trixie/aarch64)
 - Network access to YouTube servers
 - **Optional: [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs)** for PoToken generation (prevents CDN throttle after 60s). Uses [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) internally. Runs as HTTP server on port 4416. ~66MB RAM due to embedded V8 JS engine for BotGuard challenges — can be hosted on a separate machine/VPS to save RAM on the Pi.
@@ -109,7 +109,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.rs` | ~1500 | Entry point, player command loop, MPD idle events, auto-advance, debug endpoints |
+| `main.rs` | ~1500 | Entry point, player command loop, MPD idle events, auto-advance |
 | `lounge.rs` | ~1090 | YouTube Lounge API - session management, streaming long-poll, command parsing |
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
 | `cookies.rs` | ~410 | Cookie loading, YouTube Music session extraction (ytcfg), triple SAPISIDHASH auth |
