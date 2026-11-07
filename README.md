@@ -110,7 +110,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | File | Lines | Purpose |
 |------|-------|---------|
 | `main.rs` | ~1500 | Entry point, player command loop, MPD idle events, auto-advance |
-| `lounge.rs` | ~1090 | YouTube Lounge API - session management, streaming long-poll, command parsing |
+| `lounge.rs` | ~1230 | YouTube Lounge API - session management, streaming long-poll, command parsing (session tokens and pairing codes are kept out of logs) |
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
 | `cookies.rs` | ~410 | Cookie loading, YouTube Music session extraction (ytcfg), triple SAPISIDHASH auth |
 | `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
@@ -119,7 +119,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
 | `dial.rs` | ~420 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
 | `config.rs` | ~110 | JSON config (UUID, screen_id, screen_id_m) load/save |
-| `sabr/stream.rs` | ~1450 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing |
+| `sabr/stream.rs` | ~1840 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (cookies, OAuth, PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 
