@@ -220,7 +220,7 @@ struct PlayerData {
 ///
 /// Streaming URLs come from server responses (player response, SABR
 /// redirects), so cookies and auth headers must never follow them blindly.
-fn is_trusted_google_host(url: &str) -> bool {
+pub(crate) fn is_trusted_google_host(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -244,6 +244,41 @@ fn host_for_log(url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| "<unparseable>".to_owned())
+}
+
+/// Fail closed: a SABR request body carries the PoToken and playback cookie,
+/// so an off-Google streaming URL is refused outright.
+fn check_streaming_url(url: &str) -> Result<(), SabrError> {
+    if is_trusted_google_host(url) {
+        return Ok(());
+    }
+    let host = host_for_log(url);
+    tracing::warn!("[sabr] refusing untrusted streaming host {}", host);
+    Err(format!("untrusted streaming host {}", host).into())
+}
+
+/// Client for credentialed YouTube requests. The default reqwest policy
+/// follows up to 10 redirects to any host and re-sends POST bodies on
+/// 307/308; this one only follows redirects that stay on Google hosts.
+fn credential_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else if is_trusted_google_host(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                tracing::warn!("[sabr] not following redirect to {}", host_for_log(attempt.url().as_str()));
+                attempt.stop()
+            }
+        });
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0")
+            .redirect(policy)
+            .build()
+            .expect("static reqwest client config is valid")
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -384,9 +419,7 @@ async fn innertube_player(
     } else {
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
     };
-    if !is_trusted_google_host(url) {
-        return Err(format!("refusing to send credentials to {}", host_for_log(url)).into());
-    }
+    debug_assert!(is_trusted_google_host(url));
 
     // Client version from live session (changes frequently) or hardcoded constant.
     let client_version = if let Some(session) = yt_session {
@@ -1054,11 +1087,7 @@ fn handle_next_request_policy(state: &mut SabrState, data: &[u8]) -> Result<(), 
 fn handle_sabr_redirect(state: &mut SabrState, data: &[u8]) -> Result<(), SabrError> {
     let redirect = vs::SabrRedirect::decode(data)?;
     if let Some(url) = redirect.url {
-        // Following a redirect off Google would hand the next request (PoToken
-        // in the body, cookies in the headers) to that host.
-        if !is_trusted_google_host(&url) {
-            return Err(format!("SABR redirect to untrusted host {}", host_for_log(&url)).into());
-        }
+        check_streaming_url(&url)?;
         tracing::info!("[sabr] redirect to new streaming URL");
         state.server_url = url;
     }
@@ -1127,6 +1156,7 @@ async fn sabr_request_cycle(
     state: &mut SabrState,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<bool, SabrError> {
+    check_streaming_url(&state.server_url)?;
     let req_proto = state.build_request();
     let encoded = req_proto.encode_to_vec();
 
@@ -1151,11 +1181,7 @@ async fn sabr_request_cycle(
         .header("Accept-Encoding", "identity");
 
     if let Some(ref cookies) = state.cookie_header {
-        if is_trusted_google_host(&url) {
-            req = req.header("Cookie", cookies);
-        } else {
-            tracing::warn!("[sabr] not sending cookies to untrusted host {}", host_for_log(&url));
-        }
+        req = req.header("Cookie", cookies);
     }
 
     let resp = req.body(encoded).send().await?;
@@ -1266,8 +1292,11 @@ async fn sabr_request_cycle(
 /// A background tokio task runs the SABR request loop. When all segments
 /// have been downloaded, or an error occurs, the task ends and the channel
 /// closes naturally.
+///
+/// `_client` is unused: credentialed requests go through `credential_client()`
+/// so that redirects cannot carry cookies or tokens off Google hosts.
 pub async fn stream_audio(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
@@ -1277,6 +1306,7 @@ pub async fn stream_audio(
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
+    let client = credential_client();
     // Get OAuth token if available (auto-refreshes if expired)
     let oauth_token = if let Some(os) = oauth {
         os.get_access_token().await
@@ -1366,6 +1396,8 @@ pub async fn stream_audio(
             }
         }
     }
+
+    check_streaming_url(&server_url)?;
 
     // 5. Spawn the SABR streaming loop.
     let http = client.clone();
@@ -1523,6 +1555,8 @@ mod tests {
         }
     }
 
+    // -- helpers --------------------------------------------------------------
+
     fn test_state(server_url: &str) -> SabrState {
         let fmt = AdaptiveFormat {
             itag: 251,
@@ -1535,27 +1569,17 @@ mod tests {
     }
 
     const GOOD_URL: &str = "https://rr1---sn-abc.googlevideo.com/videoplayback?a=1";
-
-    #[test]
-    fn redirect_to_foreign_host_is_rejected() {
-        let mut state = test_state(GOOD_URL);
-        let data = vs::SabrRedirect { url: Some("https://evil.example/stream".to_owned()) }.encode_to_vec();
-        let err = handle_sabr_redirect(&mut state, &data).unwrap_err();
-        assert!(err.to_string().contains("evil.example"));
-        assert_eq!(state.server_url, GOOD_URL);
-    }
-
-    #[test]
-    fn redirect_to_googlevideo_is_followed() {
-        let mut state = test_state(GOOD_URL);
-        let target = "https://rr2---sn-def.googlevideo.com/videoplayback?b=2";
-        let data = vs::SabrRedirect { url: Some(target.to_owned()) }.encode_to_vec();
-        handle_sabr_redirect(&mut state, &data).unwrap();
-        assert_eq!(state.server_url, target);
-    }
+    const SECRET_COOKIE: &str = "SAPISID=secret-cookie-value";
+    const SECRET_POTOKEN: &[u8] = b"secret-potoken-bytes";
 
     #[derive(Clone, Default)]
     struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     impl std::io::Write for LogBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1567,59 +1591,192 @@ mod tests {
         }
     }
 
-    /// Accepts one HTTP request, answers 500 and returns the raw request head.
-    async fn capture_one_request(listener: tokio::net::TcpListener) -> String {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut head = Vec::new();
-        let mut buf = [0u8; 4096];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = sock.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            head.extend_from_slice(&buf[..n]);
-        }
-        sock.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        String::from_utf8_lossy(&head).into_owned()
-    }
-
-    #[tokio::test]
-    async fn untrusted_streaming_host_gets_no_cookie() {
+    /// Captures all tracing output on this thread while the guard lives.
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
         let logs = LogBuf::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(move || writer.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(capture_one_request(listener));
+    /// Accepts one HTTP request, sends `response` and returns the raw request.
+    async fn serve_one(listener: tokio::net::TcpListener, response: String) -> String {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        let head_end = loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed before request head");
+            req.extend_from_slice(&buf[..n]);
+            if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+        let body_len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or(0);
+        while req.len() < head_end + body_len {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed before request body");
+            req.extend_from_slice(&buf[..n]);
+        }
+        sock.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&req).into_owned()
+    }
 
-        let mut state = test_state(&format!("http://{addr}/videoplayback"));
-        state.cookie_header = Some("SAPISID=secret-cookie-value".to_owned());
-        let http = reqwest::Client::new();
-        let (tx, _rx) = mpsc::channel(1);
-        assert!(sabr_request_cycle(&http, &mut state, &tx).await.is_err());
+    async fn assert_no_connection(listener: &tokio::net::TcpListener) {
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await;
+        assert!(accepted.is_err(), "a request reached the untrusted host");
+    }
 
-        let head = server.await.unwrap().to_ascii_lowercase();
-        assert!(head.starts_with("post /videoplayback"), "{head}");
-        assert!(!head.contains("\ncookie:"), "{head}");
-        assert!(!head.contains("secret-cookie-value"), "{head}");
+    // -- SABR redirect -------------------------------------------------------
 
-        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("127.0.0.1"), "{logs}");
-        assert!(!logs.contains("secret-cookie-value"), "{logs}");
+    #[test]
+    fn redirect_to_foreign_host_is_rejected() {
+        let (logs, _guard) = capture_logs();
+        let mut state = test_state(GOOD_URL);
+        let target = "https://evil.example/stream?token=secret-query-token";
+        let data = vs::SabrRedirect { url: Some(target.to_owned()) }.encode_to_vec();
+
+        let err = handle_sabr_redirect(&mut state, &data).unwrap_err();
+
+        assert!(err.to_string().contains("evil.example"));
+        assert!(!err.to_string().contains("secret-query-token"));
+        assert_eq!(state.server_url, GOOD_URL);
+        let logs = logs.text();
+        assert!(logs.contains("evil.example"), "{logs}");
+        assert!(!logs.contains("secret-query-token"), "{logs}");
     }
 
     #[test]
-    fn log_lines_do_not_format_secret_values() {
+    fn redirect_to_googlevideo_is_followed() {
+        let mut state = test_state(GOOD_URL);
+        let target = "https://rr2---sn-def.googlevideo.com/videoplayback?b=2";
+        let data = vs::SabrRedirect { url: Some(target.to_owned()) }.encode_to_vec();
+        handle_sabr_redirect(&mut state, &data).unwrap();
+        assert_eq!(state.server_url, target);
+    }
+
+    // -- initial streaming URL ---------------------------------------------------
+
+    #[test]
+    fn untrusted_initial_server_url_fails() {
+        let (logs, _guard) = capture_logs();
+        let err = check_streaming_url("https://evil.example/videoplayback?pot=secret-query-token")
+            .unwrap_err();
+        assert!(err.to_string().contains("evil.example"));
+        let logs = logs.text();
+        assert!(logs.contains("evil.example"), "{logs}");
+        assert!(!logs.contains("secret-query-token"), "{logs}");
+        check_streaming_url(GOOD_URL).unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_cycle_to_untrusted_host_sends_nothing() {
+        let (logs, _guard) = capture_logs();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut state = test_state(&format!("http://{addr}/videoplayback"));
+        state.cookie_header = Some(SECRET_COOKIE.to_owned());
+        state.po_token = Some(SECRET_POTOKEN.to_vec());
+        let (tx, _rx) = mpsc::channel(1);
+
+        assert!(sabr_request_cycle(credential_client(), &mut state, &tx).await.is_err());
+        assert_no_connection(&listener).await;
+
+        let logs = logs.text();
+        assert!(logs.contains("127.0.0.1"), "{logs}");
+        assert!(!logs.contains("secret-cookie-value"), "{logs}");
+        assert!(!logs.contains("secret-potoken-bytes"), "{logs}");
+    }
+
+    // -- HTTP redirects --------------------------------------------------------
+
+    #[tokio::test]
+    async fn credential_client_does_not_follow_307_to_foreign_host() {
+        let (logs, _guard) = capture_logs();
+        let foreign = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let foreign_addr = foreign.local_addr().unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let server = tokio::spawn(serve_one(
+            origin,
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{foreign_addr}/steal\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+        ));
+
+        let resp = credential_client()
+            .post(format!("http://{origin_addr}/videoplayback"))
+            .header("Cookie", SECRET_COOKIE)
+            .body("secret-body")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.await.unwrap();
+        assert_no_connection(&foreign).await;
+        let logs = logs.text();
+        assert!(logs.contains("not following redirect to 127.0.0.1"), "{logs}");
+        assert!(!logs.contains("secret-cookie-value"), "{logs}");
+    }
+
+    // -- secret-free logs ------------------------------------------------------
+
+    #[tokio::test]
+    async fn pot_token_log_shows_length_only() {
+        let (logs, _guard) = capture_logs();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let json = r#"{"poToken":"secret-potoken-value-0123456789"}"#;
+        let server = tokio::spawn(serve_one(
+            proxy,
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{json}",
+                json.len()
+            ),
+        ));
+        // bgutil-pot lives at a fixed localhost URL; route it to the fake server.
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        let token = fetch_pot_token(&http, Some("vid")).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(token.po_token, "secret-potoken-value-0123456789");
+        let logs = logs.text();
+        assert!(logs.contains(&format!("PoToken (len={})", token.po_token.len())), "{logs}");
+        assert!(!logs.contains("secret-potoken"), "{logs}");
+        assert!(!logs.contains(&token.visitor_data[..10]), "{logs}");
+    }
+
+    #[test]
+    fn log_formats_do_not_include_secret_values() {
         let src = include_str!("stream.rs").split("#[cfg(test)]").next().unwrap();
-        for forbidden in ["ctt={}...", "PoToken ({}...)", "visitor_data={}..."] {
-            assert!(!src.contains(forbidden), "log format still leaks: {forbidden}");
+        let forbidden = [
+            "ctt={}...",
+            "with ctt={}",
+            "PoToken ({}",
+            "visitor_data={}",
+            "&po_token[..",
+            "&token[..",
+            "&visitor_data[..",
+        ];
+        for pattern in forbidden {
+            assert!(!src.contains(pattern), "log format still leaks: {pattern}");
         }
     }
 }

@@ -247,7 +247,8 @@ pub async fn get_lounge_token(
         .and_then(|s| s["loungeToken"].as_str())
         .ok_or_else(|| {
             LoungeError::Protocol(format!(
-                "missing loungeToken in response: {data}"
+                "missing loungeToken in response (keys: {:?})",
+                data.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default()
             ))
         })?
         .to_owned();
@@ -284,7 +285,8 @@ pub async fn register_pairing_code(
     let resp_body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(LoungeError::Protocol(format!(
-            "register_pairing_code returned {status}: {resp_body}"
+            "register_pairing_code returned {status} (body len={})",
+            resp_body.len()
         )));
     }
 
@@ -503,7 +505,7 @@ impl LoungeSession {
         let body = encode_outgoing(messages, self.ofs);
         self.ofs += messages.len() as u32;
 
-        tracing::debug!("[lounge] POST body: {}", &body[..body.len().min(500)]);
+        tracing::debug!("[lounge] POST body len={}", body.len());
 
         let resp = self
             .client
@@ -620,7 +622,7 @@ fn dispatch_messages(
 
             // -- Lounge status --
             "loungeStatus" => {
-                tracing::debug!("lounge status: {:?}", msg.args);
+                tracing::debug!("lounge status: keys={:?}", arg_keys(&msg.args));
                 // Check if any REMOTE_CONTROL senders are connected
                 let has_senders = msg.args.get("devices")
                     .map(|d| d.contains("REMOTE_CONTROL"))
@@ -694,12 +696,19 @@ fn dispatch_messages(
             }
 
             other => {
-                tracing::debug!("unhandled lounge command: {other} args={:?}", msg.args);
+                tracing::debug!("unhandled lounge command: {other} keys={:?}", arg_keys(&msg.args));
             }
         }
     }
 
     responses
+}
+
+/// Command args can carry credentials (e.g. `ctt`), so logs get keys only.
+fn arg_keys(args: &HashMap<String, String>) -> Vec<&str> {
+    let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
 }
 
 fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sender<PlayerCommand>) {
@@ -710,7 +719,7 @@ fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sende
         .unwrap_or_default();
 
     if video_ids.is_empty() {
-        tracing::warn!("setPlaylist with no video IDs: {args:?}");
+        tracing::warn!("setPlaylist with no video IDs: keys={:?}", arg_keys(args));
         return;
     }
 
@@ -749,7 +758,7 @@ fn dispatch_set_video(args: &HashMap<String, String>, player_tx: &mpsc::Sender<P
     let video_id = match args.get("videoId") {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            tracing::warn!("setVideo with no videoId: {args:?}");
+            tracing::warn!("setVideo with no videoId: keys={:?}", arg_keys(args));
             return;
         }
     };
@@ -775,7 +784,7 @@ fn dispatch_update_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Se
         .unwrap_or_default();
 
     if video_ids.is_empty() {
-        tracing::warn!("updatePlaylist with no video IDs: {args:?}");
+        tracing::warn!("updatePlaylist with no video IDs: keys={:?}", arg_keys(args));
         return;
     }
 
@@ -857,7 +866,7 @@ pub async fn run_lounge(
         }
 
         // -- Get lounge token --
-        tracing::info!("{} obtaining lounge token for screen {}", theme_tag, session.screen_id);
+        tracing::info!("{} obtaining lounge token", theme_tag);
         match get_lounge_token(&session.client, &session.screen_id).await {
             Ok(token) => {
                 session.lounge_token = token;
@@ -1091,14 +1100,37 @@ async fn backoff_sleep(attempt: u32, shutdown: &mut watch::Receiver<bool>) -> Re
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn log_lines_do_not_format_secret_values() {
+    fn arg_keys_lists_keys_without_values() {
+        let args = HashMap::from([
+            ("videoId".to_owned(), "abc".to_owned()),
+            ("ctt".to_owned(), "secret-ctt-value".to_owned()),
+        ]);
+        let logged = format!("{:?}", arg_keys(&args));
+        assert_eq!(logged, r#"["ctt", "videoId"]"#);
+        assert!(!logged.contains("secret-ctt-value"));
+    }
+
+    #[test]
+    fn log_and_error_formats_do_not_include_secret_values() {
         let src = include_str!("lounge.rs").split("#[cfg(test)]").next().unwrap();
-        for forbidden in ["pairing code {code}", "body={resp_body}", "SID={}", "gsession={}"] {
-            assert!(!src.contains(forbidden), "log format still leaks: {forbidden}");
+        let forbidden = [
+            "pairing code {code}",
+            "{resp_body}",
+            "SID={}",
+            "gsession={}",
+            "{args:?}",
+            "{:?}\", msg.args",
+            "in response: {data}",
+            "POST body: {}",
+            "for screen {}",
+        ];
+        for pattern in forbidden {
+            assert!(!src.contains(pattern), "log/error format still leaks: {pattern}");
         }
     }
 }
