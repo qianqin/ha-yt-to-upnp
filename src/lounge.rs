@@ -288,7 +288,7 @@ pub async fn register_pairing_code(
         )));
     }
 
-    tracing::info!("pairing code {code} registered (status={status}, body={resp_body})");
+    tracing::info!("pairing code registered (status={status}, body len={})", resp_body.len());
     Ok(())
 }
 
@@ -344,7 +344,7 @@ impl LoungeSession {
             ));
         }
 
-        tracing::info!("[lounge:{}] session bound: SID={}, gsession={}", self.theme, self.sid, self.gsessionid);
+        tracing::info!("[lounge:{}] session bound", self.theme);
         Ok(messages)
     }
 
@@ -398,7 +398,7 @@ impl LoungeSession {
             ));
         }
 
-        tracing::info!("[lounge:{}] reconnected: SID={}, gsession={}", self.theme, self.sid, self.gsessionid);
+        tracing::info!("[lounge:{}] reconnected", self.theme);
         Ok(messages)
     }
 
@@ -1091,3 +1091,14 @@ async fn backoff_sleep(attempt: u32, shutdown: &mut watch::Receiver<bool>) -> Re
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_lines_do_not_format_secret_values() {
+        let src = include_str!("lounge.rs").split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["pairing code {code}", "body={resp_body}", "SID={}", "gsession={}"] {
+            assert!(!src.contains(forbidden), "log format still leaks: {forbidden}");
+        }
+    }
+}

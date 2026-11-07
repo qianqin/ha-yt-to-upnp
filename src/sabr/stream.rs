@@ -192,10 +192,10 @@ async fn fetch_pot_token(http: &reqwest::Client, content_binding: Option<&str>) 
     let visitor_data = generate_visitor_data();
 
     tracing::info!(
-        "[sabr] got PoToken ({}...) binding={}, visitor_data={}...",
-        &po_token[..po_token.len().min(20)],
+        "[sabr] got PoToken (len={}) binding={}, visitor_data len={}",
+        po_token.len(),
         content_binding.unwrap_or("<session>"),
-        &visitor_data[..visitor_data.len().min(20)],
+        visitor_data.len(),
     );
     Some(GvsToken { po_token, visitor_data })
 }
@@ -210,6 +210,40 @@ struct PlayerData {
     formats: Vec<AdaptiveFormat>,
     title: String,
     duration_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Credential host check
+// ---------------------------------------------------------------------------
+
+/// True only for https URLs on youtube.com / googlevideo.com or a subdomain.
+///
+/// Streaming URLs come from server responses (player response, SABR
+/// redirects), so cookies and auth headers must never follow them blindly.
+fn is_trusted_google_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    // domain() is None for IP literals.
+    let Some(host) = parsed.domain() else {
+        return false;
+    };
+    ["youtube.com", "googlevideo.com"].iter().any(|trusted| {
+        host == *trusted
+            || host.strip_suffix(trusted).is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Host part of a URL for log/error messages (never the full URL: query
+/// strings carry tokens).
+fn host_for_log(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<unparseable>".to_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +384,9 @@ async fn innertube_player(
     } else {
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
     };
+    if !is_trusted_google_host(url) {
+        return Err(format!("refusing to send credentials to {}", host_for_log(url)).into());
+    }
 
     // Client version from live session (changes frequently) or hardcoded constant.
     let client_version = if let Some(session) = yt_session {
@@ -1017,6 +1054,11 @@ fn handle_next_request_policy(state: &mut SabrState, data: &[u8]) -> Result<(), 
 fn handle_sabr_redirect(state: &mut SabrState, data: &[u8]) -> Result<(), SabrError> {
     let redirect = vs::SabrRedirect::decode(data)?;
     if let Some(url) = redirect.url {
+        // Following a redirect off Google would hand the next request (PoToken
+        // in the body, cookies in the headers) to that host.
+        if !is_trusted_google_host(&url) {
+            return Err(format!("SABR redirect to untrusted host {}", host_for_log(&url)).into());
+        }
         tracing::info!("[sabr] redirect to new streaming URL");
         state.server_url = url;
     }
@@ -1109,7 +1151,11 @@ async fn sabr_request_cycle(
         .header("Accept-Encoding", "identity");
 
     if let Some(ref cookies) = state.cookie_header {
-        req = req.header("Cookie", cookies);
+        if is_trusted_google_host(&url) {
+            req = req.header("Cookie", cookies);
+        } else {
+            tracing::warn!("[sabr] not sending cookies to untrusted host {}", host_for_log(&url));
+        }
     }
 
     let resp = req.body(encoded).send().await?;
@@ -1228,8 +1274,8 @@ pub async fn stream_audio(
     yt_session: Option<&crate::cookies::YtMusicSession>,
     oauth: Option<&std::sync::Arc<crate::oauth::OAuthState>>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
-    if let Some(token) = ctt {
-        tracing::info!("[sabr] stream_audio for {} with ctt={}...", video_id, &token[..token.len().min(20)]);
+    if ctt.is_some() {
+        tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
     // Get OAuth token if available (auto-refreshes if expired)
     let oauth_token = if let Some(os) = oauth {
@@ -1447,4 +1493,133 @@ async fn sabr_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn trusted_google_host_check() {
+        let cases = [
+            ("https://rr3---sn-abc.googlevideo.com/videoplayback", true),
+            ("https://www.youtube.com/youtubei/v1/player", true),
+            ("https://music.youtube.com/", true),
+            ("https://youtube.com/", true),
+            ("http://www.youtube.com/", false),
+            ("https://evilyoutube.com/", false),
+            ("https://youtube.com.evil.example/", false),
+            ("https://googlevideo.com.attacker.example/", false),
+            ("https://youtube.com@evil.example/", false),
+            ("https://user:pass@www.youtube.com/", false),
+            ("https://192.0.2.1/", false),
+            ("https://[2001:db8::1]/", false),
+            ("not-a-url", false),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(is_trusted_google_host(url), expected, "{url}");
+        }
+    }
+
+    fn test_state(server_url: &str) -> SabrState {
+        let fmt = AdaptiveFormat {
+            itag: 251,
+            last_modified: 1,
+            xtags: None,
+            mime_type: "audio/webm".to_owned(),
+            bitrate: 1,
+        };
+        SabrState::new(server_url.to_owned(), &fmt, &fmt, Vec::new(), &WEB_REMIX_CLIENT)
+    }
+
+    const GOOD_URL: &str = "https://rr1---sn-abc.googlevideo.com/videoplayback?a=1";
+
+    #[test]
+    fn redirect_to_foreign_host_is_rejected() {
+        let mut state = test_state(GOOD_URL);
+        let data = vs::SabrRedirect { url: Some("https://evil.example/stream".to_owned()) }.encode_to_vec();
+        let err = handle_sabr_redirect(&mut state, &data).unwrap_err();
+        assert!(err.to_string().contains("evil.example"));
+        assert_eq!(state.server_url, GOOD_URL);
+    }
+
+    #[test]
+    fn redirect_to_googlevideo_is_followed() {
+        let mut state = test_state(GOOD_URL);
+        let target = "https://rr2---sn-def.googlevideo.com/videoplayback?b=2";
+        let data = vs::SabrRedirect { url: Some(target.to_owned()) }.encode_to_vec();
+        handle_sabr_redirect(&mut state, &data).unwrap();
+        assert_eq!(state.server_url, target);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Accepts one HTTP request, answers 500 and returns the raw request head.
+    async fn capture_one_request(listener: tokio::net::TcpListener) -> String {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..n]);
+        }
+        sock.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    #[tokio::test]
+    async fn untrusted_streaming_host_gets_no_cookie() {
+        let logs = LogBuf::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_one_request(listener));
+
+        let mut state = test_state(&format!("http://{addr}/videoplayback"));
+        state.cookie_header = Some("SAPISID=secret-cookie-value".to_owned());
+        let http = reqwest::Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(sabr_request_cycle(&http, &mut state, &tx).await.is_err());
+
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("post /videoplayback"), "{head}");
+        assert!(!head.contains("\ncookie:"), "{head}");
+        assert!(!head.contains("secret-cookie-value"), "{head}");
+
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("127.0.0.1"), "{logs}");
+        assert!(!logs.contains("secret-cookie-value"), "{logs}");
+    }
+
+    #[test]
+    fn log_lines_do_not_format_secret_values() {
+        let src = include_str!("stream.rs").split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["ctt={}...", "PoToken ({}...)", "visitor_data={}..."] {
+            assert!(!src.contains(forbidden), "log format still leaks: {forbidden}");
+        }
+    }
 }
