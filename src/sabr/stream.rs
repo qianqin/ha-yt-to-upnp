@@ -522,7 +522,7 @@ async fn innertube_player(
         }
     }
 
-    let resp = req.json(&body).send().await?;
+    let resp = req.json(&body).send().await.map_err(|e| e.without_url())?;
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -532,7 +532,7 @@ async fn innertube_player(
         .into());
     }
 
-    let json: serde_json::Value = resp.json().await?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
 
     let status = json["playabilityStatus"]["status"]
         .as_str()
@@ -1184,7 +1184,8 @@ async fn sabr_request_cycle(
         req = req.header("Cookie", cookies);
     }
 
-    let resp = req.body(encoded).send().await?;
+    // Signed streaming URLs are credentials; reqwest errors would print them.
+    let resp = req.body(encoded).send().await.map_err(|e| e.without_url())?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1202,7 +1203,7 @@ async fn sabr_request_cycle(
     let mut byte_stream = resp.bytes_stream();
 
     while let Some(chunk_result) = byte_stream.next().await {
-        let chunk = chunk_result?;
+        let chunk = chunk_result.map_err(|e| e.without_url())?;
         parser.push(&chunk);
 
         while let Some(part) = parser.next_part() {
@@ -1293,10 +1294,9 @@ async fn sabr_request_cycle(
 /// have been downloaded, or an error occurs, the task ends and the channel
 /// closes naturally.
 ///
-/// `_client` is unused: credentialed requests go through `credential_client()`
-/// so that redirects cannot carry cookies or tokens off Google hosts.
+/// Requests go through `credential_client()` so that redirects cannot carry
+/// cookies or tokens off Google hosts.
 pub async fn stream_audio(
-    _client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
@@ -1370,13 +1370,13 @@ pub async fn stream_audio(
         if let Some(ref n_val) = n_value {
             if let Some(session) = yt_session {
                 if let Some(ref js) = session.player_js {
-                    tracing::info!("[sabr] decoding nsig: n={}...", &n_val[..n_val.len().min(10)]);
+                    tracing::info!("[sabr] decoding nsig: n len={}", n_val.len());
                     let js_clone = js.clone();
                     let n_clone = n_val.clone();
                     let hash_clone = session.player_hash.clone().unwrap_or_default();
                     match tokio::task::spawn_blocking(move || decode_nsig(&js_clone, &n_clone, &hash_clone)).await {
                         Ok(Ok(decoded)) => {
-                            tracing::info!("[sabr] nsig decoded: {} -> {}", n_val, &decoded[..decoded.len().min(10)]);
+                            tracing::info!("[sabr] nsig decoded: len {} -> {}", n_val.len(), decoded.len());
                             server_url = replace_n_param(&server_url, &decoded);
                         }
                         Ok(Err(e)) => {
@@ -1602,14 +1602,15 @@ mod tests {
         (logs, tracing::subscriber::set_default(subscriber))
     }
 
-    /// Accepts one HTTP request, sends `response` and returns the raw request.
-    async fn serve_one(listener: tokio::net::TcpListener, response: String) -> String {
-        let (mut sock, _) = listener.accept().await.unwrap();
+    /// Reads one HTTP request (head plus content-length body) from `sock`.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         let mut req = Vec::new();
         let mut buf = [0u8; 4096];
         let head_end = loop {
-            let n = sock.read(&mut buf).await.unwrap();
-            assert!(n > 0, "connection closed before request head");
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return String::from_utf8_lossy(&req).into_owned();
+            }
             req.extend_from_slice(&buf[..n]);
             if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
                 break pos + 4;
@@ -1619,21 +1620,48 @@ mod tests {
         let body_len: usize = head
             .lines()
             .find_map(|l| l.strip_prefix("content-length:"))
-            .map(|v| v.trim().parse().unwrap())
+            .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
         while req.len() < head_end + body_len {
-            let n = sock.read(&mut buf).await.unwrap();
-            assert!(n > 0, "connection closed before request body");
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
             req.extend_from_slice(&buf[..n]);
         }
-        sock.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8_lossy(&req).into_owned()
     }
 
-    async fn assert_no_connection(listener: &tokio::net::TcpListener) {
-        let accepted =
-            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await;
-        assert!(accepted.is_err(), "a request reached the untrusted host");
+    /// Accepts one HTTP request, sends `response` and returns the raw request.
+    async fn serve_one(listener: tokio::net::TcpListener, response: String) -> String {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let req = read_request(&mut sock).await;
+        sock.write_all(response.as_bytes()).await.unwrap();
+        req
+    }
+
+    /// Plays an untrusted host: records every request that reaches it and
+    /// answers 500, so a regression shows up as a recorded request, not a hang.
+    fn spawn_recorder(listener: tokio::net::TcpListener) -> Arc<Mutex<Vec<String>>> {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let req = read_request(&mut sock).await;
+                record.lock().unwrap().push(req);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        seen
+    }
+
+    async fn within_2s<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(2), fut)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish within 2s"))
     }
 
     // -- SABR redirect -------------------------------------------------------
@@ -1683,19 +1711,50 @@ mod tests {
         let (logs, _guard) = capture_logs();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let reached = spawn_recorder(listener);
 
         let mut state = test_state(&format!("http://{addr}/videoplayback"));
         state.cookie_header = Some(SECRET_COOKIE.to_owned());
         state.po_token = Some(SECRET_POTOKEN.to_vec());
         let (tx, _rx) = mpsc::channel(1);
 
-        assert!(sabr_request_cycle(credential_client(), &mut state, &tx).await.is_err());
-        assert_no_connection(&listener).await;
+        let result = within_2s("sabr_request_cycle", sabr_request_cycle(credential_client(), &mut state, &tx)).await;
 
+        let reached = reached.lock().unwrap().clone();
+        assert!(reached.is_empty(), "request reached the untrusted host: {reached:?}");
+        assert!(result.is_err());
         let logs = logs.text();
-        assert!(logs.contains("127.0.0.1"), "{logs}");
+        assert!(logs.contains("refusing untrusted streaming host 127.0.0.1"), "{logs}");
         assert!(!logs.contains("secret-cookie-value"), "{logs}");
         assert!(!logs.contains("secret-potoken-bytes"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn request_cycle_errors_do_not_carry_signed_url() {
+        let (logs, _guard) = capture_logs();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+        // Trusted URL, but every connection is routed to a closed local port.
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{closed_addr}")).unwrap())
+            .build()
+            .unwrap();
+        let mut state = test_state(
+            "https://rr1---sn-abc.googlevideo.com/videoplayback?sig=secret-sig&lsig=secret-lsig",
+        );
+        let (tx, _rx) = mpsc::channel(1);
+
+        let err = within_2s("sabr_request_cycle", sabr_request_cycle(&http, &mut state, &tx))
+            .await
+            .unwrap_err();
+        tracing::error!("[sabr] streaming error: {}", err);
+
+        for text in [err.to_string(), format!("{err:?}"), logs.text()] {
+            assert!(!text.is_empty());
+            assert!(!text.contains("secret-sig"), "{text}");
+            assert!(!text.contains("secret-lsig"), "{text}");
+        }
     }
 
     // -- HTTP redirects --------------------------------------------------------
@@ -1705,6 +1764,7 @@ mod tests {
         let (logs, _guard) = capture_logs();
         let foreign = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let foreign_addr = foreign.local_addr().unwrap();
+        let reached = spawn_recorder(foreign);
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin.local_addr().unwrap();
         let server = tokio::spawn(serve_one(
@@ -1715,17 +1775,17 @@ mod tests {
             ),
         ));
 
-        let resp = credential_client()
+        let send = credential_client()
             .post(format!("http://{origin_addr}/videoplayback"))
             .header("Cookie", SECRET_COOKIE)
             .body("secret-body")
-            .send()
-            .await
-            .unwrap();
+            .send();
+        let resp = within_2s("credential_client POST", send).await.unwrap();
+        within_2s("origin server", server).await.unwrap();
 
+        let reached = reached.lock().unwrap().clone();
+        assert!(reached.is_empty(), "redirect was followed to the foreign host: {reached:?}");
         assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        server.await.unwrap();
-        assert_no_connection(&foreign).await;
         let logs = logs.text();
         assert!(logs.contains("not following redirect to 127.0.0.1"), "{logs}");
         assert!(!logs.contains("secret-cookie-value"), "{logs}");
@@ -1774,6 +1834,8 @@ mod tests {
             "&po_token[..",
             "&token[..",
             "&visitor_data[..",
+            "n={}...",
+            "&decoded[..",
         ];
         for pattern in forbidden {
             assert!(!src.contains(pattern), "log format still leaks: {pattern}");

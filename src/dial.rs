@@ -283,7 +283,7 @@ async fn stream_audio(
     let yt_cookies = state.yt_cookies.as_ref().map(|c| c.as_ref());
     let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
     let oauth = state.oauth_state.clone();
-    match crate::sabr::stream::stream_audio(&state.http_client, &video_id, ctt.as_deref(), yt_cookies, yt_session, oauth.as_ref()).await {
+    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_cookies, yt_session, oauth.as_ref()).await {
         Ok((info, rx)) => {
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm

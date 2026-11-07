@@ -62,8 +62,10 @@ impl std::error::Error for LoungeError {
 }
 
 impl From<reqwest::Error> for LoungeError {
+    /// Lounge URLs carry SID, gsessionid and loungeIdToken in the query, and
+    /// reqwest errors print their URL; strip it so errors can be logged.
     fn from(e: reqwest::Error) -> Self {
-        LoungeError::Http(e)
+        LoungeError::Http(e.without_url())
     }
 }
 
@@ -328,7 +330,8 @@ impl LoungeSession {
                 return Err(LoungeError::UnknownSid);
             }
             return Err(LoungeError::Protocol(format!(
-                "initial_bind returned {status}: {body}"
+                "initial_bind returned {status} (body len={})",
+                body.len()
             )));
         }
 
@@ -380,7 +383,8 @@ impl LoungeSession {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(LoungeError::Protocol(format!(
-                "reconnect_bind returned {status}: {body}"
+                "reconnect_bind returned {status} (body len={})",
+                body.len()
             )));
         }
 
@@ -446,7 +450,8 @@ impl LoungeSession {
                     return Err(LoungeError::UnknownSid);
                 }
                 return Err(LoungeError::Protocol(format!(
-                    "poll returned 400: {body}"
+                    "poll returned 400 (body len={})",
+                    body.len()
                 )));
             }
             if !status.is_success() {
@@ -481,7 +486,7 @@ impl LoungeSession {
                         }
                     }
                     Ok(Some(Err(e))) => {
-                        return Err(LoungeError::Http(e));
+                        return Err(e.into());
                     }
                 }
             }
@@ -526,7 +531,8 @@ impl LoungeSession {
                 return Err(LoungeError::UnknownSid);
             }
             return Err(LoungeError::Protocol(format!(
-                "send_messages returned {status}: {body}"
+                "send_messages returned {status} (body len={})",
+                body.len()
             )));
         }
 
@@ -1103,6 +1109,92 @@ async fn backoff_sleep(attempt: u32, shutdown: &mut watch::Receiver<bool>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures all tracing output on this thread while the guard lives.
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let logs = LogBuf::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test]
+    async fn http_errors_do_not_carry_query_secrets() {
+        let (logs, _guard) = capture_logs();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+
+        let url = format!(
+            "http://{addr}/api/lounge/bc/bind?SID=secret-sid&gsessionid=secret-gs&loungeIdToken=secret-tok"
+        );
+        let err: LoungeError = reqwest::Client::new().get(&url).send().await.unwrap_err().into();
+        tracing::error!("lounge request failed: {err}");
+        tracing::error!("lounge request failed: {err:?}");
+
+        assert!(err.to_string().starts_with("lounge http:"), "{err}");
+        for text in [err.to_string(), format!("{err:?}"), logs.text()] {
+            for secret in ["secret-sid", "secret-gs", "secret-tok"] {
+                assert!(!text.contains(secret), "{secret} leaked: {text}");
+            }
+        }
+    }
+
+    fn incoming(command: &str, args: &[(&str, &str)]) -> IncomingMessage {
+        IncomingMessage {
+            index: 0,
+            command: command.to_owned(),
+            args: args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn dispatch_logs_arg_keys_not_ctt_value() {
+        let (logs, _guard) = capture_logs();
+        let mut session = LoungeSession::new(
+            reqwest::Client::new(),
+            "Test Screen".to_owned(),
+            "uuid".to_owned(),
+            "screen".to_owned(),
+            "cl".to_owned(),
+        );
+        let (player_tx, _player_rx) = mpsc::channel(8);
+        let messages = [
+            incoming("someFutureCommand", &[("ctt", "secret-ctt"), ("foo", "bar")]),
+            incoming("setVideo", &[("ctt", "secret-ctt")]),
+        ];
+
+        dispatch_messages(&mut session, &messages, &player_tx);
+
+        let logs = logs.text();
+        assert!(logs.contains("unhandled lounge command: someFutureCommand"), "{logs}");
+        assert!(logs.contains("setVideo with no videoId"), "{logs}");
+        assert!(logs.contains("\"ctt\""), "{logs}");
+        assert!(!logs.contains("secret-ctt"), "{logs}");
+    }
 
     #[test]
     fn arg_keys_lists_keys_without_values() {
@@ -1121,6 +1213,7 @@ mod tests {
         let forbidden = [
             "pairing code {code}",
             "{resp_body}",
+            "{body}\"",
             "SID={}",
             "gsession={}",
             "{args:?}",
