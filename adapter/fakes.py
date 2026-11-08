@@ -312,3 +312,32 @@ class FakeMpd:
                     f.write(b"ACK [5@0] {} unknown command\n")
         finally:
             conn.close()
+
+
+def run_bounded(test, follower, mpd, should_stop, sleep, limit_s=5):
+    """Run raumfeld_adapter.run() against a live FakeMpd in a daemon thread. A regression
+    that leaves run() blocked in MPD `idle` (or spinning) fails the test after limit_s,
+    listing the MPD commands seen, instead of hanging the suite. Exceptions raised inside
+    run() are re-raised here."""
+    import raumfeld_adapter as ra
+
+    given_up = threading.Event()
+    errors = []
+
+    def target():
+        try:
+            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleep,
+                   should_stop=lambda: given_up.is_set() or should_stop())
+        except BaseException as e:  # surfaced in the test thread below
+            errors.append(e)
+
+    runner = threading.Thread(target=target, daemon=True)
+    runner.start()
+    runner.join(limit_s)
+    if runner.is_alive():
+        given_up.set()
+        mpd.close()  # wakes run() out of `idle`; it then sees should_stop
+        runner.join(2)
+        test.fail("run() still running after %ss; MPD commands: %r" % (limit_s, mpd.commands))
+    if errors:
+        raise errors[0]

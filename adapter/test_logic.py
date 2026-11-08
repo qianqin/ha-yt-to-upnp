@@ -52,7 +52,8 @@ class ConfigTest(unittest.TestCase):
         for key, value in [("MPD_PORT", "x"), ("MPD_PORT", "70000"),
                            ("SPEAKER_POLL_SECONDS", "0"), ("SPEAKER_POLL_SECONDS", "-1"),
                            ("SPEAKER_POLL_SECONDS", "0.5"),
-                           ("SPEAKER_POLL_SECONDS", "soon"), ("SPEAKER_POLL_SECONDS", "nan"), ("STREAM_METADATA", "maybe"),
+                           ("SPEAKER_POLL_SECONDS", "soon"), ("SPEAKER_POLL_SECONDS", "nan"),
+                           ("SPEAKER_POLL_SECONDS", "inf"), ("STREAM_METADATA", "maybe"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
                            ("RAUMFELD_SPEAKER_UDN", "speaker"),
@@ -306,10 +307,11 @@ class FollowerTest(unittest.TestCase):
         self.ctl.verdict = ra.STANDBY
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.advance(5)
-        requests = self.f.take_mpd_requests()
-        self.f.on_mpd_state("play")  # after a reconnect: a re-pause is queued
-        self.f.requeue_mpd_requests(requests)
         self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        # The pause went out, then the connection dropped before the release ...
+        self.f.on_mpd_state("play")  # ... and after the reconnect a re-pause is queued.
+        self.f.requeue_mpd_requests([ra.RELEASE_CAST])
+        self.assertEqual(self.f.take_mpd_requests(), [ra.RELEASE_CAST, ra.PAUSE_PLAYER])
 
     def test_pause_without_an_owned_zone_does_not_poll(self):
         self.f.on_mpd_state("pause")

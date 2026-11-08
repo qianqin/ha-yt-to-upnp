@@ -7,7 +7,7 @@ import time
 import unittest
 
 import raumfeld_adapter as ra
-from fakes import SPEAKER_UDN, FakeMpd
+from fakes import SPEAKER_UDN, FakeMpd, run_bounded
 from test_logic import FakeClock, RecordingController
 
 
@@ -240,8 +240,7 @@ class RunLoopTest(unittest.TestCase):
         follower = RecordingFollower(stop_after=3)
         sleeps = []
         with self.assertLogs("raumfeld_adapter", "WARNING"):
-            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
-                   sleep=sleeps.append, should_stop=follower.done)
+            run_bounded(self, follower, mpd, sleep=sleeps.append, should_stop=follower.done)
         self.assertEqual(follower.states, ["stop", "play", "pause"])
         self.assertEqual(follower.ticks, 3)  # after each connect and each wake-up
         self.assertEqual(sleeps, [1])
@@ -252,8 +251,7 @@ class RunLoopTest(unittest.TestCase):
         follower = RecordingFollower(stop_after=3)
         sleeps = []
         with self.assertLogs("raumfeld_adapter", "WARNING"):
-            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
-                   sleep=sleeps.append, should_stop=follower.done)
+            run_bounded(self, follower, mpd, sleep=sleeps.append, should_stop=follower.done)
         self.assertEqual(sleeps, [1, 1])
 
     def test_failed_takeover_is_retried_after_reconnect_without_reconnect_loop(self):
@@ -273,8 +271,8 @@ class RunLoopTest(unittest.TestCase):
             clock.now += 400  # the outage outlasts the retry delay
 
         with self.assertLogs("raumfeld_adapter", "WARNING"):
-            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleep,
-                   should_stop=lambda: len(ctl.calls) >= 2 or len(sleeps) > 3)
+            run_bounded(self, follower, mpd, sleep=sleep,
+                        should_stop=lambda: len(ctl.calls) >= 2 or len(sleeps) > 3)
         self.assertEqual(ctl.calls, ["ensure_playing", "ensure_playing"])
         self.assertEqual(sleeps, [1])
 
@@ -296,8 +294,8 @@ class RunLoopTest(unittest.TestCase):
         follower.tick = tick
         sleeps = []
         with self.assertLogs("raumfeld_adapter", "WARNING"):
-            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleeps.append,
-                   should_stop=lambda: len(ticks) >= 3 or bool(sleeps))
+            run_bounded(self, follower, mpd, sleep=sleeps.append,
+                        should_stop=lambda: len(ticks) >= 3 or bool(sleeps))
         self.assertEqual(sleeps, [])
         self.assertEqual(mpd.commands.count("noidle"), 2)
 

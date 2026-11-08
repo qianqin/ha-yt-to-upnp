@@ -5,13 +5,12 @@ adapter stays away until the user resumes from the phone.
 Real Follower + Controller against the fake Raumfeld host; MPD events are fed by hand.
 """
 
-import threading
 import time
 import unittest
 
 import raumfeld_adapter as ra
 from fakes import (LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN, FakeDiscovery,
-                   FakeMpd, FakeRaumfeld)
+                   FakeMpd, FakeRaumfeld, run_bounded)
 from test_logic import FakeClock
 
 POLL_S = 5
@@ -343,29 +342,13 @@ class SpeakerYieldTest(unittest.TestCase):
 class SpeakerYieldRunTest(unittest.TestCase):
     """End to end through run(): the adapter talks to MPD over its own connection."""
 
-    def run_until(self, mpd, rf, follower, mutate, done, limit_s=5):
-        """run() until done(); a regression that leaves it blocked in MPD `idle` fails the
-        test after limit_s instead of hanging the suite."""
-        deadline = time.monotonic() + limit_s
-        given_up = threading.Event()
-
+    def run_until(self, mpd, rf, follower, mutate, done):
         def should_stop():
             with rf.lock:
                 mutate()
-            return given_up.is_set() or done() or time.monotonic() > deadline
+            return done()
 
-        def target():
-            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
-                   sleep=lambda s: time.sleep(0.05), should_stop=should_stop)
-
-        runner = threading.Thread(target=target, daemon=True)
-        runner.start()
-        runner.join(limit_s)
-        if runner.is_alive():
-            given_up.set()
-            mpd.close()  # wakes run() out of `idle`; it then sees should_stop
-            runner.join(2)
-            self.fail("run() still blocked after %ss; MPD commands: %r" % (limit_s, mpd.commands))
+        run_bounded(self, follower, mpd, should_stop, sleep=lambda s: time.sleep(0.05))
 
     def setUp(self):
         self.rf = FakeRaumfeld()
