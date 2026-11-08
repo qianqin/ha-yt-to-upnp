@@ -47,6 +47,8 @@ pub struct DialState {
     /// player tell a failed stream from a song that ended, since MPD just
     /// stops in both cases.
     pub stream_failure: std::sync::Mutex<Option<(String, String)>>,
+    /// Caps the endless `/silence` streams open at once.
+    pub silence_slots: SilenceSlots,
 }
 
 impl DialState {
@@ -251,11 +253,13 @@ async fn app_launch(
             if let Err(e) = tx.send(code.clone()).await {
                 tracing::error!("failed to send pairing code: {e}");
             }
+            // Only a launch that pairs a phone may wake the speaker: any LAN
+            // peer can POST here.
+            request_preroll(&state.preroll_tx);
         }
     }
 
     state.running.store(true, Ordering::Relaxed);
-    request_preroll(&state.preroll_tx);
 
     // DIAL spec: 201 Created with LOCATION pointing to the running instance.
     let mut headers = HeaderMap::new();
@@ -305,15 +309,35 @@ pub const SILENCE_PATH: &str = "/silence";
 const SILENCE_CONTENT_TYPE: &str = "audio/L16;rate=44100;channels=2";
 /// About 93 ms of 16-bit stereo at 44.1 kHz per chunk.
 static SILENCE_CHUNK: [u8; 16 * 1024] = [0; 16 * 1024];
+/// MPD needs one; the second covers a stream that is still closing while
+/// the next pre-roll opens its own.
+const SILENCE_MAX_STREAMS: usize = 2;
+
+pub struct SilenceSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for SilenceSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(SILENCE_MAX_STREAMS)))
+    }
+}
 
 /// Not paced: MPD reads only as far ahead as its input buffer, and TCP
 /// back-pressure suspends the stream until it reads again.
-async fn silence_audio(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
+async fn silence_audio(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<DialState>>,
+) -> Response {
     if !is_loopback_peer(peer) {
-        tracing::warn!("[silence] rejected non-loopback peer {}", peer);
+        tracing::debug!("[silence] rejected non-loopback peer {}", peer);
         return StatusCode::FORBIDDEN.into_response();
     }
-    let chunks = futures_util::stream::repeat_with(|| {
+    let Ok(slot) = state.silence_slots.0.clone().try_acquire_owned() else {
+        tracing::debug!("[silence] all {SILENCE_MAX_STREAMS} streams busy");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // The body owns the slot, so it is freed when the stream is dropped.
+    let chunks = futures_util::stream::repeat_with(move || {
+        let _slot = &slot;
         Ok::<_, std::io::Error>(bytes::Bytes::from_static(&SILENCE_CHUNK))
     });
     (
@@ -333,7 +357,7 @@ async fn stream_audio(
     State(state): State<Arc<DialState>>,
 ) -> Response {
     if !is_loopback_peer(peer) {
-        tracing::warn!("[stream] rejected non-loopback peer {}", peer);
+        tracing::debug!("[stream] rejected non-loopback peer {}", peer);
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -448,6 +472,7 @@ mod tests {
             yt_session: None,
             screen_id: "test-screen".to_string(),
             stream_failure: Default::default(),
+            silence_slots: Default::default(),
         })
     }
 
@@ -625,6 +650,62 @@ mod tests {
             assert_eq!(launch(test_state_with(tx), theme).await, StatusCode::CREATED);
             assert_eq!(rx.try_recv(), Ok(()), "theme={theme}");
         }
+    }
+
+    #[tokio::test]
+    async fn launch_without_pairing_code_requests_no_preroll() {
+        // Any LAN peer can POST a launch; only a phone that pairs may wake
+        // the speaker and take it from its other source.
+        for body in ["", "theme=m&v=dQw4w9WgXcQ", "pairingCode=&theme=m"] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let status = app_launch(
+                Method::POST,
+                "/apps/YouTube".parse().unwrap(),
+                ConnectInfo(peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))),
+                State(test_state_with(tx)),
+                body.to_string(),
+            )
+            .await
+            .status();
+            assert_eq!(status, StatusCode::CREATED, "{body:?}");
+            assert!(rx.try_recv().is_err(), "pre-roll requested for {body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_lan_peers_are_not_logged_as_warnings() {
+        // A LAN peer probing /silence or /stream must not flood the log.
+        let lan = peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        let capture = crate::storage::test_util::LogCapture::start();
+        let silence = silence_audio(ConnectInfo(lan), State(test_state())).await;
+        let stream = stream_audio(
+            axum::extract::Path("dQw4w9WgXcQ".to_string()),
+            ConnectInfo(lan),
+            State(test_state()),
+        )
+        .await;
+        assert_eq!(silence.status(), StatusCode::FORBIDDEN);
+        assert_eq!(stream.status(), StatusCode::FORBIDDEN);
+        let logs = capture.text();
+        assert!(logs.contains("rejected non-loopback peer"), "log capture is not working: {logs:?}");
+        assert!(!logs.contains("WARN"), "rejections logged as warnings: {logs}");
+    }
+
+    #[tokio::test]
+    async fn silence_serves_at_most_two_streams_at_once() {
+        let state = test_state();
+        let local = || ConnectInfo(peer(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let first = silence_audio(local(), State(state.clone())).await;
+        let second = silence_audio(local(), State(state.clone())).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            silence_audio(local(), State(state.clone())).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A finished stream frees its slot.
+        drop(first);
+        assert_eq!(silence_audio(local(), State(state)).await.status(), StatusCode::OK);
     }
 
     #[tokio::test]

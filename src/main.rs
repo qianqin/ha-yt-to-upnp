@@ -213,6 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         yt_session: yt_session.clone(),
         screen_id: config.screen_id.clone(),
         stream_failure: Default::default(),
+        silence_slots: Default::default(),
     });
 
     // 12. Spawn background tasks
