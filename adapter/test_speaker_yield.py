@@ -42,7 +42,8 @@ class SpeakerYieldTest(unittest.TestCase):
         self.discover = FakeDiscovery(self.rf)
         self.clock = FakeClock()
         self.follower = ra.Follower(make_controller(self.rf, self.discover),
-                                    poll_seconds=POLL_S, clock=self.clock)
+                                    poll_seconds=POLL_S, clock=self.clock,
+                                    start_gate_seconds=0)
 
     def tearDown(self):
         assert_speaker_left_alone(self, self.rf)
@@ -348,7 +349,8 @@ class StuckRendererScenarioTest(unittest.TestCase):
         self.addCleanup(self.rf.close)
         self.clock = FakeClock()
         self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
-                                    poll_seconds=POLL_S, clock=self.clock, stuck_seconds=15)
+                                    poll_seconds=POLL_S, clock=self.clock, stuck_seconds=15,
+                                    start_gate_seconds=0)
 
     def poll(self):
         self.clock.now += POLL_S
@@ -445,7 +447,7 @@ class SpeakerYieldRunTest(unittest.TestCase):
         self.rf = FakeRaumfeld()
         self.addCleanup(self.rf.close)
         self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
-                                    poll_seconds=0.05)
+                                    poll_seconds=0.05, start_gate_seconds=0)
 
     def tearDown(self):
         assert_speaker_left_alone(self, self.rf)

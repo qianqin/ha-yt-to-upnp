@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import unittest
+from unittest import mock
 
 import raumfeld_adapter as ra
 from fakes import SPEAKER_UDN, FakeMpd, run_bounded
@@ -278,7 +279,7 @@ class RunLoopTest(unittest.TestCase):
         clock = FakeClock()
         ctl = RecordingController()
         ctl.fail = OSError("speaker unreachable")
-        follower = ra.Follower(ctl, poll_seconds=5, clock=clock)
+        follower = ra.Follower(ctl, poll_seconds=5, clock=clock, start_gate_seconds=0)
         # Connection 1 reports play then drops; connection 2 stays open in idle.
         mpd = FakeMpd([["play"], ["play"]], close_after=False)
         mpd.close_first = True
@@ -300,7 +301,7 @@ class RunLoopTest(unittest.TestCase):
         clock = FakeClock()
         ctl = RecordingController()
         ctl.fail = OSError("speaker unreachable")
-        follower = ra.Follower(ctl, poll_seconds=5, clock=clock)
+        follower = ra.Follower(ctl, poll_seconds=5, clock=clock, start_gate_seconds=0)
         mpd = FakeMpd([["play"]])
         self.addCleanup(mpd.close)
         ticks = []
@@ -343,13 +344,31 @@ class RunLoopTest(unittest.TestCase):
         follower = ra.Follower(ctl, poll_seconds=5, start_gate_seconds=5)
         mpd = FakeMpd([[("play", "1")]])
         self.addCleanup(mpd.close)
+        takeovers = []
+        real_ensure = ctl.ensure_playing
+
+        def ensure_playing(wake=True):
+            takeovers.append((time.monotonic(), list(mpd.commands)))
+            return real_ensure(wake)
+
+        ctl.ensure_playing = ensure_playing
         started = time.monotonic()
-        with self.assertLogs("raumfeld_adapter", "WARNING"):
+        # A short retry delay, so the run goes past the idle event of our own pause 0 and on
+        # to the retry within the test's time limit.
+        with mock.patch.object(ra, "PLAY_RETRY_S", 1.5), \
+                self.assertLogs("raumfeld_adapter", "WARNING"):
             run_bounded(self, follower, mpd, sleep=lambda s: None,
-                        should_stop=lambda: "pause 0" in mpd.commands)
-        # Not after the next MPD event or the 30 s takeover retry.
-        self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(ctl.calls, ["ensure_playing"])
+                        should_stop=lambda: len(takeovers) >= 2)
+        # pause 0 went out right after the failure, not after the next MPD event or the retry.
+        resumed_by = takeovers[1][1]
+        self.assertEqual([c for c in resumed_by if c.startswith("pause")], ["pause 1", "pause 0"])
+        self.assertLess(takeovers[0][0] - started, 2)
+        # The echo of our pause 0 started no new gate; the retry waited for its delay and
+        # did not hold MPD again.
+        self.assertGreaterEqual(takeovers[1][0] - takeovers[0][0], 1.4)
+        self.assertEqual([c for c in mpd.commands if c.startswith("pause")],
+                         ["pause 1", "pause 0"])
+        self.assertEqual(ctl.calls, ["ensure_playing", "ensure_playing"])
 
     def test_mpd_dropping_a_client_silent_during_slow_speaker_io_is_logged_truthfully(self):
         # The incident: a speaker request ran into its deadline while the adapter was out

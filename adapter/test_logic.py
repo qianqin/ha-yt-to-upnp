@@ -298,7 +298,7 @@ class FollowerTest(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.ctl = RecordingController()
-        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock)
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
 
     def advance(self, seconds):
         self.clock.now += seconds
@@ -428,7 +428,7 @@ class StuckRendererTest(unittest.TestCase):
         self.clock = FakeClock()
         self.ctl = RecordingController()
         self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
-                             stuck_seconds=self.STUCK_S)
+                             stuck_seconds=self.STUCK_S, start_gate_seconds=0)
         self.f.on_mpd_state("play")
         self.ctl.calls.clear()
 
@@ -559,6 +559,7 @@ class StartGateTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.advance(ra.GATE_POLL_S)
         self.released()
+        self.f.on_mpd_state("play", "1")  # the idle event of our own pause 0
         self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["plays_stream"] * 3)
         self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual from now on
         self.assertEqual(self.requests(), [])
@@ -602,8 +603,14 @@ class StartGateTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             self.f.on_mpd_state("pause", "1")
         self.released()
+        self.f.on_mpd_state("play", "1")  # the idle event of our own pause 0 is no new cast
+        self.assertEqual(self.requests(), [])
         self.assertEqual(self.f.seconds_until_deadline(), ra.PLAY_RETRY_S)
         self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.ctl.fail = None
+        self.advance(ra.PLAY_RETRY_S)  # the retry takes over without holding MPD again
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+        self.assertEqual(self.requests(), [])
 
     def test_stop_from_the_phone_during_the_gate_is_not_overridden(self):
         self.held()
@@ -627,6 +634,21 @@ class StartGateTest(unittest.TestCase):
                     self.advance(5)
                 self.assertEqual(self.requests(), [])
                 self.assertEqual(self.ctl.calls.count("ensure_playing"), 1)
+
+    def test_song_change_while_our_resume_is_on_its_way_ends_the_gate(self):
+        self.held()
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("play", "2")  # the phone skipped right as pause 0 landed
+        # MPD-supplied values are logged with %r.
+        self.assertTrue(any("MPD changed during the start gate ('play', song '2')" in m
+                            for m in logs.output), logs.output)
+        self.assertIsNone(self.f._gate)
+        self.assertEqual(self.ctl.calls[-1], "ensure_playing(no wake)")  # a song change
+        self.assertEqual(self.requests(), [])
 
     def test_stop_before_our_pause_lands_drops_the_pause(self):
         with self.assertLogs("raumfeld_adapter", "INFO"):
@@ -683,6 +705,10 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.ctl.calls, ["ensure_playing"])
         self.assertEqual(self.requests(), [])  # the stale pause 1 is dropped
         self.assertEqual(self.f.seconds_until_deadline(), ra.PLAY_RETRY_S)
+
+    def test_gate_is_on_by_default_like_the_config(self):
+        self.assertEqual(ra.Follower(self.ctl).start_gate_seconds, ra.START_GATE_S)
+        self.assertEqual(ra.Config.from_env(REQUIRED).start_gate_seconds, ra.START_GATE_S)
 
     def test_gate_off_takes_over_at_once(self):
         f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)

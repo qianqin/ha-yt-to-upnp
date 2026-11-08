@@ -709,7 +709,7 @@ class Follower:
     be told apart from ours (MPD is already paused, nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
-                 stuck_seconds=STUCK_S, start_gate_seconds=0):
+                 stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S):
         self.controller = controller
         self.poll_seconds = poll_seconds
         self.stuck_seconds = stuck_seconds
@@ -720,6 +720,7 @@ class Follower:
         self.pending = None
         self.deadline = None
         self.mpd_state = None
+        self.mpd_song = None
         self.owned = False
         self.yielded = False
         self.wake = True
@@ -727,7 +728,11 @@ class Follower:
         self._requests = []
 
     def on_mpd_state(self, state, songid=None):
-        previous, self.mpd_state = self.mpd_state, state
+        if songid is not None and (state, songid) == (self.mpd_state, self.mpd_song):
+            # No change: the idle event of our own pause 0 after the status read that already
+            # reported it, or a seek. Taken as a new start it would hold MPD again at once.
+            return
+        previous, self.mpd_state, self.mpd_song = self.mpd_state, state, songid
         self.stopped_polls = 0
         if self._gate is not None:
             if self._gated(state, songid):
@@ -798,7 +803,7 @@ class Follower:
         if gate.phase == _RESUMING and state == "play" and song == gate.song:
             self._gate = None  # our pause 0 landed
             return True
-        log.info("MPD changed during the start gate (%s, song %s); leaving it as it is",
+        log.info("MPD changed during the start gate (%r, song %r); leaving it as it is",
                  state, song)
         self._gate = None
         self._requests = [r for r in self._requests if r not in (PAUSE_PLAYER, RESUME_PLAYER)]
