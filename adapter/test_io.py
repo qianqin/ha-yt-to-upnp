@@ -319,6 +319,38 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(sleeps, [])
         self.assertEqual(mpd.commands.count("noidle"), 2)
 
+    def test_start_gate_pauses_before_the_takeover_and_resumes_once_playing(self):
+        ctl = RecordingController()
+        follower = ra.Follower(ctl, poll_seconds=5, start_gate_seconds=5)
+        mpd = FakeMpd([[("play", "1")]])
+        self.addCleanup(mpd.close)
+        real_ensure = ctl.ensure_playing
+
+        def ensure_playing(wake=True):
+            ctl.calls.append("mpd sent: %r" % [c for c in mpd.commands if c.startswith("pause")])
+            return real_ensure(wake)
+
+        ctl.ensure_playing = ensure_playing
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            run_bounded(self, follower, mpd, sleep=lambda s: None,
+                        should_stop=lambda: "pause 0" in mpd.commands)
+        self.assertEqual(ctl.calls[:3], ["mpd sent: ['pause 1']", "ensure_playing", "plays_stream"])
+        self.assertEqual([c for c in mpd.commands if c.startswith("pause")], ["pause 1", "pause 0"])
+
+    def test_failed_takeover_in_the_gate_resumes_mpd_right_away(self):
+        ctl = RecordingController()
+        ctl.fail = OSError("speaker unreachable")
+        follower = ra.Follower(ctl, poll_seconds=5, start_gate_seconds=5)
+        mpd = FakeMpd([[("play", "1")]])
+        self.addCleanup(mpd.close)
+        started = time.monotonic()
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            run_bounded(self, follower, mpd, sleep=lambda s: None,
+                        should_stop=lambda: "pause 0" in mpd.commands)
+        # Not after the next MPD event or the 30 s takeover retry.
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(ctl.calls, ["ensure_playing"])
+
     def test_unreachable_mpd_backs_off_exponentially(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))

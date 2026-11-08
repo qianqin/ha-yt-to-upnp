@@ -376,6 +376,60 @@ class StuckRendererScenarioTest(unittest.TestCase):
             self.assertNotIn("Standby", path)
 
 
+class StartGateScenarioTest(unittest.TestCase):
+    """Scenario: a cast starts while the room sleeps or plays line-in. MPD is held at the
+    start of the song until the zone renderer plays our stream, so nothing is missed."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.clock = FakeClock()
+        self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
+                                    poll_seconds=POLL_S, clock=self.clock, start_gate_seconds=15)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+        self.assertNotIn("Pause", self.rf.soap_actions())  # our gate pause stays in MPD
+
+    def gate_tick(self):
+        self.clock.now += ra.GATE_POLL_S
+        self.follower.tick()
+
+    def test_explicit_cast_over_line_in_is_held_until_the_renderer_plays(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "PLAYING"
+        self.rf.current_uri = LINE_IN_URI
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.rf.requests, [])  # MPD first, the room after
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.PAUSE_PLAYER])
+        self.rf.stuck = True  # Play leads to TRANSITIONING: connecting and buffering
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.gate_tick()
+        self.assertEqual(self.follower.take_mpd_requests(), [])
+        with self.rf.lock:
+            self.rf.transport_state = "PLAYING"
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.gate_tick()
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.follower.take_mpd_requests(), [])
+        self.assertFalse(self.follower.yielded)
+
+    def test_waking_room_in_standby_is_held_and_released(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+        self.follower.take_mpd_requests()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")
+        self.assertEqual(self.rf.api_calls()[-1], "leaveStandby")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.gate_tick()  # the fake renderer plays right after Play
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
+
+
 class SpeakerYieldRunTest(unittest.TestCase):
     """End to end through run(): the adapter talks to MPD over its own connection."""
 

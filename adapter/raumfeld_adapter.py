@@ -76,7 +76,8 @@ def _seconds(env, key, default, minimum):
 
 
 class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime stream_metadata "
-                                  "poll_seconds stuck_seconds mpd_host mpd_port log_level")):
+                                  "poll_seconds stuck_seconds start_gate_seconds mpd_host mpd_port "
+                                  "log_level")):
     @classmethod
     def from_env(cls, env):
         required = ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN", "STREAM_URL")
@@ -95,6 +96,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
         # Below 1 s the adapter would hammer the speaker's API and SSDP.
         poll_seconds = _seconds(env, "SPEAKER_POLL_SECONDS", "5", 1)
         stuck_seconds = _seconds(env, "STUCK_SECONDS", str(STUCK_S), 1)
+        start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0)
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -120,6 +122,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             stream_metadata=metadata == "1",
             poll_seconds=poll_seconds,
             stuck_seconds=stuck_seconds,
+            start_gate_seconds=start_gate_seconds,
             mpd_host=env.get("MPD_HOST", "localhost").strip(),
             mpd_port=mpd_port,
             log_level=log_level,
@@ -462,16 +465,28 @@ class Controller:
             raise
         return judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
 
+    def plays_stream(self):
+        """Whether the zone renderer of the last takeover or look reports PLAYING on our
+        stream. Only the renderer is asked: right after a wake the room's power state in
+        getZones may still lag behind."""
+        control = self._known_control()
+        state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
+        uri = soap_call(control, "GetMediaInfo", []).get("CurrentURI", "")
+        return state == "PLAYING" and uri == self.config.stream_url
+
     def restart_renderer(self):
         """Stop, then Play, on the zone renderer of the last look at the room. A renderer that
         hangs in TRANSITIONING ignores a plain Play; Stop followed right away by Play brings
         it back. The stream URI is left as it is."""
-        if self._control is None:
-            raise RaumfeldError("no zone renderer known to restart")
-        control = self._control[1]
+        control = self._known_control()
         soap_call(control, "Stop", [])
         soap_call(control, "Play", [("Speed", "1")])
         log.info("zone %r restarted (Stop, Play)", self._control[0])
+
+    def _known_control(self):
+        if self._control is None:
+            raise RaumfeldError("no zone renderer known yet")
+        return self._control[1]
 
     def _inspect(self, reuse=False):
         if not (reuse and self._api):
@@ -626,13 +641,34 @@ STOPPED_GRACE_POLLS = 2
 # one before; a renderer seen PLAYING again ends the episode.
 STUCK_S = 15
 STUCK_MAX_RESTARTS = 3
+# Start gate: at a takeover MPD is held at the start of the song (pause 1) until the
+# renderer plays our stream, at most START_GATE_S seconds; the renderer is asked every
+# GATE_POLL_S seconds meanwhile.
+START_GATE_S = 15
+GATE_POLL_S = 0.5
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
+RESUME_PLAYER = "resume"
 RELEASE_CAST = "release_cast"
 
 _PLAY = "ensure_playing"
 _POLL = "check"
+_GATE = "gate"
+
+# Start gate phases: our pause 1 is on its way; MPD is held while the speaker wakes and
+# buffers; our pause 0 is on its way.
+_PAUSING = "pausing"
+_HOLDING = "holding"
+_RESUMING = "resuming"
+
+
+class _Gate:
+    def __init__(self, song, started, seconds):
+        self.phase = _PAUSING
+        self.song = song
+        self.started = started
+        self.deadline = started + seconds
 
 _REASONS = {
     STANDBY: "room went to standby",
@@ -651,13 +687,22 @@ class Follower:
     (if playing) and to tell the receiver to end the cast, and leaves the room alone
     until the user resumes (MPD pause -> play) or the receiver ends the session
     (pause -> stop). If the room goes away while MPD is stopped there is no cast to
-    end: it just lets go (no pause, no release) and the next play wakes the room."""
+    end: it just lets go (no pause, no release) and the next play wakes the room.
+
+    Start gate: when MPD starts playing and the adapter doesn't own the zone, it first
+    asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
+    pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). Its
+    own pause and resume are not followed. A stop or another song during the gate is
+    the user's doing and is never undone; a pause from the phone during the gate can't
+    be told apart from ours (MPD is already paused, nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
-                 stuck_seconds=STUCK_S):
+                 stuck_seconds=STUCK_S, start_gate_seconds=0):
         self.controller = controller
         self.poll_seconds = poll_seconds
         self.stuck_seconds = stuck_seconds
+        self.start_gate_seconds = start_gate_seconds
+        self._gate = None
         self.clock = clock
         self._stuck = None  # (first seen, restarts so far, next restart due) of a stuck episode
         self.pending = None
@@ -672,6 +717,11 @@ class Follower:
     def on_mpd_state(self, state, songid=None):
         previous, self.mpd_state = self.mpd_state, state
         self.stopped_polls = 0
+        if self._gate is not None:
+            if self._gated(state, songid):
+                return
+            # The gate was ended by someone else; our own pause was no user pause.
+            previous = "play"
         if self.yielded:
             if previous != "pause" or state == "pause":
                 if state == "play":
@@ -682,7 +732,9 @@ class Follower:
                 return
             # MPD left the pause on the user's behalf: resumed, or the session ended.
             self.yielded = False
-        if state == "play":
+        if state == "play" and not self.owned and self.start_gate_seconds > 0:
+            self._start_gate(songid)
+        elif state == "play":
             # Only a user resume may wake a zone we own; a song change must not.
             self.wake = previous == "pause" or not self.owned
             self._attempt(_PLAY)
@@ -711,11 +763,85 @@ class Follower:
         if self.pending is not None and self.clock() >= self.deadline:
             self._attempt(self.pending)
 
+    def _start_gate(self, song):
+        log.info("holding MPD at the start of the song while the speaker wakes (at most %g s)",
+                 self.start_gate_seconds)
+        self._gate = _Gate(song, self.clock(), self.start_gate_seconds)
+        self._requests.append(PAUSE_PLAYER)
+        # Should our pause never be confirmed, the gate deadline still takes over.
+        self.pending, self.deadline = _GATE, self._gate.deadline
+
+    def _gated(self, state, song):
+        """Handle an MPD state during the gate; False once someone else ended it."""
+        gate = self._gate
+        if gate.phase == _PAUSING and state == "pause":
+            # Our pause 1 holds the song: now wake the room.
+            gate.phase, gate.song = _HOLDING, song
+            self._gate_take_over()
+            return True
+        if gate.phase == _PAUSING and state == "play":
+            return True  # our pause 1 is still on its way (e.g. after a reconnect)
+        if state == "pause" and song == gate.song and gate.phase != _PAUSING:
+            return True  # ours (an event that arrives late), or a phone pause we can't tell apart
+        if gate.phase == _RESUMING and state == "play" and song == gate.song:
+            self._gate = None  # our pause 0 landed
+            return True
+        log.info("MPD changed during the start gate (%s, song %s); leaving it as it is",
+                 state, song)
+        self._gate = None
+        self._requests = [r for r in self._requests if r not in (PAUSE_PLAYER, RESUME_PLAYER)]
+        if self.pending == _GATE:
+            self.pending = None
+        return False
+
+    def _gate_take_over(self):
+        self.wake = True
+        self._attempt(_PLAY)
+        if self.owned:
+            self._schedule(_GATE)
+        else:
+            # The takeover failed and is retried later; never keep the phone waiting for it.
+            self._release_gate("the takeover failed")
+
+    def _gate_check(self):
+        if self._gate.phase == _PAUSING:
+            # Our pause 1 never landed: play ungated.
+            log.warning("MPD was not paused within %g s; taking over without the start gate",
+                        self.start_gate_seconds)
+            self._gate = None
+            self._requests = [r for r in self._requests if r != PAUSE_PLAYER]
+            self.wake = True
+            return self._attempt(_PLAY)
+        try:
+            plays = self.controller.plays_stream()
+        except _ERRORS as e:
+            log.debug("start gate: renderer check failed: %r", e)
+            plays = False
+        if plays:
+            log.info("speaker plays; resuming MPD after %.1f s", self.clock() - self._gate.started)
+            self._end_gate()
+        elif self.clock() >= self._gate.deadline:
+            self._release_gate("the renderer does not play after %g s" % self.start_gate_seconds)
+        else:
+            self._schedule(_GATE)
+
+    def _release_gate(self, reason):
+        log.warning("start gate: %s; resuming MPD anyway", reason)
+        self._end_gate()
+
+    def _end_gate(self):
+        self._gate.phase = _RESUMING
+        self._requests.append(RESUME_PLAYER)
+        if self.pending in (None, _GATE):
+            self._schedule(_POLL)
+
     def _attempt(self, action):
         self.pending = None
         try:
             if action == _PLAY:
                 self._take_over()
+            elif action == _GATE:
+                self._gate_check()
             else:
                 self._poll()
         except _ERRORS as e:
@@ -791,25 +917,36 @@ class Follower:
 
     def _schedule(self, action):
         self.pending = action
-        self.deadline = self.clock() + (PLAY_RETRY_S if action == _PLAY else self.poll_seconds)
+        if action == _GATE:
+            self.deadline = min(self.clock() + GATE_POLL_S, self._gate.deadline)
+        else:
+            self.deadline = self.clock() + (PLAY_RETRY_S if action == _PLAY else self.poll_seconds)
 
 
 def _serve_requests(follower, mpd):
-    requests = follower.take_mpd_requests()
-    for i, request in enumerate(requests):
-        try:
-            if request == PAUSE_PLAYER:
-                mpd.pause()
-                # Note the pause before the message goes out: a receiver that ends the
-                # session right away would otherwise fold our pause and its stop into one
-                # MPD event.
-                follower.on_mpd_state(*mpd.status())
-            else:
-                _send_release(mpd)
-        except BaseException:
-            # The connection is gone; what is left must still go out after the reconnect.
-            follower.requeue_mpd_requests(requests[i:])
-            raise
+    # Reporting a pause or resume back may queue more (the start gate takes over right
+    # after its pause 1 and may ask for pause 0 at once), so serve until none are left.
+    while True:
+        requests = follower.take_mpd_requests()
+        if not requests:
+            return
+        for i, request in enumerate(requests):
+            try:
+                if request in (PAUSE_PLAYER, RESUME_PLAYER):
+                    if request == PAUSE_PLAYER:
+                        mpd.pause()
+                    else:
+                        mpd.resume()
+                    # Note the change before the message goes out: a receiver that ends the
+                    # session right away would otherwise fold our pause and its stop into
+                    # one MPD event.
+                    follower.on_mpd_state(*mpd.status())
+                else:
+                    _send_release(mpd)
+            except BaseException:
+                # The connection is gone; what is left must still go out after the reconnect.
+                follower.requeue_mpd_requests(requests[i:])
+                raise
 
 
 def _send_release(mpd):
@@ -868,7 +1005,8 @@ def main(env=None):
         log.warning("IDLE_MINUTES is ignored: the Raumfeld's own auto power-off puts the room "
                     "into standby")
     controller = Controller(config, ssdp_discover)
-    follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds)
+    follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds,
+                        start_gate_seconds=config.start_gate_seconds)
     try:
         run(follower, lambda: MpdClient(config.mpd_host, config.mpd_port))
     except KeyboardInterrupt:

@@ -7,6 +7,23 @@ Raumfeld room play the receiver's MPD stream automatically.
   wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
   it to a new one only if it has none) and tells the zone's renderer to play
   `STREAM_URL` via UPnP AVTransport.
+- **Start gate:** the speaker needs several seconds to wake, join its zone and
+  buffer, while MPD starts the song right away. So when MPD starts playing and the
+  adapter doesn't own the room (a new cast, or a resume after the room was taken
+  away), it first sends MPD `pause 1`, which holds the song at about 0:00; MPD's
+  httpd output keeps streaming silence while paused (`always_on`), so the speaker
+  can connect. Then it wakes the room and starts the stream as usual, asks the
+  zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`, and sends
+  `pause 0` as soon as it is. If that doesn't happen within `START_GATE_SECONDS`,
+  or the takeover fails, it sends `pause 0` anyway and logs a warning: playback is
+  never blocked. The adapter's own pause is not followed to the speaker (no
+  AVTransport `Pause`, no "taken away"). If MPD stops or switches to another song
+  (MPD `songid`) during the gate, that was the user (or the receiver) and the
+  adapter does not unpause. **Limit:** a pause from the phone during the gate
+  can't be told apart from the adapter's own pause (MPD is already paused, so
+  nothing changes), and is undone when the gate opens. Song changes and resumes
+  while the adapter owns the room are not gated: the speaker already plays the
+  stream. The phone shows the position standing still during the gate.
 - If the zone already plays the stream, it does nothing. **An explicit cast
   wins at takeover:** a new cast or a user resume takes the room over from any
   other source, e.g. the Raumfeld **line-in** (a Chromecast Audio or a karaoke
@@ -87,6 +104,7 @@ the stream (the phone shows it paused).
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
+| `START_GATE_SECONDS` | `15` | Longest time (seconds) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off |
 | `STUCK_SECONDS` | `15` | How long (seconds, at least 1) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
