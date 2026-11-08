@@ -6,6 +6,7 @@ mod messages;
 mod mpd;
 mod music_session;
 mod nsig;
+mod preroll;
 mod sabr;
 mod ssdp;
 mod storage;
@@ -32,6 +33,8 @@ struct PlaylistState {
     cpn: String,
     /// Last reported player state (for reference-matching NowPlaying logic).
     last_state: messages::PlayerState,
+    /// Silence MPD plays from a DIAL launch until the first song.
+    preroll: preroll::PreRoll,
 }
 
 impl Default for PlaylistState {
@@ -46,6 +49,7 @@ impl Default for PlaylistState {
             current_duration: 0,
             cpn: messages::generate_cpn(),
             last_state: messages::PlayerState::Idle,
+            preroll: preroll::PreRoll::default(),
         }
     }
 }
@@ -348,6 +352,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut playlist = PlaylistState::default();
     let mut play_started = false;
     let mut has_remote = false;
+    // localhost like the /stream URLs, so the DIAL server's loopback check passes.
+    let silence_url = format!("http://localhost:{dial_port}{}", dial::SILENCE_PATH);
     let mut position_timer = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
@@ -411,12 +417,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 while let Ok(more) = idle_rx.try_recv() {
                     event = event.merge(more);
                 }
-                let plan = idle_plan(event, play_started);
+                let plan = idle_plan(event, play_started, playlist.preroll.is_active());
 
                 if plan.release {
-                    if !release_applies(has_remote, &playlist) {
-                        tracing::debug!("[player] release from adapter ignored: no active cast");
-                        continue;
+                    match release_action(has_remote, &playlist) {
+                        ReleaseAction::Ignore => {
+                            tracing::debug!("[player] release from adapter ignored: no active cast");
+                            continue;
+                        }
+                        ReleaseAction::StopPreRoll => {
+                            match playlist.preroll.stop(&mut mpd_client).await {
+                                Ok(_) => tracing::info!("[preroll] pre-roll stopped: released by speaker (adapter)"),
+                                Err(e) => tracing::warn!("[preroll] release: stopping the pre-roll failed: {e}"),
+                            }
+                            continue;
+                        }
+                        ReleaseAction::EndCast => {}
+                    }
+                    if playlist.preroll.is_active() {
+                        tracing::info!("[preroll] pre-roll ended: released by speaker (adapter)");
                     }
                     tracing::info!("[player] released by speaker (adapter) — ending cast session");
                     has_remote = false;
@@ -509,6 +528,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         }
                     }
+                }
+            }
+
+            // DIAL launch: play silence so the speaker wakes while the phone loads
+            Some(()) = preroll_rx.recv() => {
+                start_preroll(&mut mpd_client, &mut playlist.preroll, play_started, &silence_url).await;
+            }
+
+            // No song came in time: stop the silence so the speaker can idle
+            _ = preroll_expired(playlist.preroll.deadline()) => {
+                match playlist.preroll.stop(&mut mpd_client).await {
+                    Ok(_) => tracing::info!(
+                        "[preroll] pre-roll timed out after {} s without a song; MPD stopped",
+                        preroll::PREROLL_TIMEOUT.as_secs()
+                    ),
+                    Err(e) => tracing::warn!("[preroll] pre-roll timed out; stopping MPD failed: {e}"),
                 }
             }
 
@@ -692,7 +727,7 @@ async fn handle_command(
             // Temporarily reset last_state so send_state includes NowPlaying.
             playlist.last_state = messages::PlayerState::Idle;
             let status = mpd.status().await?;
-            let state = mpd_state_to_player_state(&status.state);
+            let (state, _) = reported_playback(playlist.preroll.is_active(), &status);
             send_state(mpd, state_tx, playlist, state).await?;
         }
 
@@ -712,6 +747,7 @@ async fn handle_command(
         PlayerCommand::Stop => {
             tracing::info!("[player] Stop");
             *play_started = false;
+            end_preroll(&mut playlist.preroll, "stop from the phone");
             mpd.stop().await?;
             mpd.clear().await?;
             playlist.video_ids.clear();
@@ -796,6 +832,7 @@ async fn handle_command(
             } else {
                 tracing::info!("[player] Next: end of playlist");
                 *play_started = false;
+                end_preroll(&mut playlist.preroll, "next at the end of the playlist");
                 mpd.stop().await?;
                 mpd.clear().await?;
                 send_state(mpd, state_tx, playlist, messages::PlayerState::Stopped).await?;
@@ -809,6 +846,7 @@ async fn handle_command(
         PlayerCommand::RemoteDisconnected { .. } => {
             tracing::info!("[player] Remote disconnected, stopping playback");
             *play_started = false;
+            end_preroll(&mut playlist.preroll, "remote disconnected");
             mpd.stop().await?;
             mpd.clear().await?;
             playlist.video_ids.clear();
@@ -857,16 +895,44 @@ struct IdlePlan {
 
 /// A release wins over a player change seen in the same wake-up: the speaker
 /// is gone, so a stop must never be read as a song end and auto-advance.
-fn idle_plan(event: mpd::IdleEvent, play_started: bool) -> IdlePlan {
+/// The pre-roll silence is no song, so its stop is no song end either.
+fn idle_plan(event: mpd::IdleEvent, play_started: bool, preroll_active: bool) -> IdlePlan {
     IdlePlan {
         release: event.release,
-        check_song_end: event.player && play_started && !event.release,
+        check_song_end: event.player && play_started && !preroll_active && !event.release,
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum ReleaseAction {
+    /// End the phone's cast and stop MPD.
+    EndCast,
+    /// Only the pre-roll runs, the phone may still be connecting: stop the
+    /// silence and leave the Lounge session alone.
+    StopPreRoll,
+    /// Nobody is casting.
+    Ignore,
+}
+
 /// The adapter may release on every speaker standby, also with nobody casting.
-fn release_applies(has_remote: bool, playlist: &PlaylistState) -> bool {
-    has_remote || !playlist.video_ids.is_empty()
+fn release_action(has_remote: bool, playlist: &PlaylistState) -> ReleaseAction {
+    if has_remote || !playlist.video_ids.is_empty() {
+        ReleaseAction::EndCast
+    } else if playlist.preroll.is_active() {
+        ReleaseAction::StopPreRoll
+    } else {
+        ReleaseAction::Ignore
+    }
+}
+
+/// Player state and position the phone is told. The pre-roll silence is
+/// reported as nothing playing, as MPD would be without it.
+fn reported_playback(preroll_active: bool, status: &mpd::MpdStatus) -> (messages::PlayerState, f64) {
+    if preroll_active {
+        (messages::PlayerState::Stopped, 0.0)
+    } else {
+        (mpd_state_to_player_state(&status.state), status.elapsed.unwrap_or(0.0))
+    }
 }
 
 /// Forget the cast and build the messages that end it on the sender.
@@ -910,6 +976,45 @@ fn current_video_id(playlist: &PlaylistState) -> String {
         .unwrap_or_default()
 }
 
+/// Start the pre-roll if the player is idle. Never fails the launch: MPD
+/// trouble only costs the early wake.
+async fn start_preroll(
+    mpd: &mut mpd::MpdClient,
+    preroll: &mut preroll::PreRoll,
+    play_started: bool,
+    silence_url: &str,
+) {
+    let status = match mpd.status().await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!("[preroll] no pre-roll, mpd status failed: {e}");
+            return;
+        }
+    };
+    if !preroll.should_start(play_started, &status.state) {
+        tracing::debug!("[preroll] not started: pre-roll running or player busy ({})", status.state);
+        return;
+    }
+    if let Err(e) = preroll.start(mpd, silence_url).await {
+        tracing::warn!("[preroll] pre-roll failed to start: {e}");
+    }
+}
+
+/// Resolves when the pre-roll's deadline passes; never without a pre-roll.
+async fn preroll_expired(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// For callers that stop and clear MPD themselves.
+fn end_preroll(preroll: &mut preroll::PreRoll, why: &str) {
+    if let Some(played) = preroll.forget() {
+        tracing::info!("[preroll] pre-roll ended after {:.1} s: {why}", played.as_secs_f64());
+    }
+}
+
 /// Resolve an audio stream via InnerTube and play it through MPD.
 ///
 /// Returns `true` if playback started, `false` if no stream was available.
@@ -950,9 +1055,7 @@ async fn play_video(
             playlist.current_title = info.title;
             playlist.current_duration = info.duration;
 
-            mpd.clear().await?;
-            mpd.add(&info.stream_url).await?;
-            mpd.play().await?;
+            playlist.preroll.play_song(mpd, &info.stream_url).await?;
 
             if start_position > 0.0 {
                 // Non-fatal: MPD may not have buffered enough data to seek yet
@@ -1000,7 +1103,7 @@ async fn send_state(
     state: messages::PlayerState,
 ) -> CmdResult {
     let status = mpd.status().await?;
-    let elapsed = status.elapsed.unwrap_or(0.0);
+    let (_, elapsed) = reported_playback(playlist.preroll.is_active(), &status);
     let duration = playlist.current_duration as f64;
     let vid = current_video_id(playlist);
 
@@ -1115,14 +1218,36 @@ mod stop_tests {
     #[test]
     fn release_wins_over_song_end_in_the_same_wake_up() {
         let both = mpd::IdleEvent { player: true, release: true };
-        assert_eq!(idle_plan(both, true), IdlePlan { release: true, check_song_end: false });
+        assert_eq!(idle_plan(both, true, false), IdlePlan { release: true, check_song_end: false });
     }
 
     #[test]
     fn player_change_checks_song_end_only_while_playing() {
         let player = mpd::IdleEvent { player: true, release: false };
-        assert_eq!(idle_plan(player, true), IdlePlan { release: false, check_song_end: true });
-        assert_eq!(idle_plan(player, false), IdlePlan { release: false, check_song_end: false });
+        assert_eq!(idle_plan(player, true, false), IdlePlan { release: false, check_song_end: true });
+        assert_eq!(idle_plan(player, false, false), IdlePlan { release: false, check_song_end: false });
+    }
+
+    #[test]
+    fn the_pre_roll_silence_never_ends_a_song() {
+        let player = mpd::IdleEvent { player: true, release: false };
+        // Even if a stray resume from the phone set play_started.
+        assert!(!idle_plan(player, true, true).check_song_end);
+        assert!(!idle_plan(player, false, true).check_song_end);
+    }
+
+    #[test]
+    fn the_pre_roll_silence_is_reported_as_nothing_playing() {
+        let status = |state: &str| mpd::MpdStatus {
+            state: state.into(),
+            elapsed: Some(3.2),
+            duration: None,
+            volume: 50,
+        };
+        assert_eq!(reported_playback(true, &status("play")), (messages::PlayerState::Stopped, 0.0));
+        assert_eq!(reported_playback(true, &status("pause")), (messages::PlayerState::Stopped, 0.0));
+        assert_eq!(reported_playback(false, &status("play")), (messages::PlayerState::Playing, 3.2));
+        assert_eq!(reported_playback(false, &status("pause")), (messages::PlayerState::Paused, 3.2));
     }
 
     #[test]
@@ -1138,7 +1263,7 @@ mod stop_tests {
         assert!(pl.video_ids.is_empty());
         assert_eq!(pl.current_index, 0);
         assert!(pl.list_id.is_empty());
-        assert!(!idle_plan(mpd::IdleEvent { player: true, release: false }, play_started).check_song_end);
+        assert!(!idle_plan(mpd::IdleEvent { player: true, release: false }, play_started, false).check_song_end);
         // Fresh state for the next cast: NowPlaying will be sent again.
         assert_eq!(pl.last_state, messages::PlayerState::Idle);
 
@@ -1148,10 +1273,26 @@ mod stop_tests {
     }
 
     #[test]
-    fn release_applies_only_while_a_cast_is_active() {
-        assert!(release_applies(true, &PlaylistState::default()));
-        assert!(release_applies(false, &playlist(1, 0)));
-        assert!(!release_applies(false, &PlaylistState::default()));
+    fn release_ends_a_cast_only_while_one_is_active() {
+        assert_eq!(release_action(true, &PlaylistState::default()), ReleaseAction::EndCast);
+        assert_eq!(release_action(false, &playlist(1, 0)), ReleaseAction::EndCast);
+        assert_eq!(release_action(false, &PlaylistState::default()), ReleaseAction::Ignore);
+    }
+
+    #[test]
+    fn release_during_a_pre_roll_alone_stops_only_the_silence() {
+        // The phone may still be connecting: ending its cast would break that.
+        let pre_rolling = PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() };
+        assert_eq!(release_action(false, &pre_rolling), ReleaseAction::StopPreRoll);
+        let connected = PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() };
+        assert_eq!(release_action(true, &connected), ReleaseAction::EndCast);
+    }
+
+    #[test]
+    fn ending_the_cast_ends_its_pre_roll() {
+        let mut pl = PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() };
+        release_cast(&mut pl, &mut false);
+        assert!(!pl.preroll.is_active());
     }
 
     #[test]
