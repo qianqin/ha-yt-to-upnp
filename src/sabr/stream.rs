@@ -640,10 +640,12 @@ fn replace_n_param(url: &str, decoded_n: &str) -> String {
 const PREMIUM_ONLY_AUDIO_ITAGS: [i32; 2] = [774, 141];
 
 /// Choose the best audio format, preferring Opus/WebM at the highest bitrate.
-fn choose_audio_format(formats: &[AdaptiveFormat]) -> Option<&AdaptiveFormat> {
-    formats
-        .iter()
-        .filter(|f| f.mime_type.starts_with("audio/"))
+fn choose_audio_format(formats: &[AdaptiveFormat]) -> Result<&AdaptiveFormat, SabrError> {
+    let audio = formats.iter().filter(|f| f.mime_type.starts_with("audio/"));
+    if audio.clone().count() == 0 {
+        return Err("no suitable audio format found".into());
+    }
+    audio
         .filter(|f| !PREMIUM_ONLY_AUDIO_ITAGS.contains(&f.itag))
         .max_by_key(|f| {
             let codec_priority: u64 = if f.mime_type.contains("opus") {
@@ -654,6 +656,9 @@ fn choose_audio_format(formats: &[AdaptiveFormat]) -> Option<&AdaptiveFormat> {
                 0
             };
             codec_priority + f.bitrate
+        })
+        .ok_or_else(|| {
+            "only YouTube Music Premium audio formats (itag 774/141) listed; SABR does not serve them to this session".into()
         })
 }
 
@@ -1260,9 +1265,7 @@ pub async fn stream_audio(
     let gvs_po_token = result.gvs_token.map(|g| g.po_token);
 
     // 2. Pick the best audio format + a video format for the discard trick.
-    let audio_fmt = choose_audio_format(&player.formats)
-        .ok_or("no suitable audio format found")?
-        .clone();
+    let audio_fmt = choose_audio_format(&player.formats)?.clone();
     let video_fmt = choose_video_format(&player.formats)
         .ok_or("no video format found (needed for SABR discard trick)")?
         .clone();
@@ -1393,6 +1396,36 @@ async fn sabr_loop(
         }
     }
 
+    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }).await
+}
+
+/// One SABR request/response round trip, boxed so `drive_loop` stays `Send`.
+type CycleFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, SabrError>> + Send + 'a>>;
+
+/// Performs one round trip for `drive_loop`; `Ok(false)` ends the stream.
+trait SabrCycle {
+    fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a>;
+}
+
+struct HttpCycle<'c> {
+    http: &'c reqwest::Client,
+    tx: &'c mpsc::Sender<Bytes>,
+}
+
+impl SabrCycle for HttpCycle<'_> {
+    fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+        Box::pin(sabr_request_cycle(self.http, state, self.tx))
+    }
+}
+
+/// Repeat SABR request cycles until the stream is done, the consumer is
+/// gone, a non-retryable error arrives, or retries run out.
+async fn drive_loop(
+    state: &mut SabrState,
+    tx: &mpsc::Sender<Bytes>,
+    cycle: &mut impl SabrCycle,
+) -> Result<(), SabrError> {
     let mut consecutive_errors = 0u32;
     const MAX_RETRIES: u32 = 5;
     let mut stall_count = 0u32;
@@ -1408,7 +1441,7 @@ async fn sabr_loop(
 
         let prev_progress = state.audio_downloaded_ms;
 
-        match sabr_request_cycle(http, &mut state, tx).await {
+        match cycle.run(state).await {
             Ok(should_continue) => {
                 consecutive_errors = 0;
                 if !should_continue || state.done {
@@ -1836,13 +1869,21 @@ mod tests {
             audio(251, OPUS, 146_272),
             audio(250, OPUS, 73_493),
         ];
-        assert_eq!(choose_audio_format(&formats).map(|f| f.itag), Some(251));
+        assert_eq!(choose_audio_format(&formats).map(|f| f.itag).unwrap(), 251);
     }
 
     #[test]
-    fn audio_selection_with_only_premium_formats_finds_none() {
+    fn audio_selection_with_only_premium_formats_says_so() {
         let formats = [audio(774, OPUS, 272_644), audio(141, AAC, 262_000)];
-        assert!(choose_audio_format(&formats).is_none());
+        let err = choose_audio_format(&formats).unwrap_err();
+        assert!(err.to_string().contains("Premium"), "{err}");
+    }
+
+    #[test]
+    fn audio_selection_without_audio_formats_is_a_plain_error() {
+        let formats = [audio(160, "video/mp4", 100_000)];
+        let err = choose_audio_format(&formats).unwrap_err();
+        assert_eq!(err.to_string(), "no suitable audio format found");
     }
 
     fn part(part_type: u32, data: Vec<u8>) -> ump::UmpPart {
@@ -1897,13 +1938,55 @@ mod tests {
         let logs = crate::storage::test_util::LogCapture::start();
         let mut state = test_state(GOOD_URL);
 
-        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
-        state.po_token = Some(b"pot".to_vec());
-        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
+        for status in 0..=3 {
+            state.po_token = None;
+            handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(status))).unwrap();
+            state.po_token = Some(b"pot".to_vec());
+            handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(status))).unwrap();
+        }
 
         let logs = logs.text();
         assert!(logs.contains("stream_protection_status=1 (OK, no PoToken sent)"), "{logs}");
         assert!(logs.contains("stream_protection_status=1 (OK, PoToken sent)"), "{logs}");
+        for status in 0..=3 {
+            let line = format!("stream_protection_status={status} (");
+            assert_eq!(logs.matches(&line).count(), 2, "status {status}: {logs}");
+        }
+        assert_eq!(logs.matches("no PoToken sent").count(), 4, "{logs}");
         assert!(!logs.contains("Premium"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn reload_request_stops_the_loop_after_one_request() {
+        let mut state = test_state(GOOD_URL);
+        let (tx, _rx) = mpsc::channel(1);
+        // Stands in for SABR round trips whose UMP body is a single
+        // RELOAD_PLAYER_RESPONSE part (the network path refuses non-Google hosts).
+        struct ReloadEveryTime {
+            requests: u32,
+        }
+        impl SabrCycle for ReloadEveryTime {
+            fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+                self.requests += 1;
+                Box::pin(async move {
+                    let reload = part(ump::RELOAD_PLAYER_RESPONSE, vec![0x0a, 0x02, 0x0a, 0x00]);
+                    handle_part(state, &reload)?;
+                    Ok(true)
+                })
+            }
+        }
+        let mut cycle = ReloadEveryTime { requests: 0 };
+
+        // Retrying would sleep 0.5 s + 1 s + 2 s + ... and hit this timeout.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            drive_loop(&mut state, &tx, &mut cycle),
+        )
+        .await
+        .expect("a reload request must end the loop without retry backoff");
+
+        let err = result.unwrap_err();
+        assert!(err.is::<ReloadRequested>(), "{err}");
+        assert_eq!(cycle.requests, 1);
     }
 }
