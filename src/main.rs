@@ -480,7 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     &mut mpd_client, &innertube_client, &state_tx,
                                     &mut playlist, &video_id, 0.0, innertube_cookies.as_ref().map(|c| c.as_ref()),
                                     innertube_session.as_ref().map(|s| s.as_ref()),
-                                                ).await {
+                                ).await {
                                     Ok(true) => play_started = true,
                                     Ok(false) => {
                                         tracing::warn!(
@@ -1070,19 +1070,85 @@ mod no_stored_credentials_tests {
         }
     }
 
+    /// Credential-header violations in `src`: any bearer or basic auth, and
+    /// any Authorization header (literal or reqwest constant) whose own call
+    /// does not take its value from the cookie SAPISIDHASH.
+    fn credential_header_violations(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        // ASCII lowercasing keeps byte offsets aligned with `src`.
+        let lower = src.to_ascii_lowercase();
+        for needle in [concat!("bear", "er"), concat!("basic", "_auth(")] {
+            if lower.contains(needle) {
+                found.push(format!("uses {needle}"));
+            }
+        }
+        let name = concat!("authori", "zation");
+        let bytes = src.as_bytes();
+        for (i, _) in lower.match_indices(name) {
+            let end = i + name.len();
+            let constant = &src[i..end] == name.to_ascii_uppercase();
+            let literal = i > 0 && bytes[i - 1] == b'"' && bytes.get(end) == Some(&b'"');
+            if !(constant || literal) {
+                continue;
+            }
+            let call = header_call(src, i);
+            if !call.contains("full_sapisidhash(") {
+                found.push(format!("Authorization header not from SAPISIDHASH: {call}"));
+            }
+        }
+        found
+    }
+
+    /// From `start` to the `)` closing the call that contains it, or to the
+    /// end of the statement. Walks chars, so it never splits a UTF-8 char.
+    fn header_call(src: &str, start: usize) -> &str {
+        let mut depth = 0i32;
+        for (off, c) in src[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => return &src[start..start + off],
+                ')' => depth -= 1,
+                ';' if depth == 0 => return &src[start..start + off],
+                _ => {}
+            }
+        }
+        &src[start..]
+    }
+
     #[test]
     fn no_bearer_authorization() {
         for (path, src) in production_sources() {
-            assert!(!src.contains(concat!("Bear", "er")), "{} mentions a bearer token", path.display());
-            // The only Authorization header allowed is the cookie SAPISIDHASH.
-            for (i, _) in src.match_indices(concat!("\"Authori", "zation\"")) {
-                let value = &src[i..(i + 200).min(src.len())];
-                assert!(
-                    value.contains("full_sapisidhash("),
-                    "{}: Authorization header that is not SAPISIDHASH: {value}",
-                    path.display()
-                );
-            }
+            let found = credential_header_violations(&src);
+            assert!(found.is_empty(), "{}: {found:?}", path.display());
+        }
+    }
+
+    #[test]
+    fn credential_header_guard_catches_non_sapisidhash_auth() {
+        for bad in [
+            "req.bearer_auth(t);",
+            "req.basic_auth(u, Some(p));",
+            "req.header(reqwest::header::AUTHORIZATION, format!(\"tok {t}\"));",
+            "req.header(header::AUTHORIZATION, x).header(\"X\", full_sapisidhash(c, o, None));",
+            "req.header(\"Authorization\", x)\n.header(\"Authorization\", full_sapisidhash(c, o, None));",
+            "req.header(\"authorization\", x);",
+            "req.header(\"Authorization\", x); // \u{2014}\u{2014}\u{2014}",
+        ] {
+            assert!(!credential_header_violations(bad).is_empty(), "not caught: {bad}");
+        }
+    }
+
+    #[test]
+    fn credential_header_guard_accepts_sapisidhash_and_multibyte_text() {
+        for good in [
+            "req.header(\"Authorization\", crate::cookies::full_sapisidhash(c, o, None));",
+            "req.header(header::AUTHORIZATION, full_sapisidhash(c, o, uid))",
+            // A non-ASCII char right after a header site must not panic.
+            "// auth \u{2014} see \"Authorization\"\u{2014}\u{2014}\nreq.header(\"Authorization\", full_sapisidhash(c, o, None));",
+            "/// Generate the full Authorization header \u{2014} like yt-dlp.",
+        ] {
+            let found = credential_header_violations(good);
+            assert!(found.is_empty(), "{good}: {found:?}");
         }
     }
 
