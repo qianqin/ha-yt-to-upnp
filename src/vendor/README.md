@@ -2,7 +2,9 @@
 
 Release assets of https://github.com/yt-dlp/ejs (Unlicense), used unmodified
 by `src/nsig.rs`. When updating, bump `EJS_VERSION` in `src/nsig.rs` (it is
-part of the nsig disk cache key) and update the table.
+part of the nsig disk cache key) and update the table. Cache files of other
+versions, including the older unversioned `nsig-preprocessed-<hash>.js`, are
+unused leftovers and can be deleted.
 
 ejs release: 0.8.0
 

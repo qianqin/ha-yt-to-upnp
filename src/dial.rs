@@ -51,6 +51,12 @@ impl DialState {
         *self.stream_failure.lock().unwrap() = Some((video_id.to_owned(), reason));
     }
 
+    /// A successful `/stream` makes any earlier failure stale: MPD plays one
+    /// stream at a time.
+    fn clear_stream_failure(&self) {
+        *self.stream_failure.lock().unwrap() = None;
+    }
+
     /// Takes the recorded failure; returns its reason if it was for `video_id`.
     pub fn take_stream_failure(&self, video_id: &str) -> Option<String> {
         self.stream_failure
@@ -298,6 +304,7 @@ async fn stream_audio(
     let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
     match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session).await {
         Ok((info, rx)) => {
+            state.clear_stream_failure();
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
             // so we can inspect with ffprobe if MPD crashes.
@@ -547,6 +554,14 @@ mod tests {
         state.record_stream_failure("aaaaaaaaaaa", "boom".into());
         assert_eq!(state.take_stream_failure("bbbbbbbbbbb"), None);
         // A stale failure must not mark a later stop of its video as failed.
+        assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
+    }
+
+    #[test]
+    fn cleared_stream_failure_is_not_taken() {
+        let state = test_state();
+        state.record_stream_failure("aaaaaaaaaaa", "boom".into());
+        state.clear_stream_failure();
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
 }
