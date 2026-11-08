@@ -544,6 +544,11 @@ class MpdClient:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.buf = b""
+        # MPD hangs up on a client that sends nothing for its connection_timeout (60 s by
+        # default) while not in `idle`, e.g. while the adapter waits for a slow speaker.
+        # Tracked so a lost connection can say so.
+        self._quiet_since = time.monotonic()
+        self._silent_s = 0.0
         try:
             banner = self._readline()
             if not banner.startswith("OK MPD "):
@@ -583,6 +588,8 @@ class MpdClient:
         self.sock.settimeout(timeout)
         try:
             self._response()
+            # MPD restarts its connection_timeout when it ends an `idle`.
+            self._quiet_since = time.monotonic()
             return True
         except socket.timeout:
             self.sock.settimeout(self.timeout)
@@ -597,6 +604,8 @@ class MpdClient:
         self._response()
 
     def _send(self, command):
+        now = time.monotonic()
+        self._silent_s, self._quiet_since = now - self._quiet_since, now
         self.sock.sendall(command.encode() + b"\n")
 
     def _response(self):
@@ -616,7 +625,10 @@ class MpdClient:
                 raise MpdError("MPD line longer than %d bytes" % MPD_MAX_LINE)
             chunk = self.sock.recv(4096)
             if not chunk:
-                raise ConnectionError("MPD closed the connection")
+                raise ConnectionError(
+                    "MPD closed the connection after %.1f s without a command from the adapter "
+                    "(MPD hangs up on clients silent outside idle for longer than its "
+                    "connection_timeout, 60 s by default)" % self._silent_s)
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         return line.decode("utf-8", "replace")

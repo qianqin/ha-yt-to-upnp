@@ -351,6 +351,29 @@ class RunLoopTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(ctl.calls, ["ensure_playing"])
 
+    def test_mpd_dropping_a_client_silent_during_slow_speaker_io_is_logged_truthfully(self):
+        # The incident: a speaker request ran into its deadline while the adapter was out
+        # of `idle`; MPD's connection_timeout hung up, and the next command found it closed.
+        mpd = FakeMpd([["play"], ["play"]])
+        mpd.connection_timeout = 0.2
+        self.addCleanup(mpd.close)
+        follower = RecordingFollower(stop_after=2)
+        follower.seconds_until_deadline = lambda: 0.05
+        real_tick = follower.tick
+
+        def slow_tick():
+            real_tick()
+            if follower.ticks == 2:  # the first tick after an idle timeout
+                time.sleep(0.5)  # blocked on the speaker
+
+        follower.tick = slow_tick
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            run_bounded(self, follower, mpd, sleep=lambda s: None, should_stop=follower.done)
+        self.assertEqual(mpd.connections, 2)
+        message = [r.getMessage() for r in logs.records if "MPD" in r.getMessage()][0]
+        self.assertRegex(message, r"MPD closed the connection after 0\.[5-9] s without a command")
+        self.assertIn("connection_timeout", message)
+
     def test_unreachable_mpd_backs_off_exponentially(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))

@@ -237,6 +237,8 @@ class FakeMpd:
         self.message_subscribers = True
         self.stop_on_message = False  # a receiver that ends its session on `release`
         self.drop_on_first_pause = False  # lose the connection on the first `pause 1`
+        # Like MPD's connection_timeout: hang up on a client silent this long outside `idle`.
+        self.connection_timeout = None
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -279,7 +281,11 @@ class FakeMpd:
             idling = False
             changed_by_client = False
             while True:
-                line = f.readline()
+                conn.settimeout(None if idling else self.connection_timeout)
+                try:
+                    line = f.readline()
+                except socket.timeout:
+                    return
                 if not line:
                     return
                 cmd = line.decode().strip()
