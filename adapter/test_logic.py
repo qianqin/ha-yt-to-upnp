@@ -742,6 +742,14 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.clock.now, 1000 + 22 + ra.GATE_RETAKE_S)
         self.released()
 
+    def test_a_short_gate_still_gives_each_retake_its_time(self):
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=3)
+        self.held()
+        self.gate_runs_out()
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), ra.GATE_MAX_RETAKES)
+        self.assertEqual(self.clock.now, 1000 + (ra.GATE_MAX_RETAKES + 1) * ra.GATE_RETAKE_S)
+        self.released()
+
     def test_the_gate_never_holds_mpd_beyond_the_configured_maximum(self):
         self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
                              start_gate_seconds=ra.START_GATE_MAX_S)
