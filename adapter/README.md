@@ -9,18 +9,47 @@ Raumfeld room play the receiver's MPD stream automatically.
   `STREAM_URL` via UPnP AVTransport.
 - If the zone already plays the stream, it does nothing. If the zone is playing
   the Raumfeld **line-in** (e.g. another cast device), it does not take over.
-- When MPD is stopped or paused for `IDLE_MINUTES`, it stops the zone and puts
-  the room into manual standby, but only if the zone still holds our stream
-  (playing, paused or stopped). Anything else, e.g. line-in, is left alone.
+- **The speaker's own controls win.** While the adapter owns the zone and MPD
+  plays or is paused, it looks at the room every `SPEAKER_POLL_SECONDS` (one
+  `getZones` plus `GetTransportInfo`/`GetMediaInfo`, reusing the last SSDP
+  discovery until a request fails or the zone changes). The speaker counts as
+  *taken away* when the room is no longer `ACTIVE` (power button, or the
+  Raumfeld's own auto power-off, also while paused), the room left its zone,
+  the zone plays anything other than `STREAM_URL` (e.g. line-in switched in by
+  Home Assistant), or, while MPD plays, the renderer stays stopped for more than
+  two polls in a row. Then the adapter:
+  1. sends MPD `pause 1` if MPD is playing (never `stop`: the receiver reads an
+     MPD stop as the end of the track and plays the next one),
+  2. sends `sendmessage ytcast release` once, which tells the receiver to end the
+     cast session (see below),
+  3. stops polling and leaves the room alone. A song change does not wake the
+     room again; if one slips in, MPD is paused again. Only a user resume from
+     the phone (MPD pause -> play) lets it take the room back, waking it as
+     usual; a new session (MPD pause -> stop, then play) takes over as usual too.
+- A song change on a zone the adapter owns never wakes the room: if the room
+  was switched off or to another source in the meantime, that counts as taken
+  away right away.
+- It never stops the zone or puts the room into standby itself; the Raumfeld's
+  own auto power-off does that.
 - It never changes the volume and sends no RenderingControl requests at all.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that
   answered SSDP (redirects included), caps replies at 256 KiB and each request
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
   and accepts only `uuid:<letters, digits, dashes>` UDNs.
-- Network and device errors are logged, never fatal. A failed takeover is
-  retried on the next MPD event or after 30 seconds while MPD keeps playing; a
-  failed release is retried after another `IDLE_MINUTES`. Lost MPD connections
-  are re-established with backoff.
+- Network and device errors are logged, never fatal, and never count as "taken
+  away". A failed takeover is retried on the next MPD event or after 30 seconds
+  while MPD keeps playing; a failed poll is retried at the next poll. Lost MPD
+  connections are re-established with backoff.
+
+## Ending the cast: MPD channel `ytcast`
+
+The adapter talks to the receiver through MPD's client-to-client messages: it
+sends the message `release` on the channel `ytcast`
+(`sendmessage ytcast release`). The receiver subscribes to that channel and
+ends the phone's cast session when it gets `release`. With a receiver that
+doesn't subscribe, MPD answers "nobody is subscribed to this channel"; the
+adapter logs a warning and carries on, and the earlier `pause 1` still stops
+the stream (the phone shows it paused).
 
 ## Configuration (environment)
 
@@ -31,12 +60,13 @@ Raumfeld room play the receiver's MPD stream automatically.
 | `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
-| `IDLE_MINUTES` | `5` | How long MPD must be stopped/paused before the room is released |
+| `SPEAKER_POLL_SECONDS` | `5` | How often the room is checked while the adapter owns the zone and MPD plays or is paused |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
 Missing or invalid settings make the adapter exit with status 2 and a message
-naming the variable.
+naming the variable. `IDLE_MINUTES` is no longer used; if it is set, the
+adapter logs a warning and ignores it.
 
 See [`mpd.conf.example`](mpd.conf.example) for a matching MPD setup (httpd
 output on port 8000, MP3 or FLAC).

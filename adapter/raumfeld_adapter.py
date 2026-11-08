@@ -1,6 +1,8 @@
 """Raumfeld adapter: makes a Teufel Raumfeld room play the receiver's MPD
-httpd stream whenever MPD plays, and puts the room back into standby after MPD
-has been idle for a while.
+httpd stream whenever MPD plays, and gives the room back as soon as someone
+takes it away (power button, auto power-off, another source): it then pauses
+MPD and asks the receiver to end the cast. The adapter never stops the room or
+puts it into standby itself; the Raumfeld's own auto power-off does that.
 
 Python 3.9+ standard library only. Devices are identified exclusively by UPnP
 UDN (found via SSDP on every action), never by IP. No volume is ever touched:
@@ -9,6 +11,7 @@ this module sends no RenderingControl requests at all.
 
 import http.client
 import logging
+import math
 import os
 import re
 import socket
@@ -31,6 +34,9 @@ MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a fe
 MPD_MAX_LINE = 64 * 1024
 UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
 STREAM_TITLE = "YouTube Music cast"
+# MPD client-to-client channel the receiver subscribes to; "release" ends its cast session.
+CAST_CHANNEL = "ytcast"
+CAST_RELEASE_MESSAGE = "release"
 
 
 class ConfigError(Exception):
@@ -56,7 +62,7 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime stream_metadata "
-                                  "idle_seconds mpd_host mpd_port log_level")):
+                                  "poll_seconds mpd_host mpd_port log_level")):
     @classmethod
     def from_env(cls, env):
         required = ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN", "STREAM_URL")
@@ -73,11 +79,11 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             raise ConfigError("STREAM_METADATA must be 0 or 1, got %r" % metadata)
 
         try:
-            idle_minutes = float(env.get("IDLE_MINUTES", "5"))
+            poll_seconds = float(env.get("SPEAKER_POLL_SECONDS", "5"))
         except ValueError:
-            raise ConfigError("IDLE_MINUTES must be a number") from None
-        if not idle_minutes > 0:
-            raise ConfigError("IDLE_MINUTES must be greater than 0")
+            raise ConfigError("SPEAKER_POLL_SECONDS must be a number") from None
+        if not (math.isfinite(poll_seconds) and poll_seconds > 0):
+            raise ConfigError("SPEAKER_POLL_SECONDS must be greater than 0")
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -101,7 +107,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             stream_url=stream_url,
             stream_mime=env.get("STREAM_MIME", "audio/mpeg").strip(),
             stream_metadata=metadata == "1",
-            idle_seconds=idle_minutes * 60,
+            poll_seconds=poll_seconds,
             mpd_host=env.get("MPD_HOST", "localhost").strip(),
             mpd_port=mpd_port,
             log_level=log_level,
@@ -117,6 +123,15 @@ ALREADY_PLAYING = "already_playing"
 LINE_IN_ACTIVE = "line_in_active"
 
 _PLAYING_STATES = ("PLAYING", "TRANSITIONING")
+
+# What a look at the room says about our zone.
+OURS = "ours"  # the zone plays our stream
+NOT_PLAYING = "not_playing"  # the zone holds our stream but its renderer doesn't play
+STANDBY = "standby"
+NO_ZONE = "no_zone"
+OTHER_SOURCE = "other_source"
+# Someone else has the speaker now; the adapter must give it up.
+TAKEN_AWAY = (STANDBY, NO_ZONE, OTHER_SOURCE)
 
 
 def is_line_in(uri):
@@ -138,11 +153,17 @@ def decide_play(status, stream_url):
     return TAKE_OVER
 
 
-def decide_release(status, stream_url):
-    """MPD has been idle long enough: release the room if our stream is still loaded.
-    The transport state doesn't matter: a paused MPD stalls the stream and the renderer
-    then often sits STOPPED or PAUSED on our URI."""
-    return status is not None and status.current_uri == stream_url
+def judge_speaker(power, zone, status, stream_url):
+    """Verdict on a zone the adapter owns. `status` is None unless the room is active in a zone."""
+    if zone is None:
+        return NO_ZONE
+    if power != "ACTIVE":
+        return STANDBY
+    if status.current_uri != stream_url:
+        return OTHER_SOURCE
+    if status.transport_state in _PLAYING_STATES:
+        return OURS
+    return NOT_PLAYING
 
 
 def build_didl(stream_url, mime):
@@ -366,12 +387,13 @@ def soap_call(control_url, action, args):
 
 
 # What one inspection of the room found; control/status are None unless the room is active in a zone.
-_Room = namedtuple("_Room", "api zone control status")
+_Room = namedtuple("_Room", "api zone power control status")
 
 
 class Controller:
-    """Drives the Raumfeld room. Rediscovers everything via SSDP on each call,
-    because host IPs change and the zone renderer comes and goes."""
+    """Drives the Raumfeld room. Taking over rediscovers everything via SSDP, because
+    host IPs change and the zone renderer comes and goes; the frequent `check` reuses
+    the last discovery until it fails or the zone changes."""
 
     def __init__(self, config, discover, api_port=RAUMFELD_API_PORT, sleep=time.sleep,
                  zone_wait_s=10.0, zone_poll_s=0.5):
@@ -381,50 +403,69 @@ class Controller:
         self.sleep = sleep
         self.zone_polls = int(zone_wait_s / zone_poll_s)
         self.zone_poll_s = zone_poll_s
+        self._api = None
+        self._control = None  # (zone UDN, AVTransport control URL)
 
-    def ensure_playing(self):
+    def ensure_playing(self, wake=True):
+        """Make the room play our stream; returns the decision taken. With wake=False
+        (a track change on a zone we already own) a room someone took away is left
+        alone and its verdict returned instead."""
         room = self._inspect()
+        if not wake:
+            verdict = judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
+            if verdict in TAKEN_AWAY:
+                return verdict
         decision = decide_play(room.status, self.config.stream_url)
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
-            return
+            return decision
         if decision == LINE_IN_ACTIVE:
             log.info("zone %r is playing line-in; not taking over", room.zone)
-            return
+            return decision
 
         room_param = quote(self.config.room_udn, safe="")
         http_get(room.api + "leaveStandby?roomUDN=" + room_param)
         zone = room.zone or self._connect_zone(room.api, room_param)
-        control = room.control or self._control_url(zone)
+        control = room.control or self._zone_control(zone, reuse=False)
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
                     if self.config.stream_metadata else "")
         soap_call(control, "SetAVTransportURI",
                   [("CurrentURI", self.config.stream_url), ("CurrentURIMetaData", metadata)])
         soap_call(control, "Play", [("Speed", "1")])
         log.info("zone %r now plays %s", zone, self.config.stream_url)
+        return decision
 
-    def release(self):
-        room = self._inspect()
-        if not decide_release(room.status, self.config.stream_url):
-            log.info("room is not playing our stream; leaving it alone")
-            return
-        soap_call(room.control, "Stop", [])
-        http_get(room.api + "enterManualStandby?roomUDN=" + quote(self.config.room_udn, safe=""))
-        log.info("stopped zone %r and put the room into standby", room.zone)
+    def check(self):
+        """Read-only look at the room: the judge_speaker verdict."""
+        try:
+            room = self._inspect(reuse=True)
+        except Exception:
+            # The device may have moved; find it again next time.
+            self._api = self._control = None
+            raise
+        return judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
 
-    def _inspect(self):
-        host, _location = self.discover(self.config.speaker_udn)
-        api = "http://%s:%d/" % (host, self.api_port)
+    def _inspect(self, reuse=False):
+        if not (reuse and self._api):
+            host, _location = self.discover(self.config.speaker_udn)
+            self._api = "http://%s:%d/" % (host, self.api_port)
+        api = self._api
         zones = http_get(api + "getZones")
         zone = zone_of_room(zones, self.config.room_udn)
+        power = room_power_state(zones, self.config.room_udn)
         # A room in standby (or without zone) plays nothing; don't query a sleeping renderer.
-        if zone is None or room_power_state(zones, self.config.room_udn) != "ACTIVE":
-            return _Room(api, zone, None, None)
-        control = self._control_url(zone)
+        if zone is None or power != "ACTIVE":
+            return _Room(api, zone, power, None, None)
+        control = self._zone_control(zone, reuse)
         info = soap_call(control, "GetTransportInfo", [])
         media = soap_call(control, "GetMediaInfo", [])
         status = ZoneStatus(info.get("CurrentTransportState", ""), media.get("CurrentURI", ""))
-        return _Room(api, zone, control, status)
+        return _Room(api, zone, power, control, status)
+
+    def _zone_control(self, zone, reuse):
+        if not (reuse and self._control and self._control[0] == zone):
+            self._control = (zone, self._control_url(zone))
+        return self._control[1]
 
     def _connect_zone(self, api, room):
         # connectRoomToZone makes a brand-new zone each time, so call it exactly once.
@@ -444,8 +485,12 @@ class Controller:
 
 # --------------------------------------------------------------------------- MPD
 
+_MPD_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
 class MpdClient:
-    """Minimal MPD protocol client: `status` and `idle player` only."""
+    """Minimal MPD protocol client: `status`, `idle player`, `pause 1` and `sendmessage`.
+    Never `stop`: the receiver takes an MPD stop for the end of the track and advances."""
 
     def __init__(self, host, port, timeout=HTTP_TIMEOUT_S):
         self.timeout = timeout
@@ -471,20 +516,36 @@ class MpdClient:
                 return value
         raise MpdError("status without state")
 
+    def pause(self):
+        self._command("pause 1")
+
+    def send_message(self, channel, text):
+        for token in (channel, text):
+            if not _MPD_TOKEN.fullmatch(token):
+                raise ValueError("refusing MPD message token %r" % token)
+        self._command("sendmessage %s %s" % (channel, text))
+
     def wait_player(self, timeout):
-        """Block until the player changes or `timeout` seconds pass (None = forever)."""
+        """Block until the player changes (True) or `timeout` seconds pass (False;
+        None = forever)."""
         if timeout is not None and timeout <= 0:
             raise ValueError("idle timeout must be positive or None, got %r" % timeout)
         self._send("idle player")
         self.sock.settimeout(timeout)
         try:
             self._response()
+            return True
         except socket.timeout:
             self.sock.settimeout(self.timeout)
             self._send("noidle")
-            self._response()
+            # MPD may have reported a change just before it saw noidle.
+            return bool(self._response())
         finally:
             self.sock.settimeout(self.timeout)
+
+    def _command(self, command):
+        self._send(command)
+        self._response()
 
     def _send(self, command):
         self.sock.sendall(command.encode() + b"\n")
@@ -522,27 +583,73 @@ _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.Par
 PLAY_RETRY_S = 30
 # Shortest idle wait: a zero timeout would turn the MPD socket non-blocking.
 MIN_WAIT_S = 0.1
+DEFAULT_POLL_S = 5
+# Consecutive polls that may find our renderer stopped while MPD plays (a stream
+# reconnect between songs) before the speaker counts as taken away.
+STOPPED_GRACE_POLLS = 2
+
+# What the Follower asks run() to do on the MPD connection.
+PAUSE_PLAYER = "pause"
+RELEASE_CAST = "release_cast"
 
 _PLAY = "ensure_playing"
-_RELEASE = "release"
+_POLL = "check"
+
+_REASONS = {
+    STANDBY: "room went to standby",
+    NO_ZONE: "room left its zone",
+    OTHER_SOURCE: "zone switched to another source",
+    NOT_PLAYING: "zone renderer stays stopped",
+}
 
 
 class Follower:
     """Turns the MPD player state stream into Controller actions. At most one action is
-    pending at a time: the idle release, or the retry of a failed takeover."""
+    pending at a time: the retry of a failed takeover, or the next look at the room.
 
-    def __init__(self, controller, idle_seconds, clock=time.monotonic):
+    While it owns the zone and MPD plays or is paused, it polls the room. When someone
+    takes the speaker away it yields: it asks run() to pause MPD (if playing) and to
+    tell the receiver to end the cast, and leaves the room alone until the user resumes
+    (MPD pause -> play) or the receiver ends the session (pause -> stop)."""
+
+    def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic):
         self.controller = controller
-        self.idle_seconds = idle_seconds
+        self.poll_seconds = poll_seconds
         self.clock = clock
         self.pending = None
         self.deadline = None
+        self.mpd_state = None
+        self.owned = False
+        self.yielded = False
+        self.wake = True
+        self.stopped_polls = 0
+        self._requests = []
 
     def on_mpd_state(self, state):
+        previous, self.mpd_state = self.mpd_state, state
+        self.stopped_polls = 0
+        if self.yielded:
+            if previous != "pause" or state == "pause":
+                if state == "play":
+                    # A song change that raced our pause: keep the phone paused.
+                    log.info("speaker was taken away; pausing MPD again")
+                    self._requests.append(PAUSE_PLAYER)
+                return
+            # MPD left the pause on the user's behalf: resumed, or the session ended.
+            self.yielded = False
         if state == "play":
+            # Only a user resume may wake a zone we own; a song change must not.
+            self.wake = previous == "pause" or not self.owned
             self._attempt(_PLAY)
-        elif self.pending != _RELEASE:
-            self._schedule(_RELEASE)
+        elif state == "pause" and self.owned:
+            # The Raumfeld's auto power-off may end a pause; that must end the cast too.
+            self._schedule(_POLL)
+        else:
+            self.pending = None
+
+    def take_mpd_requests(self):
+        requests, self._requests = self._requests, []
+        return requests
 
     def seconds_until_deadline(self):
         if self.pending is None:
@@ -556,16 +663,68 @@ class Follower:
     def _attempt(self, action):
         self.pending = None
         try:
-            getattr(self.controller, action)()
+            if action == _PLAY:
+                self._take_over()
+            else:
+                self._poll()
         except _ERRORS as e:
             # %r: the message may carry device-supplied text (e.g. an HTTP reason phrase).
             log.warning("%s failed: %r", action, e)
-            # Don't give up: neither a missed takeover nor a room left on a dead stream.
+            # Don't give up on a missed takeover; a failed look is not "taken away".
             self._schedule(action)
+
+    def _take_over(self):
+        decision = self.controller.ensure_playing(wake=self.wake)
+        if decision in TAKEN_AWAY:
+            self._yield(decision)
+        elif decision == LINE_IN_ACTIVE:
+            self.owned = False  # not ours; look again on the next song
+        else:
+            self.owned = True
+            self._schedule(_POLL)
+
+    def _poll(self):
+        verdict = self.controller.check()
+        if verdict in TAKEN_AWAY:
+            return self._yield(verdict)
+        if verdict == NOT_PLAYING and self.mpd_state == "play":
+            self.stopped_polls += 1
+            if self.stopped_polls > STOPPED_GRACE_POLLS:
+                return self._yield(verdict)
+        elif verdict == OURS:
+            self.stopped_polls = 0
+        self._schedule(_POLL)
+
+    def _yield(self, verdict):
+        log.info("speaker taken away (%s): ending the cast; not taking the room back "
+                 "until playback is resumed from the phone", _REASONS[verdict])
+        if self.mpd_state == "play":
+            # Before the message, so the stream stops even if the receiver ignores it.
+            self._requests.append(PAUSE_PLAYER)
+        self._requests.append(RELEASE_CAST)
+        self.yielded = True
+        self.owned = False
 
     def _schedule(self, action):
         self.pending = action
-        self.deadline = self.clock() + (PLAY_RETRY_S if action == _PLAY else self.idle_seconds)
+        self.deadline = self.clock() + (PLAY_RETRY_S if action == _PLAY else self.poll_seconds)
+
+
+def _serve_requests(follower, mpd):
+    for request in follower.take_mpd_requests():
+        if request == PAUSE_PLAYER:
+            mpd.pause()
+            # Note the pause before the message goes out: a receiver that ends the session
+            # right away would otherwise fold our pause and its stop into one MPD event.
+            follower.on_mpd_state(mpd.state())
+            continue
+        try:
+            mpd.send_message(CAST_CHANNEL, CAST_RELEASE_MESSAGE)
+            log.info("asked the receiver to end the cast (%s %s)", CAST_CHANNEL, CAST_RELEASE_MESSAGE)
+        except MpdError as e:
+            # e.g. an older receiver that doesn't subscribe: MPD answers "nobody is subscribed".
+            log.warning("could not send %r on MPD channel %r: %s",
+                        CAST_RELEASE_MESSAGE, CAST_CHANNEL, e)
 
 
 def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
@@ -583,11 +742,15 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
             follower.on_mpd_state(mpd.state())
             # Tick right away too: a deadline may have passed while MPD was unreachable.
             follower.tick()
+            _serve_requests(follower, mpd)
             while not should_stop():
                 wait = follower.seconds_until_deadline()
-                mpd.wait_player(None if wait is None else max(wait, MIN_WAIT_S))
-                follower.on_mpd_state(mpd.state())
+                # Only a real player change is an MPD event; a timeout just means "tick".
+                if mpd.wait_player(None if wait is None else max(wait, MIN_WAIT_S)):
+                    follower.on_mpd_state(mpd.state())
                 follower.tick()
+                # Outside `idle`: the connection is free for our own commands.
+                _serve_requests(follower, mpd)
         except (OSError, MpdError) as e:
             log.warning("lost MPD connection: %s; reconnecting in %ss", e, backoff)
             sleep(backoff)
@@ -606,8 +769,11 @@ def main(env=None):
     logging.basicConfig(level=config.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log.info("following MPD at %s:%d for room %s", config.mpd_host, config.mpd_port, config.room_udn)
+    if "IDLE_MINUTES" in env:
+        log.warning("IDLE_MINUTES is ignored: the Raumfeld's own auto power-off puts the room "
+                    "into standby")
     controller = Controller(config, ssdp_discover)
-    follower = Follower(controller, config.idle_seconds)
+    follower = Follower(controller, config.poll_seconds)
     try:
         run(follower, lambda: MpdClient(config.mpd_host, config.mpd_port))
     except KeyboardInterrupt:

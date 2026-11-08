@@ -1,4 +1,4 @@
-"""Pure logic: config, line-in detection, decisions, DIDL/SOAP building, idle timer."""
+"""Pure logic: config, line-in detection, decisions, DIDL/SOAP building, Follower."""
 
 import io
 import time
@@ -24,17 +24,18 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(c.stream_url, STREAM_URL)
         self.assertEqual(c.stream_mime, "audio/mpeg")
         self.assertTrue(c.stream_metadata)
-        self.assertEqual(c.idle_seconds, 300)
+        self.assertEqual(c.poll_seconds, 5)
         self.assertEqual((c.mpd_host, c.mpd_port), ("localhost", 6600))
         self.assertEqual(c.log_level, "INFO")
 
     def test_overrides(self):
-        env = dict(REQUIRED, STREAM_MIME="audio/flac", STREAM_METADATA="0", IDLE_MINUTES="1.5",
-                   MPD_HOST="mpd.invalid", MPD_PORT="6601", LOG_LEVEL="debug")
+        env = dict(REQUIRED, STREAM_MIME="audio/flac", STREAM_METADATA="0",
+                   SPEAKER_POLL_SECONDS="2.5", MPD_HOST="mpd.invalid", MPD_PORT="6601",
+                   LOG_LEVEL="debug")
         c = ra.Config.from_env(env)
         self.assertEqual(c.stream_mime, "audio/flac")
         self.assertFalse(c.stream_metadata)
-        self.assertEqual(c.idle_seconds, 90)
+        self.assertEqual(c.poll_seconds, 2.5)
         self.assertEqual((c.mpd_host, c.mpd_port), ("mpd.invalid", 6601))
         self.assertEqual(c.log_level, "DEBUG")
 
@@ -47,8 +48,9 @@ class ConfigTest(unittest.TestCase):
         self.assertNotIn("STREAM_URL", msg)
 
     def test_invalid_values(self):
-        for key, value in [("MPD_PORT", "x"), ("MPD_PORT", "70000"), ("IDLE_MINUTES", "-1"),
-                           ("IDLE_MINUTES", "soon"), ("STREAM_METADATA", "maybe"),
+        for key, value in [("MPD_PORT", "x"), ("MPD_PORT", "70000"),
+                           ("SPEAKER_POLL_SECONDS", "0"), ("SPEAKER_POLL_SECONDS", "-1"),
+                           ("SPEAKER_POLL_SECONDS", "soon"), ("SPEAKER_POLL_SECONDS", "nan"), ("STREAM_METADATA", "maybe"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
                            ("RAUMFELD_SPEAKER_UDN", "speaker"),
@@ -56,6 +58,10 @@ class ConfigTest(unittest.TestCase):
                            ("RAUMFELD_ROOM_UDN", "uuid:abc\nST: ssdp:all")]:
             with self.subTest(key=key, value=value), self.assertRaises(ra.ConfigError):
                 ra.Config.from_env(dict(REQUIRED, **{key: value}))
+
+    def test_idle_minutes_is_no_longer_a_setting(self):
+        c = ra.Config.from_env(dict(REQUIRED, IDLE_MINUTES="soon"))  # ignored, not validated
+        self.assertFalse(hasattr(c, "idle_seconds"))
 
     def test_main_exits_nonzero_with_clear_message(self):
         err = io.StringIO()
@@ -92,16 +98,21 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(d(self.s("STOPPED", LINE_IN_URI), STREAM_URL), ra.TAKE_OVER)
         self.assertEqual(d(self.s("PLAYING", "http://other.invalid/x"), STREAM_URL), ra.TAKE_OVER)
 
-    def test_release_decisions(self):
-        d = ra.decide_release
-        self.assertFalse(d(None, STREAM_URL))
-        self.assertTrue(d(self.s("PLAYING", STREAM_URL), STREAM_URL))
-        self.assertTrue(d(self.s("TRANSITIONING", STREAM_URL), STREAM_URL))
-        # A paused MPD stalls the stream; the renderer then often sits STOPPED/PAUSED on our URI.
-        self.assertTrue(d(self.s("STOPPED", STREAM_URL), STREAM_URL))
-        self.assertTrue(d(self.s("PAUSED_PLAYBACK", STREAM_URL), STREAM_URL))
-        self.assertFalse(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL))
-        self.assertFalse(d(self.s("STOPPED", "http://other.invalid/x"), STREAM_URL))
+    def test_speaker_verdicts(self):
+        j = ra.judge_speaker
+        zone = "uuid:00000000-0000-0000-0000-0000000000b2"
+        self.assertEqual(j("ACTIVE", zone, self.s("PLAYING", STREAM_URL), STREAM_URL), ra.OURS)
+        self.assertEqual(j("ACTIVE", zone, self.s("TRANSITIONING", STREAM_URL), STREAM_URL), ra.OURS)
+        for state in ("STOPPED", "PAUSED_PLAYBACK", "NO_MEDIA_PRESENT", ""):
+            self.assertEqual(j("ACTIVE", zone, self.s(state, STREAM_URL), STREAM_URL), ra.NOT_PLAYING)
+        self.assertEqual(j("MANUAL_STANDBY", zone, None, STREAM_URL), ra.STANDBY)
+        self.assertEqual(j("AUTOMATIC_STANDBY", zone, None, STREAM_URL), ra.STANDBY)
+        self.assertEqual(j(None, None, None, STREAM_URL), ra.NO_ZONE)
+        self.assertEqual(j("ACTIVE", None, None, STREAM_URL), ra.NO_ZONE)
+        for uri in (LINE_IN_URI, "http://other.invalid/x", ""):
+            self.assertEqual(j("ACTIVE", zone, self.s("PLAYING", uri), STREAM_URL), ra.OTHER_SOURCE)
+            self.assertEqual(j("ACTIVE", zone, self.s("STOPPED", uri), STREAM_URL), ra.OTHER_SOURCE)
+        self.assertEqual(set(ra.TAKEN_AWAY), {ra.STANDBY, ra.NO_ZONE, ra.OTHER_SOURCE})
 
 
 ZONES = (b"<?xml version='1.0'?><zoneConfig><zones>"
@@ -217,50 +228,90 @@ class RecordingController:
     def __init__(self):
         self.calls = []
         self.fail = None
+        self.decision = ra.TAKE_OVER
+        self.verdict = ra.OURS
 
-    def ensure_playing(self):
-        self.calls.append("ensure_playing")
+    def ensure_playing(self, wake=True):
+        self.calls.append("ensure_playing" if wake else "ensure_playing(no wake)")
         if self.fail:
             raise self.fail
+        return self.decision
 
-    def release(self):
-        self.calls.append("release")
+    def check(self):
+        self.calls.append("check")
         if self.fail:
             raise self.fail
+        return self.verdict
 
 
 class FollowerTest(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.ctl = RecordingController()
-        self.f = ra.Follower(self.ctl, idle_seconds=300, clock=self.clock)
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock)
 
-    def test_play_drives_speaker_without_deadline(self):
+    def advance(self, seconds):
+        self.clock.now += seconds
+        self.f.tick()
+
+    def test_play_takes_over_and_schedules_a_poll(self):
         self.f.on_mpd_state("play")
         self.assertEqual(self.ctl.calls, ["ensure_playing"])
-        self.assertIsNone(self.f.seconds_until_deadline())
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.advance(5)
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
 
-    def test_idle_timeout_releases_once(self):
+    def test_owned_zone_is_polled_while_paused_and_not_while_stopped(self):
         self.f.on_mpd_state("play")
         self.f.on_mpd_state("pause")
-        self.clock.now += 120
-        self.f.on_mpd_state("stop")  # continuing idle does not restart the timer
-        self.assertEqual(self.f.seconds_until_deadline(), 180)
-        self.f.tick()
-        self.assertEqual(self.ctl.calls, ["ensure_playing"])
-        self.clock.now += 180
-        self.f.tick()
-        self.f.tick()
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "release"])
+        self.advance(5)
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
+        self.f.on_mpd_state("stop")
+        self.assertIsNone(self.f.seconds_until_deadline())
+        self.advance(60)
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
+
+    def test_pause_without_an_owned_zone_does_not_poll(self):
+        self.f.on_mpd_state("pause")
         self.assertIsNone(self.f.seconds_until_deadline())
 
-    def test_resume_before_timeout_cancels(self):
-        self.f.on_mpd_state("stop")
-        self.clock.now += 299
+    def test_track_change_on_an_owned_zone_does_not_wake(self):
         self.f.on_mpd_state("play")
-        self.clock.now += 10
-        self.f.tick()
-        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.f.on_mpd_state("stop")
+        self.f.on_mpd_state("play")
+        self.f.on_mpd_state("play")
+        self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["ensure_playing(no wake)"] * 2)
+
+    def test_user_resume_wakes(self):
+        self.f.on_mpd_state("play")
+        self.f.on_mpd_state("pause")
+        self.f.on_mpd_state("play")
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+
+    def test_line_in_on_takeover_is_left_alone_and_not_polled(self):
+        self.ctl.decision = ra.LINE_IN_ACTIVE
+        self.f.on_mpd_state("play")
+        self.assertIsNone(self.f.seconds_until_deadline())
+        self.assertEqual(self.f.take_mpd_requests(), [])
+        self.f.on_mpd_state("play")  # next track: look again, waking is still allowed
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+
+    def test_taken_away_on_track_change_pauses_and_releases(self):
+        self.f.on_mpd_state("play")
+        self.ctl.decision = ra.STANDBY
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play")
+        self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertIsNone(self.f.seconds_until_deadline())
+
+    def test_requests_are_handed_out_once(self):
+        self.f.on_mpd_state("play")
+        self.ctl.verdict = ra.OTHER_SOURCE
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(self.f.take_mpd_requests(), [])
 
     def test_errors_are_logged_not_raised(self):
         self.ctl.fail = ra.DeviceNotFound(SPEAKER_UDN)
@@ -276,21 +327,27 @@ class FollowerTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             self.f.on_mpd_state("play")
         self.assertEqual(self.f.seconds_until_deadline(), ra.PLAY_RETRY_S)
-        self.clock.now += ra.PLAY_RETRY_S - 1
-        self.f.tick()
+        self.advance(ra.PLAY_RETRY_S - 1)
         self.assertEqual(self.ctl.calls, ["ensure_playing"])
         self.ctl.fail = None
-        self.clock.now += 1
-        self.f.tick()
+        self.advance(1)
         self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
-        self.assertIsNone(self.f.seconds_until_deadline())
+        self.assertEqual(self.f.seconds_until_deadline(), 5)  # now polling
 
     def test_play_retry_is_dropped_when_mpd_stops(self):
         self.ctl.fail = OSError("speaker unreachable")
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             self.f.on_mpd_state("play")
         self.f.on_mpd_state("stop")
-        self.assertEqual(self.f.seconds_until_deadline(), 300)
+        self.assertIsNone(self.f.seconds_until_deadline())
+
+    def test_failed_poll_is_retried_and_not_taken_as_gone(self):
+        self.f.on_mpd_state("play")
+        self.ctl.fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.advance(5)
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.assertEqual(self.f.take_mpd_requests(), [])
 
     def test_device_supplied_error_text_is_logged_escaped(self):
         self.ctl.fail = ra.RaumfeldError("HTTP 500 Boom\n2026-01-01 INFO forged line")
@@ -298,18 +355,6 @@ class FollowerTest(unittest.TestCase):
             self.f.on_mpd_state("play")
         self.assertNotIn("\n", logs.records[0].getMessage())
         self.assertIn("\\n", logs.records[0].getMessage())
-
-    def test_failed_release_is_retried_after_another_idle_period(self):
-        self.f.on_mpd_state("stop")
-        self.clock.now += 300
-        self.ctl.fail = OSError("timeout")
-        with self.assertLogs("raumfeld_adapter", "WARNING"):
-            self.f.tick()
-        self.assertEqual(self.f.seconds_until_deadline(), 300)
-        self.ctl.fail = None
-        self.clock.now += 300
-        self.f.tick()
-        self.assertEqual(self.ctl.calls, ["release", "release"])
 
 
 if __name__ == "__main__":

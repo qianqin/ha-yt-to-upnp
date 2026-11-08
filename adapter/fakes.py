@@ -222,12 +222,16 @@ class FakeMpd:
     a list of player states; the first answers the initial `status`, each
     following one is announced via `changed: player` to the next `idle player`.
     When a script is exhausted the server holds `idle` open until `noidle`
-    (or closes the connection if close_after is set)."""
+    (or closes the connection if close_after is set). `pause 1` pauses the
+    player and is announced to the next `idle player`. `sendmessage` succeeds while
+    `message_subscribers` is set; otherwise MPD's "nobody is subscribed" ACK."""
 
     def __init__(self, scripts, close_after=False):
         self.scripts = list(scripts)
         self.close_after = close_after
         self.close_first = False  # drop the first connection at its first `idle player`
+        self.message_subscribers = True
+        self.stop_on_message = False  # a receiver that ends its session on `release`
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -260,6 +264,7 @@ class FakeMpd:
             f.write(b"OK MPD 0.23.5\n")
             state = states.pop(0)
             idling = False
+            paused_by_client = False
             while True:
                 line = f.readline()
                 if not line:
@@ -268,8 +273,20 @@ class FakeMpd:
                 self.commands.append(cmd)
                 if cmd == "status":
                     f.write(("volume: -1\nrepeat: 0\nstate: %s\nOK\n" % state).encode())
+                elif cmd == "pause 1":
+                    state, paused_by_client = "pause", True
+                    f.write(b"OK\n")
+                elif cmd.startswith("sendmessage ") and self.message_subscribers:
+                    if self.stop_on_message:
+                        state, paused_by_client = "stop", True
+                    f.write(b"OK\n")
+                elif cmd.startswith("sendmessage "):
+                    f.write(b"ACK [50@0] {sendmessage} nobody is subscribed to this channel\n")
                 elif cmd == "idle player":
-                    if states:
+                    if paused_by_client:
+                        paused_by_client = False
+                        f.write(b"changed: player\nOK\n")
+                    elif states:
                         state = states.pop(0)
                         f.write(b"changed: player\nOK\n")
                     elif close_after:

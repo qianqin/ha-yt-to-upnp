@@ -18,7 +18,7 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         self.assertEqual(client.state(), "stop")
-        client.wait_player(None)
+        self.assertTrue(client.wait_player(None))
         self.assertEqual(client.state(), "play")
         self.assertEqual(mpd.commands, ["status", "idle player", "status"])
 
@@ -28,7 +28,7 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         started = time.monotonic()
-        client.wait_player(0.2)
+        self.assertFalse(client.wait_player(0.2))
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(client.state(), "pause")
         self.assertEqual(mpd.commands, ["idle player", "noidle", "status"])
@@ -41,6 +41,36 @@ class MpdClientTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.wait_player(0.0)
         self.assertEqual(client.state(), "stop")
+
+    def test_pause_and_release_message(self):
+        mpd = FakeMpd([["play"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        client.pause()
+        client.send_message(ra.CAST_CHANNEL, ra.CAST_RELEASE_MESSAGE)
+        self.assertEqual(client.state(), "pause")
+        self.assertEqual(mpd.commands, ["pause 1", "sendmessage ytcast release", "status"])
+
+    def test_send_message_without_subscriber_raises_mpd_error(self):
+        mpd = FakeMpd([["play"]])
+        mpd.message_subscribers = False
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        with self.assertRaises(ra.MpdError):
+            client.send_message(ra.CAST_CHANNEL, ra.CAST_RELEASE_MESSAGE)
+        self.assertEqual(client.state(), "play")  # the connection stays usable
+
+    def test_send_message_refuses_unsafe_tokens(self):
+        mpd = FakeMpd([["play"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        for channel, text in (("yt cast", "release"), ("ytcast", "release\nstop"), ("", "x")):
+            with self.subTest(channel=channel, text=text), self.assertRaises(ValueError):
+                client.send_message(channel, text)
+        self.assertEqual(mpd.commands, [])
 
     def test_server_gone_raises_connection_error(self):
         mpd = FakeMpd([["play"]], close_after=True)
@@ -192,6 +222,9 @@ class RecordingFollower:
     def tick(self):
         self.ticks += 1
 
+    def take_mpd_requests(self):
+        return []
+
     def seconds_until_deadline(self):
         return None
 
@@ -223,41 +256,41 @@ class RunLoopTest(unittest.TestCase):
                    sleep=sleeps.append, should_stop=follower.done)
         self.assertEqual(sleeps, [1, 1])
 
-    def test_deadline_passed_during_disconnect_releases_without_reconnect_loop(self):
+    def test_failed_takeover_is_retried_after_reconnect_without_reconnect_loop(self):
         clock = FakeClock()
         ctl = RecordingController()
-        follower = ra.Follower(ctl, idle_seconds=300, clock=clock)
-        # Connection 1 reports stop then drops; connection 2 stays open in idle.
-        mpd = FakeMpd([["stop"], ["stop"]], close_after=False)
+        ctl.fail = OSError("speaker unreachable")
+        follower = ra.Follower(ctl, poll_seconds=5, clock=clock)
+        # Connection 1 reports play then drops; connection 2 stays open in idle.
+        mpd = FakeMpd([["play"], ["play"]], close_after=False)
         mpd.close_first = True
         self.addCleanup(mpd.close)
         sleeps = []
 
         def sleep(seconds):
             sleeps.append(seconds)
-            clock.now += 400  # the outage outlasts the idle timeout
+            ctl.fail = None
+            clock.now += 400  # the outage outlasts the retry delay
 
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleep,
-                   should_stop=lambda: bool(ctl.calls) or len(sleeps) > 3)
-        self.assertEqual(ctl.calls, ["release"])
+                   should_stop=lambda: len(ctl.calls) >= 2 or len(sleeps) > 3)
+        self.assertEqual(ctl.calls, ["ensure_playing", "ensure_playing"])
         self.assertEqual(sleeps, [1])
 
     def test_past_deadline_wait_is_clamped_positive(self):
         clock = FakeClock()
         ctl = RecordingController()
         ctl.fail = OSError("speaker unreachable")
-        follower = ra.Follower(ctl, idle_seconds=300, clock=clock)
-        mpd = FakeMpd([["stop"]])
+        follower = ra.Follower(ctl, poll_seconds=5, clock=clock)
+        mpd = FakeMpd([["play"]])
         self.addCleanup(mpd.close)
-        follower.on_mpd_state("stop")
-        clock.now += 1000  # deadline already passed before MPD is even reached
         ticks = []
         real_tick = follower.tick
 
         def tick():
             ticks.append(1)
-            real_tick()  # release fails and re-arms ...
+            real_tick()  # the retry fails and re-arms ...
             clock.now += 1000  # ... but the next deadline is already passed again
 
         follower.tick = tick
