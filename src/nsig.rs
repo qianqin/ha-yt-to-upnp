@@ -94,17 +94,25 @@ const MEM_LIMITS: MemLimits = MemLimits {
 
 /// Whether a decode error comes from an exhausted QuickJS limit rather than
 /// from the player. Such a failure says nothing about the cached player.
+/// [`fmt_js_error`] and the solver call report memory failures with these.
 fn is_resource_error(err: &str) -> bool {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 6] = [
         "out of memory",
-        // Thrown when even the error object could not be allocated.
-        "null exception (OOM?)",
+        NULL_EXCEPTION,
         // rquickjs::Error::Allocation
         "Allocation failed",
         "Maximum call stack size exceeded",
+        // Debug form of a null/undefined exception value.
+        "failed: Null",
+        "failed: Undefined",
     ];
     MARKERS.iter().any(|m| err.contains(m))
 }
+
+/// Reported for a null/undefined exception: QuickJS could not even allocate
+/// the error object (Linux under a tight limit). Matches the solver call's
+/// own message for a null exception.
+const NULL_EXCEPTION: &str = "null exception (OOM?)";
 
 fn decode_with_limits(
     player_js: &str,
@@ -256,13 +264,13 @@ fn decode_nsig_inner(
         // 4. Set variables
         let global = ctx.globals();
         global.set("_n_value", n_value)
-            .map_err(|e| format!("set _n_value failed: {}", e))?;
+            .map_err(|e| fmt_js_error(&ctx, e, "set _n_value"))?;
 
         let result_json: String = if let Some(preprocessed) = cached_preprocessed {
             // Fast path: use cached preprocessed player (~0.6s, ~65MB)
             tracing::info!("[nsig] using cached preprocessed player");
             global.set("_preprocessed", preprocessed)
-                .map_err(|e| format!("set _preprocessed failed: {}", e))?;
+                .map_err(|e| fmt_js_error(&ctx, e, "set _preprocessed"))?;
 
             let call_js = r#"
                 try {
@@ -284,7 +292,7 @@ fn decode_nsig_inner(
             // Slow path: parse base.js from scratch (~40s, ~256MB)
             tracing::info!("[nsig] parsing base.js with meriyah (first time, ~40s)...");
             global.set("_player_js", player_js)
-                .map_err(|e| format!("set _player_js failed: {}", e))?;
+                .map_err(|e| fmt_js_error(&ctx, e, "set _player_js"))?;
 
             let call_js = r#"
                 try {
@@ -350,8 +358,18 @@ fn decode_nsig_inner(
     })
 }
 
-fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, _e: rquickjs::Error, stage: &str) -> String {
+/// Formats a failed QuickJS call, deciding from the error variant and the
+/// exception value (not its text) whether memory ran out.
+fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, stage: &str) -> String {
+    match e {
+        rquickjs::Error::Exception => {}
+        rquickjs::Error::Allocation => return format!("{} failed: out of memory", stage),
+        e => return format!("{} failed: {}", stage, e),
+    }
     let caught = ctx.catch();
+    if caught.is_null() || caught.is_undefined() {
+        return format!("{} failed: {}", stage, NULL_EXCEPTION);
+    }
     if let Some(exc) = caught.as_exception() {
         let msg = exc.message().unwrap_or_default();
         let stack = exc
@@ -499,6 +517,9 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
             ("QuickJS context failed: Allocation failed while creating object", true),
             ("set _preprocessed failed: Allocation failed while creating object", true),
             ("jsc(preprocessed) failed: Maximum call stack size exceeded", true),
+            // Debug form of a null/undefined exception value.
+            ("lib.js eval failed: Null\"null\"", true),
+            ("core.js eval failed: Undefined", true),
             ("jsc error: _result is not defined", false),
             ("jsc error: invalid assignment left-hand side", false),
             ("jsc n error: no solutions", false),
@@ -507,6 +528,41 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         ] {
             assert_eq!(is_resource_error(err), resource, "{err}");
         }
+    }
+
+    fn js_failure(script: &str) -> String {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let e = ctx.eval::<rquickjs::Value, _>(script.as_bytes().to_vec()).unwrap_err();
+            fmt_js_error(&ctx, e, "stage")
+        })
+    }
+
+    /// Under a tight limit QuickJS may fail to allocate the error object and
+    /// leave a null exception (seen on Linux); that is a memory failure.
+    #[test]
+    fn null_or_undefined_exception_is_a_resource_error() {
+        for script in ["throw null", "throw undefined"] {
+            let err = js_failure(script);
+            assert!(err.starts_with("stage failed: "), "{err}");
+            assert!(is_resource_error(&err), "{script}: {err}");
+        }
+    }
+
+    #[test]
+    fn thrown_error_is_a_player_fault() {
+        let err = js_failure("throw new SyntaxError('invalid assignment left-hand side')");
+        assert!(err.starts_with("stage failed: invalid assignment left-hand side"), "{err}");
+        assert!(!is_resource_error(&err), "{err}");
+    }
+
+    #[test]
+    fn allocation_error_is_a_resource_error() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let err = ctx.with(|ctx| fmt_js_error(&ctx, rquickjs::Error::Allocation, "stage"));
+        assert!(is_resource_error(&err), "{err}");
     }
 
     /// Limits far below what lib.js needs, so every attempt runs out of memory.
@@ -525,7 +581,7 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
 
         let err = decode_with_limits("", "xyz", "test-oom-keep-disk", Some(path.clone()), STARVED).unwrap_err();
 
-        assert!(err.contains("out of memory"), "{err}");
+        assert!(is_resource_error(&err), "{err}");
         assert!(path.exists(), "cache was discarded after running out of memory");
         let again = decode_nsig_cached_at("", "xyz", "test-oom-keep-again", Some(path));
         assert_eq!(again.unwrap(), "zyx");
