@@ -42,8 +42,17 @@ Raumfeld room play the receiver's MPD stream automatically.
   away right away. Trade-off: if the room is switched off and a poll lands in
   the short MPD stop between two songs, the adapter has already let go, so the
   next song wakes the room again.
-- It never stops the zone or puts the room into standby itself; the Raumfeld's
-  own auto power-off does that.
+- **A stuck renderer is restarted.** If, while MPD plays, the zone renderer
+  reports `TRANSITIONING` on `STREAM_URL` for longer than `STUCK_SECONDS`
+  (measured across polls), it has dropped the stream and hangs (seen after a
+  speaker request timed out at a song change). A plain AVTransport `Play` does not
+  help, so the adapter sends `Stop` and right away `Play` and logs a warning. This
+  is not "taken away": no pause, no release. At most 3 restarts per stuck
+  episode, each waiting twice as long as the one before; then it logs an error and
+  leaves the renderer alone. A renderer seen `PLAYING` again ends the episode. A
+  short `TRANSITIONING` (normal start or buffering) is left alone.
+- Apart from that restart it never stops the zone, and it never puts the room
+  into standby itself; the Raumfeld's own auto power-off does that.
 - It never changes the Raumfeld's volume and sends no RenderingControl requests
   at all. Volume from the phone is MPD's software volume: the httpd output needs
   `mixer_type "software"` (as in [`mpd.conf.example`](mpd.conf.example)),
@@ -78,6 +87,7 @@ the stream (the phone shows it paused).
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
+| `STUCK_SECONDS` | `15` | How long (seconds, at least 1) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 

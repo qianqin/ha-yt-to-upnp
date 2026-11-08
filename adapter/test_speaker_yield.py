@@ -339,6 +339,43 @@ class SpeakerYieldTest(unittest.TestCase):
         self.nothing_requested()
 
 
+class StuckRendererScenarioTest(unittest.TestCase):
+    """Scenario: at a song change the renderer dropped the stream and stays TRANSITIONING;
+    the adapter restarts it (Stop, Play) and does not end the cast."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.clock = FakeClock()
+        self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
+                                    poll_seconds=POLL_S, clock=self.clock, stuck_seconds=15)
+
+    def poll(self):
+        self.clock.now += POLL_S
+        self.follower.tick()
+
+    def test_stuck_renderer_is_restarted_and_plays_again(self):
+        self.follower.on_mpd_state("play")
+        self.rf.transport_state = "TRANSITIONING"
+        self.rf.stuck = True
+        self.rf.requests.clear()
+        for _ in range(3):
+            self.poll()
+        self.assertNotIn("Stop", self.rf.soap_actions())
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.poll()
+        self.assertEqual([a for a in self.rf.soap_actions() if a in ("Stop", "Play")],
+                         ["Stop", "Play"])
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.poll()
+        self.assertEqual(self.follower.take_mpd_requests(), [])
+        self.assertFalse(self.follower.yielded)
+        for method, path, action, body in self.rf.requests:
+            self.assertNotIn("RenderingControl", path)
+            self.assertNotIn("Volume", path + (action or "") + body)
+            self.assertNotIn("Standby", path)
+
+
 class SpeakerYieldRunTest(unittest.TestCase):
     """End to end through run(): the adapter talks to MPD over its own connection."""
 

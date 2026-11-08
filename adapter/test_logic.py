@@ -28,17 +28,19 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(c.poll_seconds, 5)
         self.assertEqual((c.mpd_host, c.mpd_port), ("localhost", 6600))
         self.assertEqual(c.log_level, "INFO")
+        self.assertEqual(c.stuck_seconds, 15)
 
     def test_overrides(self):
         env = dict(REQUIRED, STREAM_MIME="audio/flac", STREAM_METADATA="0",
                    SPEAKER_POLL_SECONDS="2.5", MPD_HOST="mpd.invalid", MPD_PORT="6601",
-                   LOG_LEVEL="debug")
+                   LOG_LEVEL="debug", STUCK_SECONDS="20")
         c = ra.Config.from_env(env)
         self.assertEqual(c.stream_mime, "audio/flac")
         self.assertFalse(c.stream_metadata)
         self.assertEqual(c.poll_seconds, 2.5)
         self.assertEqual((c.mpd_host, c.mpd_port), ("mpd.invalid", 6601))
         self.assertEqual(c.log_level, "DEBUG")
+        self.assertEqual(c.stuck_seconds, 20)
 
     def test_missing_required_names_every_missing_var(self):
         with self.assertRaises(ra.ConfigError) as cm:
@@ -54,6 +56,8 @@ class ConfigTest(unittest.TestCase):
                            ("SPEAKER_POLL_SECONDS", "0.5"),
                            ("SPEAKER_POLL_SECONDS", "soon"), ("SPEAKER_POLL_SECONDS", "nan"),
                            ("SPEAKER_POLL_SECONDS", "inf"), ("STREAM_METADATA", "maybe"),
+                           ("STUCK_SECONDS", "0"), ("STUCK_SECONDS", "0.5"),
+                           ("STUCK_SECONDS", "nan"), ("STUCK_SECONDS", "later"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
                            ("RAUMFELD_SPEAKER_UDN", "speaker"),
@@ -121,7 +125,9 @@ class DecisionTest(unittest.TestCase):
         j = ra.judge_speaker
         zone = "uuid:00000000-0000-0000-0000-0000000000b2"
         self.assertEqual(j("ACTIVE", zone, self.s("PLAYING", STREAM_URL), STREAM_URL), ra.OURS)
-        self.assertEqual(j("ACTIVE", zone, self.s("TRANSITIONING", STREAM_URL), STREAM_URL), ra.OURS)
+        # TRANSITIONING is told apart, so a renderer stuck in it can be noticed.
+        self.assertEqual(j("ACTIVE", zone, self.s("TRANSITIONING", STREAM_URL), STREAM_URL),
+                         ra.TRANSITIONING)
         for state in ("STOPPED", "PAUSED_PLAYBACK", "NO_MEDIA_PRESENT", ""):
             self.assertEqual(j("ACTIVE", zone, self.s(state, STREAM_URL), STREAM_URL), ra.NOT_PLAYING)
         self.assertEqual(j("MANUAL_STANDBY", zone, None, STREAM_URL), ra.STANDBY)
@@ -249,6 +255,7 @@ class RecordingController:
         self.fail = None
         self.decision = ra.TAKE_OVER
         self.verdict = ra.OURS
+        self.restart_fail = None
 
     def ensure_playing(self, wake=True):
         self.calls.append("ensure_playing" if wake else "ensure_playing(no wake)")
@@ -261,6 +268,11 @@ class RecordingController:
         if self.fail:
             raise self.fail
         return self.verdict
+
+    def restart_renderer(self):
+        self.calls.append("restart_renderer")
+        if self.restart_fail:
+            raise self.restart_fail
 
 
 class FollowerTest(unittest.TestCase):
@@ -385,6 +397,104 @@ class FollowerTest(unittest.TestCase):
             self.f.on_mpd_state("play")
         self.assertNotIn("\n", logs.records[0].getMessage())
         self.assertIn("\\n", logs.records[0].getMessage())
+
+
+class StuckRendererTest(unittest.TestCase):
+    """A zone renderer that stays TRANSITIONING on our stream while MPD plays has dropped
+    the stream; Stop then Play brings it back, a plain Play does not."""
+
+    STUCK_S = 15
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
+                             stuck_seconds=self.STUCK_S)
+        self.f.on_mpd_state("play")
+        self.ctl.calls.clear()
+
+    def poll(self, times=1):
+        for _ in range(times):
+            self.clock.now += 5
+            self.f.tick()
+
+    def restarts(self):
+        return self.ctl.calls.count("restart_renderer")
+
+    def test_brief_transitioning_does_not_restart(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        self.poll(3)  # first seen, +5 s, +10 s: still within the bound
+        self.ctl.verdict = ra.OURS
+        self.poll(3)
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(self.f.take_mpd_requests(), [])
+
+    def test_stuck_beyond_the_bound_restarts_and_is_not_taken_away(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        self.poll(3)
+        self.assertEqual(self.restarts(), 0)
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            self.poll()  # 15 s after it was first seen
+        self.assertEqual(self.restarts(), 1)
+        self.assertTrue(any("TRANSITIONING" in m for m in logs.output), logs.output)
+        self.assertEqual(self.f.take_mpd_requests(), [])  # no pause, no release
+        self.assertFalse(self.f.yielded)
+        self.assertEqual(self.f.seconds_until_deadline(), 5)  # still watching
+
+    def test_restarts_are_bounded_with_backoff(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        times = []
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            for _ in range(100):  # 500 s of a renderer that never recovers
+                before = self.restarts()
+                self.poll()
+                if self.restarts() > before:
+                    times.append(self.clock.now)
+        self.assertEqual(len(times), ra.STUCK_MAX_RESTARTS)
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertEqual(gaps, sorted(gaps))
+        self.assertGreater(gaps[-1], gaps[0])
+        self.assertTrue(any("giving up" in m for m in logs.output), logs.output)
+        self.assertEqual(sum("giving up" in m for m in logs.output), 1)
+        self.assertEqual(self.f.take_mpd_requests(), [])
+
+    def test_playing_again_resets_the_episode(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.poll(4)
+        self.assertEqual(self.restarts(), 1)
+        self.ctl.verdict = ra.OURS
+        self.poll()
+        self.ctl.verdict = ra.TRANSITIONING
+        self.poll(3)
+        self.assertEqual(self.restarts(), 1)  # a new episode starts its own clock
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.poll()
+        self.assertEqual(self.restarts(), 2)
+
+    def test_transitioning_while_mpd_is_paused_is_left_alone(self):
+        self.f.on_mpd_state("pause")
+        self.ctl.verdict = ra.TRANSITIONING
+        self.poll(10)
+        self.assertEqual(self.restarts(), 0)
+
+    def test_transitioning_does_not_count_as_stopped(self):
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        self.ctl.verdict = ra.TRANSITIONING
+        self.poll()
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        self.assertEqual(self.f.take_mpd_requests(), [])
+
+    def test_failed_restart_is_logged_and_counts_as_an_attempt(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        self.ctl.restart_fail = ra.RaumfeldError("took longer than the request deadline")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.poll(4)
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.assertEqual(self.f.take_mpd_requests(), [])
 
 
 if __name__ == "__main__":

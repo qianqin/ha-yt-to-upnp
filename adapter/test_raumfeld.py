@@ -128,6 +128,8 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.ctl.check(), ra.NOT_PLAYING)
         self.rf.transport_state = "PLAYING"
         self.assertEqual(self.ctl.check(), ra.OURS)
+        self.rf.transport_state = "TRANSITIONING"
+        self.assertEqual(self.ctl.check(), ra.TRANSITIONING)
         self.rf.current_uri = LINE_IN_URI
         self.assertEqual(self.ctl.check(), ra.OTHER_SOURCE)
         self.rf.zone_udn = None
@@ -214,6 +216,39 @@ class ControllerWithoutMetadataTest(ControllerTest):
         args = {el.tag: el.text or "" for el in ET.fromstring(self.rf.soap_body("SetAVTransportURI")).iter()}
         self.assertEqual(args["CurrentURI"], STREAM_URL)
         self.assertEqual(args["CurrentURIMetaData"], "")
+
+
+class RendererRestartTest(unittest.TestCase):
+    """Scenario: a zone renderer stuck in TRANSITIONING (it dropped the stream) is brought
+    back with Stop then Play on the zone it was last seen in; a plain Play does not help."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.discover = FakeDiscovery(self.rf)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, self.discover, api_port=self.rf.port,
+                                 sleep=lambda s: None)
+
+    def test_restart_sends_stop_then_play_to_the_checked_zone(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri = STREAM_URL
+        self.rf.transport_state = "TRANSITIONING"
+        self.rf.stuck = True
+        self.assertEqual(self.ctl.check(), ra.TRANSITIONING)
+        self.rf.requests.clear()
+        self.ctl.restart_renderer()
+        self.assertEqual(self.rf.soap_actions(), ["Stop", "Play"])
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)  # the URI is left as it is
+        self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change, no volume
+
+    def test_restart_without_a_checked_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.restart_renderer()
+        self.assertEqual(self.rf.requests, [])
 
 
 if __name__ == "__main__":

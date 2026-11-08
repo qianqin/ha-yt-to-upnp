@@ -1,8 +1,9 @@
 """Raumfeld adapter: makes a Teufel Raumfeld room play the receiver's MPD
 httpd stream whenever MPD plays, and gives the room back as soon as someone
 takes it away (power button, auto power-off, another source): it then pauses
-MPD and asks the receiver to end the cast. The adapter never stops the room or
-puts it into standby itself; the Raumfeld's own auto power-off does that.
+MPD and asks the receiver to end the cast. The adapter never puts the room into
+standby itself (the Raumfeld's own auto power-off does that) and only stops the
+zone renderer to restart it (Stop, Play) when it hangs in TRANSITIONING.
 
 Python 3.9+ standard library only. Devices are identified exclusively by UPnP
 UDN (found via SSDP; a takeover always rediscovers, the frequent room check
@@ -64,8 +65,18 @@ class MpdError(Exception):
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
+def _seconds(env, key, default, minimum):
+    try:
+        value = float(env.get(key, default))
+    except ValueError:
+        raise ConfigError("%s must be a number" % key) from None
+    if not (math.isfinite(value) and value >= minimum):
+        raise ConfigError("%s must be at least %g" % (key, minimum))
+    return value
+
+
 class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime stream_metadata "
-                                  "poll_seconds mpd_host mpd_port log_level")):
+                                  "poll_seconds stuck_seconds mpd_host mpd_port log_level")):
     @classmethod
     def from_env(cls, env):
         required = ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN", "STREAM_URL")
@@ -81,13 +92,9 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
         if metadata not in ("0", "1"):
             raise ConfigError("STREAM_METADATA must be 0 or 1, got %r" % metadata)
 
-        try:
-            poll_seconds = float(env.get("SPEAKER_POLL_SECONDS", "5"))
-        except ValueError:
-            raise ConfigError("SPEAKER_POLL_SECONDS must be a number") from None
         # Below 1 s the adapter would hammer the speaker's API and SSDP.
-        if not (math.isfinite(poll_seconds) and poll_seconds >= 1):
-            raise ConfigError("SPEAKER_POLL_SECONDS must be at least 1")
+        poll_seconds = _seconds(env, "SPEAKER_POLL_SECONDS", "5", 1)
+        stuck_seconds = _seconds(env, "STUCK_SECONDS", str(STUCK_S), 1)
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -112,6 +119,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             stream_mime=env.get("STREAM_MIME", "audio/mpeg").strip(),
             stream_metadata=metadata == "1",
             poll_seconds=poll_seconds,
+            stuck_seconds=stuck_seconds,
             mpd_host=env.get("MPD_HOST", "localhost").strip(),
             mpd_port=mpd_port,
             log_level=log_level,
@@ -129,6 +137,9 @@ _PLAYING_STATES = ("PLAYING", "TRANSITIONING")
 
 # What a look at the room says about our zone.
 OURS = "ours"  # the zone plays our stream
+# The zone holds our stream and is about to play it -- or, if this lasts, has dropped the
+# stream and hangs (seen live after a speaker request timed out).
+TRANSITIONING = "transitioning"
 NOT_PLAYING = "not_playing"  # the zone holds our stream but its renderer doesn't play
 STANDBY = "standby"
 NO_ZONE = "no_zone"
@@ -164,8 +175,10 @@ def judge_speaker(power, zone, status, stream_url):
         return STANDBY
     if status.current_uri != stream_url:
         return OTHER_SOURCE
-    if status.transport_state in _PLAYING_STATES:
+    if status.transport_state == "PLAYING":
         return OURS
+    if status.transport_state == "TRANSITIONING":
+        return TRANSITIONING
     return NOT_PLAYING
 
 
@@ -449,6 +462,17 @@ class Controller:
             raise
         return judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
 
+    def restart_renderer(self):
+        """Stop, then Play, on the zone renderer of the last look at the room. A renderer that
+        hangs in TRANSITIONING ignores a plain Play; Stop followed right away by Play brings
+        it back. The stream URI is left as it is."""
+        if self._control is None:
+            raise RaumfeldError("no zone renderer known to restart")
+        control = self._control[1]
+        soap_call(control, "Stop", [])
+        soap_call(control, "Play", [("Speed", "1")])
+        log.info("zone %r restarted (Stop, Play)", self._control[0])
+
     def _inspect(self, reuse=False):
         if not (reuse and self._api):
             host, _location = self.discover(self.config.speaker_udn)
@@ -591,6 +615,11 @@ DEFAULT_POLL_S = 5
 # Consecutive polls that may find our renderer stopped while MPD plays (a stream
 # reconnect between songs) before the speaker counts as taken away.
 STOPPED_GRACE_POLLS = 2
+# A renderer that stays TRANSITIONING on our stream this long while MPD plays is stuck
+# (it dropped the stream). Restarts per stuck episode, each waiting twice as long as the
+# one before; a renderer seen PLAYING again ends the episode.
+STUCK_S = 15
+STUCK_MAX_RESTARTS = 3
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
@@ -618,10 +647,13 @@ class Follower:
     (pause -> stop). If the room goes away while MPD is stopped there is no cast to
     end: it just lets go (no pause, no release) and the next play wakes the room."""
 
-    def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic):
+    def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
+                 stuck_seconds=STUCK_S):
         self.controller = controller
         self.poll_seconds = poll_seconds
+        self.stuck_seconds = stuck_seconds
         self.clock = clock
+        self._stuck = None  # (first seen, restarts so far, next restart due) of a stuck episode
         self.pending = None
         self.deadline = None
         self.mpd_state = None
@@ -708,9 +740,38 @@ class Follower:
             self.stopped_polls += 1
             if self.stopped_polls > STOPPED_GRACE_POLLS:
                 return self._yield(verdict)
-        elif verdict == OURS:
+        elif verdict in (OURS, TRANSITIONING):
             self.stopped_polls = 0
+        stuck = verdict == TRANSITIONING and self.mpd_state == "play"
+        if not stuck and verdict != NOT_PLAYING:
+            # Our own Stop may read NOT_PLAYING; it must not end the episode it belongs to.
+            self._stuck = None
+        # Schedule first: a failing restart is logged by _attempt and must not stop polling.
         self._schedule(_POLL)
+        if stuck:
+            self._unstick()
+
+    def _unstick(self):
+        now = self.clock()
+        if self._stuck is None:
+            self._stuck = (now, 0, now + self.stuck_seconds)
+            return
+        since, restarts, due = self._stuck
+        if now < due or restarts > STUCK_MAX_RESTARTS:
+            return
+        if restarts == STUCK_MAX_RESTARTS:
+            # restarts > STUCK_MAX_RESTARTS marks "gave up", so this is logged once.
+            log.error("zone renderer still TRANSITIONING after %d restarts; giving up until "
+                      "it plays again", restarts)
+            self._stuck = (since, restarts + 1, due)
+            return
+        restarts += 1
+        self._stuck = (since, restarts, now + self.stuck_seconds * 2 ** restarts)
+        log.warning("zone renderer TRANSITIONING for %.0f s while MPD plays: it dropped the "
+                    "stream; restarting it (Stop, Play), attempt %d of %d",
+                    now - since, restarts, STUCK_MAX_RESTARTS)
+        self.stopped_polls = 0
+        self.controller.restart_renderer()
 
     def _yield(self, verdict):
         log.info("speaker taken away (%s): ending the cast; not taking the room back "
@@ -801,7 +862,7 @@ def main(env=None):
         log.warning("IDLE_MINUTES is ignored: the Raumfeld's own auto power-off puts the room "
                     "into standby")
     controller = Controller(config, ssdp_discover)
-    follower = Follower(controller, config.poll_seconds)
+    follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds)
     try:
         run(follower, lambda: MpdClient(config.mpd_host, config.mpd_port))
     except KeyboardInterrupt:

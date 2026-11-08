@@ -38,6 +38,8 @@ class FakeRaumfeld:
         self.polls_until_new_zone = 0
         self.transport_state = "STOPPED"
         self.current_uri = ""
+        # A renderer that dropped the stream: Play alone leaves it TRANSITIONING; Stop clears it.
+        self.stuck = False
         self.fail_paths = set()  # substrings of paths that answer 500
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.redirect_base = HOST_PREFIX  # where the API's 307 points
@@ -136,9 +138,10 @@ class FakeRaumfeld:
             self.transport_state = "STOPPED"
         elif action == "Play":
             assert args.get("Speed") == "1"
-            self.transport_state = "PLAYING"
+            self.transport_state = "TRANSITIONING" if self.stuck else "PLAYING"
         elif action == "Stop":
             self.transport_state = "STOPPED"
+            self.stuck = False
         else:
             raise AssertionError("unknown SOAP action " + action)
         return (
