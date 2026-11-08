@@ -738,8 +738,9 @@ GATE_POLL_S = 0.5
 START_GATE_MAX_S = 60
 # A speaker still finishing its standby when woken accepts the takeover and drops it. So a
 # renderer not PLAYING our stream GATE_RETAKE_S after the takeover returned gets the whole
-# takeover again, at most GATE_MAX_RETAKES times per gate. Each one may push the gate's end
-# to GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has time to play.
+# takeover again, at most GATE_MAX_RETAKES times per gate. Every takeover in the gate may
+# push its end to GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has
+# time to play.
 GATE_RETAKE_S = 5
 GATE_MAX_RETAKES = 2
 
@@ -790,8 +791,10 @@ class Follower:
 
     Start gate: when MPD starts playing and the adapter doesn't own the zone, it first
     asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
-    pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). Its
-    own pause and resume are not followed; a failed takeover lets MPD play at once and is
+    pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). A
+    renderer that does not start gets the takeover again (GATE_RETAKE_S,
+    GATE_MAX_RETAKES); if it still has never played when the gate ends, it gets one more
+    before it counts as taken away. Its own pause and resume are not followed; a failed takeover lets MPD play at once and is
     retried after PLAY_RETRY_S without the gate. A stop or another song during the gate is
     the user's doing and is never undone; a pause from the phone during the gate can't
     be told apart from ours (MPD is already paused, nothing changes), so it is undone."""
@@ -919,8 +922,7 @@ class Follower:
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
-            self._gate.taken = self.clock()
-            self._schedule(_GATE)
+            self._took_over()
         else:
             # The takeover failed and is retried later; never keep the phone waiting for it.
             self._release_gate("the takeover failed")
@@ -960,6 +962,11 @@ class Follower:
         # A failed one counts too: _attempt logs it, and the next is due GATE_RETAKE_S later.
         gate.taken = now
         self.controller.ensure_playing(wake=True, force=True)
+        self._took_over()
+
+    def _took_over(self):
+        # Every takeover gets GATE_RETAKE_S to start playing, even past the configured gate.
+        gate = self._gate
         gate.taken = self.clock()
         gate.deadline = min(max(gate.deadline, gate.taken + GATE_RETAKE_S),
                             gate.started + START_GATE_MAX_S)

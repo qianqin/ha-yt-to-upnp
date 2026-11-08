@@ -732,6 +732,16 @@ class StartGateTest(unittest.TestCase):
         self.assertTrue(any("after 24.0 s" in m for m in logs), logs)
         self.released()
 
+    def test_a_takeover_slower_than_the_gate_still_gets_time_to_play(self):
+        self.ctl.takeover_s = 12  # e.g. the wake wait plus slow speaker requests
+        self.held()  # back at +12 s: the gate now ends at +17 s, not +15 s
+        self.ctl.takeover_s = 0
+        self.gate_runs_out()
+        # Retakes at +17 s and +22 s, each given GATE_RETAKE_S.
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), 2)
+        self.assertEqual(self.clock.now, 1000 + 22 + ra.GATE_RETAKE_S)
+        self.released()
+
     def test_the_gate_never_holds_mpd_beyond_the_configured_maximum(self):
         self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
                              start_gate_seconds=ra.START_GATE_MAX_S)
