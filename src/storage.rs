@@ -147,7 +147,6 @@ fn is_group_or_world_readable(_path: &Path) -> bool {
 pub(crate) mod test_util {
     use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
 
     /// A fresh, empty temp directory removed on drop.
     pub struct TempDir(pub PathBuf);
@@ -181,18 +180,21 @@ pub(crate) mod test_util {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    #[derive(Clone, Default)]
-    pub struct LogBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl LogBuf {
-        pub fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
+    thread_local! {
+        /// This thread's captured log output while a [`LogCapture`] lives.
+        static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     }
 
-    impl Write for LogBuf {
+    /// Writes to the emitting thread's capture buffer, or nowhere.
+    struct ThreadWriter;
+
+    impl Write for ThreadWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            CAPTURED.with(|c| {
+                if let Some(out) = c.borrow_mut().as_mut() {
+                    out.extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -200,16 +202,50 @@ pub(crate) mod test_util {
         }
     }
 
-    /// Run `f` with a thread-local subscriber and return everything it logged.
+    /// One process-wide subscriber enabled for every level. Per-test
+    /// thread-local subscribers raced with tracing's global callsite interest
+    /// cache when other test threads hit the same callsites, losing events.
+    fn install_test_subscriber() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(|| ThreadWriter)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global tracing subscriber in tests");
+        });
+    }
+
+    /// Captures everything logged on this thread until dropped. Not `Send`:
+    /// it must stay on the thread whose events it collects (async tests run
+    /// on the current-thread runtime).
+    pub struct LogCapture(std::marker::PhantomData<*const ()>);
+
+    impl LogCapture {
+        pub fn start() -> Self {
+            install_test_subscriber();
+            CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+            LogCapture(std::marker::PhantomData)
+        }
+
+        pub fn text(&self) -> String {
+            CAPTURED.with(|c| String::from_utf8(c.borrow().clone().unwrap_or_default()).unwrap())
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            CAPTURED.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    /// Run `f` and return everything it logged on this thread.
     pub fn capture_logs(f: impl FnOnce()) -> String {
-        let buf = LogBuf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        buf.contents()
+        let capture = LogCapture::start();
+        f();
+        capture.text()
     }
 }
 

@@ -1109,41 +1109,10 @@ async fn backoff_sleep(attempt: u32, shutdown: &mut watch::Receiver<bool>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl LogBuf {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Captures all tracing output on this thread while the guard lives.
-    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
-        let logs = LogBuf::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || writer.clone())
-            .finish();
-        (logs, tracing::subscriber::set_default(subscriber))
-    }
 
     #[tokio::test]
     async fn http_errors_do_not_carry_query_secrets() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = closed.local_addr().unwrap();
         drop(closed);
@@ -1173,7 +1142,7 @@ mod tests {
 
     #[test]
     fn dispatch_logs_arg_keys_not_ctt_value() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let mut session = LoungeSession::new(
             reqwest::Client::new(),
             "Test Screen".to_owned(),

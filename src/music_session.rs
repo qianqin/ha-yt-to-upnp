@@ -339,7 +339,6 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::MUSIC_PAGE;
     use super::*;
-    use crate::storage::test_util::LogBuf;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -392,17 +391,6 @@ mod tests {
         assert_eq!(ctx["user"]["lockedSafetyMode"], false);
         assert_eq!(ctx["client"]["visitorData"], "CgtWSVNJVE9SLUlE");
         assert!(session.player_context(None)["user"].get("credentialTransferTokens").is_none());
-    }
-
-    /// Captures all tracing output on this thread while the guard lives.
-    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
-        let logs = LogBuf::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        (logs, tracing::subscriber::set_default(subscriber))
     }
 
     fn response(status: &str, extra_headers: &str, body: &str) -> String {
@@ -533,7 +521,7 @@ mod tests {
             .resolve("consent.youtube.com", addr)
             .build()
             .unwrap();
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
 
         let page_url = format!("http://music.youtube.com:{}/", addr.port());
         let session = fetch_session_from(&http, &page_url, &format!("http://{addr}")).await;
@@ -541,7 +529,7 @@ mod tests {
         assert!(session.is_none());
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "redirect not followed or base.js fetched: {seen:?}");
-        let logs = logs.contents();
+        let logs = logs.text();
         assert!(logs.contains("music.youtube.com redirected to consent.youtube.com"), "{logs}");
     }
 
@@ -549,13 +537,13 @@ mod tests {
     async fn http_error_page_yields_no_session() {
         let (addr, seen) = spawn_fake_youtube(pages("503 Service Unavailable", MUSIC_PAGE.to_owned(), "")).await;
         let origin = format!("http://{addr}");
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
 
         let session = fetch_session_from(&reqwest::Client::new(), &format!("{origin}/"), &origin).await;
 
         assert!(session.is_none());
         assert_eq!(seen.lock().unwrap().len(), 1);
-        let logs = logs.contents();
+        let logs = logs.text();
         assert!(logs.contains("music.youtube.com returned HTTP 503"), "{logs}");
     }
 
@@ -576,12 +564,12 @@ mod tests {
     async fn unusable_page_yields_no_session() {
         let (addr, _seen) = spawn_fake_youtube(pages("200 OK", "<html>deprecated</html>".to_owned(), "")).await;
         let origin = format!("http://{addr}");
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
 
         let session = fetch_session_from(&reqwest::Client::new(), &format!("{origin}/"), &origin).await;
 
         assert!(session.is_none());
-        let logs = logs.contents();
+        let logs = logs.text();
         assert!(logs.contains("could not extract INNERTUBE_CONTEXT"), "{logs}");
     }
 

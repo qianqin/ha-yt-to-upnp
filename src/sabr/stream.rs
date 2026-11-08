@@ -1498,36 +1498,6 @@ mod tests {
     const GOOD_URL: &str = "https://rr1---sn-abc.googlevideo.com/videoplayback?a=1";
     const SECRET_POTOKEN: &[u8] = b"secret-potoken-bytes";
 
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl LogBuf {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Captures all tracing output on this thread while the guard lives.
-    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
-        let logs = LogBuf::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || writer.clone())
-            .finish();
-        (logs, tracing::subscriber::set_default(subscriber))
-    }
-
     /// Reads one HTTP request (head plus content-length body) from `sock`.
     async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         let mut req = Vec::new();
@@ -1594,7 +1564,7 @@ mod tests {
 
     #[test]
     fn redirect_to_foreign_host_is_rejected() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let mut state = test_state(GOOD_URL);
         let target = "https://evil.example/stream?token=secret-query-token";
         let data = vs::SabrRedirect { url: Some(target.to_owned()) }.encode_to_vec();
@@ -1622,7 +1592,7 @@ mod tests {
 
     #[test]
     fn untrusted_initial_server_url_fails() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let err = check_streaming_url("https://evil.example/videoplayback?pot=secret-query-token")
             .unwrap_err();
         assert!(err.to_string().contains("evil.example"));
@@ -1634,7 +1604,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_cycle_to_untrusted_host_sends_nothing() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let reached = spawn_recorder(listener);
@@ -1655,7 +1625,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_cycle_errors_do_not_carry_signed_url() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed_addr = closed.local_addr().unwrap();
         drop(closed);
@@ -1699,7 +1669,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_client_does_not_follow_307_to_foreign_host() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let foreign = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let foreign_addr = foreign.local_addr().unwrap();
         let reached = spawn_recorder(foreign);
@@ -1732,7 +1702,7 @@ mod tests {
 
     #[tokio::test]
     async fn pot_token_log_shows_length_only() {
-        let (logs, _guard) = capture_logs();
+        let logs = crate::storage::test_util::LogCapture::start();
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let json = r#"{"poToken":"secret-potoken-value-0123456789"}"#;

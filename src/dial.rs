@@ -488,31 +488,12 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(data);
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn dial_launch_does_not_log_pairing_code() {
         const CODE: &str = "SECRETPAIRCODE123";
-        let buf = LogBuf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || writer.clone())
-            .finish();
-        // Current-thread test runtime: the handler runs on this thread, so a
-        // thread-local default subscriber sees all of its events.
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Current-thread test runtime: the handler runs on this thread, so
+        // the capture sees all of its events.
+        let capture = crate::storage::test_util::LogCapture::start();
 
         let status = app_launch(
             Method::POST,
@@ -525,7 +506,7 @@ mod tests {
         .status();
 
         assert_eq!(status, StatusCode::CREATED);
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         assert!(logs.contains("DIAL"), "log capture is not working: {logs:?}");
         assert!(!logs.contains(CODE), "pairing code leaked into logs: {logs}");
     }
