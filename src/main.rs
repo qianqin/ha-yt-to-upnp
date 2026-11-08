@@ -204,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctt: std::sync::RwLock::new(None),
         yt_session: yt_session.clone(),
         screen_id: config.screen_id.clone(),
+        stream_failure: Default::default(),
     });
 
     // 12. Spawn background tasks
@@ -406,6 +407,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if status.state == "stop" {
                             play_started = false;
 
+                            let failure = dial_state.take_stream_failure(&current_video_id(&playlist));
+                            let action = stop_action(failure, &playlist);
+                            if let StopAction::StreamFailed(reason) = action {
+                                tracing::error!(
+                                    "[player] Stream failed for {} (index {}): {}; not advancing",
+                                    current_video_id(&playlist), playlist.current_index, reason
+                                );
+                                playlist.last_state = messages::PlayerState::Idle;
+                                state_tx.send(stream_failed_message(&playlist)).await.ok();
+                                continue;
+                            }
+
                             // Tell YouTube the current track has ended BEFORE
                             // attempting auto-advance. If InnerTube fails
                             // (LOGIN_REQUIRED), YouTube already has the ended
@@ -431,8 +444,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .with_arg("cpn", &playlist.cpn),
                             ).await.ok();
 
-                            if playlist.current_index + 1 < playlist.video_ids.len() {
-                                playlist.current_index += 1;
+                            if let StopAction::Advance(next) = action {
+                                playlist.current_index = next;
                                 let video_id = playlist.video_ids[playlist.current_index].clone();
                                 tracing::info!(
                                     "[player] Advancing to index {} ({})",
@@ -780,6 +793,42 @@ async fn handle_command(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// What to do when MPD stops while a track was playing.
+#[derive(Debug, PartialEq)]
+enum StopAction {
+    /// The receiver could not serve the stream. Not an end of track: the
+    /// app would skip ahead, so stay on this track and report the failure.
+    StreamFailed(String),
+    /// The track ended; play this playlist index next.
+    Advance(usize),
+    /// The last track ended.
+    Finished,
+}
+
+fn stop_action(stream_failure: Option<String>, playlist: &PlaylistState) -> StopAction {
+    match stream_failure {
+        Some(reason) => StopAction::StreamFailed(reason),
+        None if playlist.current_index + 1 < playlist.video_ids.len() => {
+            StopAction::Advance(playlist.current_index + 1)
+        }
+        None => StopAction::Finished,
+    }
+}
+
+/// Unstarted (-1) at position 0: unlike Stopped (0) at the full duration,
+/// the app does not read it as "track ended" and advance the queue.
+fn stream_failed_message(playlist: &PlaylistState) -> messages::OutgoingMessage {
+    let duration = messages::fmt_time(playlist.current_duration as f64);
+    messages::OutgoingMessage::new("onStateChange")
+        .with_arg("state", messages::PlayerState::Idle.as_str())
+        .with_arg("currentTime", "0")
+        .with_arg("duration", &duration)
+        .with_arg("loadedTime", "0")
+        .with_arg("seekableStartTime", "0")
+        .with_arg("seekableEndTime", &duration)
+        .with_arg("cpn", &playlist.cpn)
+}
+
 fn current_video_id(playlist: &PlaylistState) -> String {
     playlist
         .video_ids
@@ -975,6 +1024,44 @@ async fn send_volume(
         .await
         .ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    fn playlist(len: usize, index: usize) -> PlaylistState {
+        PlaylistState {
+            video_ids: (0..len).map(|i| format!("vid{i}")).collect(),
+            current_index: index,
+            current_duration: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn natural_end_advances_or_finishes() {
+        assert_eq!(stop_action(None, &playlist(3, 0)), StopAction::Advance(1));
+        assert_eq!(stop_action(None, &playlist(3, 2)), StopAction::Finished);
+    }
+
+    #[test]
+    fn stream_failure_never_advances() {
+        assert_eq!(
+            stop_action(Some("nsig decode failed".into()), &playlist(3, 0)),
+            StopAction::StreamFailed("nsig decode failed".into())
+        );
+    }
+
+    #[test]
+    fn stream_failure_is_reported_as_unstarted_at_zero() {
+        let msg = stream_failed_message(&playlist(3, 0));
+        let arg = |k: &str| msg.args.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(msg.command, "onStateChange");
+        assert_eq!(arg("state"), Some(messages::PlayerState::Idle.as_str()));
+        assert_eq!(arg("currentTime"), Some("0"));
+        assert_eq!(arg("loadedTime"), Some("0"));
+    }
 }
 
 #[cfg(test)]

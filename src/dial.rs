@@ -40,6 +40,26 @@ pub struct DialState {
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
     pub screen_id: String,
+    /// Last `/stream` request that failed: (video_id, reason). Lets the
+    /// player tell a failed stream from a song that ended, since MPD just
+    /// stops in both cases.
+    pub stream_failure: std::sync::Mutex<Option<(String, String)>>,
+}
+
+impl DialState {
+    fn record_stream_failure(&self, video_id: &str, reason: String) {
+        *self.stream_failure.lock().unwrap() = Some((video_id.to_owned(), reason));
+    }
+
+    /// Takes the recorded failure; returns its reason if it was for `video_id`.
+    pub fn take_stream_failure(&self, video_id: &str) -> Option<String> {
+        self.stream_failure
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|(vid, _)| vid == video_id)
+            .map(|(_, reason)| reason)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +353,8 @@ async fn stream_audio(
         }
         Err(e) => {
             tracing::error!("[stream] {} failed: {}", video_id, e);
+            // Recorded before responding, so it is visible once MPD stops.
+            state.record_stream_failure(&video_id, e.to_string());
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error: {}", e),
@@ -366,6 +388,7 @@ mod tests {
             ctt: std::sync::RwLock::new(None),
             yt_session: None,
             screen_id: "test-screen".to_string(),
+            stream_failure: Default::default(),
         })
     }
 
@@ -508,5 +531,22 @@ mod tests {
         let lan = peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
         assert_eq!(get_as(lan, "/ssdp/device-desc.xml").await, StatusCode::OK);
         assert_eq!(get_as(lan, "/apps/YouTube").await, StatusCode::OK);
+    }
+
+    #[test]
+    fn stream_failure_is_taken_once_for_its_video() {
+        let state = test_state();
+        state.record_stream_failure("aaaaaaaaaaa", "nsig decode failed".into());
+        assert_eq!(state.take_stream_failure("aaaaaaaaaaa").as_deref(), Some("nsig decode failed"));
+        assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
+    }
+
+    #[test]
+    fn stream_failure_of_another_video_is_dropped() {
+        let state = test_state();
+        state.record_stream_failure("aaaaaaaaaaa", "boom".into());
+        assert_eq!(state.take_stream_failure("bbbbbbbbbbb"), None);
+        // A stale failure must not mark a later stop of its video as failed.
+        assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
 }
