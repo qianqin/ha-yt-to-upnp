@@ -110,6 +110,7 @@ fn build_router(state: Arc<DialState>) -> Router {
         .route("/apps/YouTube", post(app_launch))
         .route("/apps/YouTube/run", delete(app_stop))
         .route("/stream/{video_id}", get(stream_audio))
+        .route(SILENCE_PATH, get(silence_audio))
         .with_state(state)
 }
 
@@ -275,6 +276,36 @@ async fn app_stop(
 }
 
 // ---------------------------------------------------------------------------
+// GET /silence -- endless silence for the pre-roll
+// ---------------------------------------------------------------------------
+
+/// Endless silence MPD plays as the pre-roll while a cast is still loading.
+pub const SILENCE_PATH: &str = "/silence";
+/// Raw PCM, decoded by MPD's built-in `pcm` decoder plugin, so it needs no
+/// optional decoder (ffmpeg, sndfile) and no header with a length.
+/// All-zero samples are silence in either byte order.
+const SILENCE_CONTENT_TYPE: &str = "audio/L16;rate=44100;channels=2";
+/// About 93 ms of 16-bit stereo at 44.1 kHz per chunk.
+static SILENCE_CHUNK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+/// Not paced: MPD reads only as far ahead as its input buffer, and TCP
+/// back-pressure suspends the stream until it reads again.
+async fn silence_audio(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
+    if !is_loopback_peer(peer) {
+        tracing::warn!("[silence] rejected non-loopback peer {}", peer);
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let chunks = futures_util::stream::repeat_with(|| {
+        Ok::<_, std::io::Error>(bytes::Bytes::from_static(&SILENCE_CHUNK))
+    });
+    (
+        [(header::CONTENT_TYPE, SILENCE_CONTENT_TYPE)],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // GET /stream/:video_id -- SABR audio stream
 // ---------------------------------------------------------------------------
 
@@ -399,20 +430,30 @@ mod tests {
     /// Serve the real router on an ephemeral loopback port while pretending the
     /// TCP peer is `peer_addr`, then issue a GET for `path`.
     async fn get_as(peer_addr: SocketAddr, path: &str) -> StatusCode {
+        let (response, server) = fetch_as(peer_addr, path).await;
+        let status = response.status();
+        server.abort();
+        StatusCode::from_u16(status.as_u16()).unwrap()
+    }
+
+    /// Like `get_as`, but hands back the response (its body may be endless)
+    /// and the server task, which the caller aborts when done.
+    async fn fetch_as(
+        peer_addr: SocketAddr,
+        path: &str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
         let app = build_router(test_state()).layer(MockConnectInfo(peer_addr));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service()).await.unwrap();
         });
-        let status = reqwest::Client::new()
+        let response = reqwest::Client::new()
             .get(format!("http://{addr}{path}"))
             .send()
             .await
-            .unwrap()
-            .status();
-        server.abort();
-        StatusCode::from_u16(status.as_u16()).unwrap()
+            .unwrap();
+        (response, server)
     }
 
     fn lan_peers() -> Vec<SocketAddr> {
@@ -486,6 +527,32 @@ mod tests {
                 "{ip}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn silence_from_lan_is_forbidden() {
+        for p in lan_peers() {
+            assert_eq!(get_as(p, SILENCE_PATH).await, StatusCode::FORBIDDEN, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn silence_from_loopback_is_an_endless_pcm_stream_of_zeros() {
+        let (mut response, server) = fetch_as(peer(IpAddr::V4(Ipv4Addr::LOCALHOST)), SILENCE_PATH).await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "audio/L16;rate=44100;channels=2"
+        );
+        // Several seconds' worth of audio: more than any single chunk, so the
+        // body keeps coming instead of ending after a fixed buffer.
+        let mut read = 0;
+        while read < 4 * 44_100 * 4 {
+            let chunk = response.chunk().await.unwrap().expect("silence must not end");
+            assert!(chunk.iter().all(|&b| b == 0), "silence must be all zero samples");
+            read += chunk.len();
+        }
+        server.abort();
     }
 
     #[tokio::test]
