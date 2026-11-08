@@ -18,6 +18,9 @@ audio_output {
     format      "44100:16:2"
     always_on   "yes"           # keep the stream open between tracks so the speaker doesn't drop it
     tags        "yes"
+    # Volume from the phone is MPD's software volume (httpd has no mixer, so without
+    # this line setvol fails with "No mixer"). The Raumfeld's own volume is never touched.
+    mixer_type  "software"
 }
 
 # Lossless variant (use instead of the block above; set STREAM_MIME=audio/flac):
@@ -28,4 +31,5 @@ audio_output {
 #     port        "8000"
 #     format      "44100:16:2"
 #     always_on   "yes"
+#     mixer_type  "software"   # phone volume = MPD software volume; Raumfeld volume untouched
 # }

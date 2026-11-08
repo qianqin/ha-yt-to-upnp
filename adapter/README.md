@@ -44,7 +44,10 @@ Raumfeld room play the receiver's MPD stream automatically.
   next song wakes the room again.
 - It never stops the zone or puts the room into standby itself; the Raumfeld's
   own auto power-off does that.
-- It never changes the volume and sends no RenderingControl requests at all.
+- It never changes the Raumfeld's volume and sends no RenderingControl requests
+  at all. Volume from the phone is MPD's software volume: the httpd output needs
+  `mixer_type "software"` (as in [`mpd.conf.example`](mpd.conf.example)),
+  otherwise MPD answers the phone's volume change with `ACK ... {setvol} No mixer`.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that
   answered SSDP (redirects included), caps replies at 256 KiB and each request
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
@@ -83,7 +86,7 @@ naming the variable. `IDLE_MINUTES` is no longer used; if it is set, the
 adapter logs a warning and ignores it.
 
 See [`mpd.conf.example`](mpd.conf.example) for a matching MPD setup (httpd
-output on port 8000, MP3 or FLAC).
+output on port 8000, MP3 or FLAC, software mixer for the phone's volume).
 
 ## Run
 
