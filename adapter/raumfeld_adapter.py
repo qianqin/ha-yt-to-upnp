@@ -714,8 +714,8 @@ class Follower:
         self.poll_seconds = poll_seconds
         self.stuck_seconds = stuck_seconds
         self.start_gate_seconds = start_gate_seconds
-        self._gate = None
         self.clock = clock
+        self._gate = None  # the start gate in progress, if any
         self._stuck = None  # (first seen, restarts so far, next restart due) of a stuck episode
         self.pending = None
         self.deadline = None
