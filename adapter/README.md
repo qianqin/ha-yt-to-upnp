@@ -6,7 +6,14 @@ Raumfeld room play the receiver's MPD stream automatically.
 - When MPD starts playing, it finds the speaker via SSDP (by UDN, never by IP),
   wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
   it to a new one only if it has none) and tells the zone's renderer to play
-  `STREAM_URL` via UPnP AVTransport.
+  `STREAM_URL` via UPnP AVTransport. **Waking waits for the room:** if the room
+  was not `ACTIVE`, the adapter asks `getZones` every 0.5 s until it reports the
+  room `ACTIVE` (and in a zone, if it had one before), at most 10 s
+  (`WAKE_WAIT_S`), and only then finds the zone renderer afresh and sends
+  `SetAVTransportURI`/`Play`. A speaker woken while it is still finishing its
+  standby otherwise accepts those requests and drops them. A room not awake in
+  time is taken over anyway, with a warning; the start gate's re-takeover (below)
+  covers the rest.
 - **Start gate:** the speaker needs several seconds to wake, join its zone and
   buffer, while MPD starts the song right away. So when MPD starts playing and the
   adapter doesn't own the room (a new cast, or a resume after the room was taken
@@ -14,8 +21,20 @@ Raumfeld room play the receiver's MPD stream automatically.
   httpd output keeps streaming silence while paused (`always_on`), so the speaker
   can connect. Then it wakes the room and starts the stream as usual, asks the
   zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`, and sends
-  `pause 0` as soon as it is. If that doesn't happen within `START_GATE_SECONDS`,
-  or the takeover fails, it sends `pause 0` anyway and logs a warning: playback is
+  `pause 0` as soon as it is. **Re-takeover:** if the renderer is not `PLAYING`
+  `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover returned, whatever it
+  reports (`STOPPED`, `TRANSITIONING`, another source, or no answer), the adapter
+  does the whole takeover again (wake, wait for the room, `SetAVTransportURI`,
+  `Play`; same UDN discovery, no volume), at most twice per gate
+  (`GATE_MAX_RETAKES`), and logs each one at INFO with the state that triggered
+  it. A renderer `TRANSITIONING` on the stream is set up afresh too; one that
+  plays it is left alone. Every takeover in the gate gets those 5 s to start
+  playing, so the gate may run past `START_GATE_SECONDS` (by default up to about
+  25 s with two re-takeovers on a speaker answering in 3 s; more on a slower
+  one), but never past 60 s, the highest `START_GATE_SECONDS`. If the renderer
+  still doesn't play by then, or the takeover fails, it sends `pause 0` anyway and
+  logs a warning naming the last renderer state and the room verdict (e.g.
+  `renderer 'STOPPED', room 'not_playing'` or `room 'standby'`): playback is
   never blocked. A failed takeover is retried after 30 seconds without holding MPD
   again; MPD's report of the adapter's own `pause 0` (same state, same `songid`) is
   no new start. That rule applies within one MPD connection: after a reconnect the
@@ -43,8 +62,14 @@ Raumfeld room play the receiver's MPD stream automatically.
   Raumfeld's own auto power-off, also while paused), the room left its zone,
   the zone plays anything other than `STREAM_URL` (e.g. line-in switched in by
   Home Assistant), or, while MPD plays, the renderer stays stopped for more than
-  two polls in a row. If that happens while MPD is playing or paused, the
-  adapter:
+  two polls in a row. **Exception right after a start gate that ran out:** if
+  every look at the room since then found the renderer stopped, it never started
+  after the adapter's own takeover, so nobody stopped it; instead of yielding, the
+  adapter does one more takeover and logs it, then counts again. A renderer seen
+  playing or `TRANSITIONING` since, or any change in MPD (pause, stop, another
+  song), drops that exception, so a user who stops the speaker later is still
+  respected. If the speaker counts as taken away while MPD is playing or paused,
+  the adapter:
   1. sends MPD `pause 1` if MPD is playing (never `stop`: the receiver reads an
      MPD stop as the end of the track and plays the next one),
   2. sends `sendmessage ytcast release` once, which tells the receiver to end the
@@ -72,6 +97,14 @@ Raumfeld room play the receiver's MPD stream automatically.
   episode, each waiting twice as long as the one before; then it logs an error and
   leaves the renderer alone. A renderer seen `PLAYING` again ends the episode. A
   short `TRANSITIONING` (normal start or buffering) is left alone.
+- How the timings fit together: one takeover may wait up to 10 s for the room
+  to wake (plus the usual SSDP and request time); a re-takeover is due 5 s after
+  a takeover returned; the gate ends at `START_GATE_SECONDS` or 5 s after the
+  last takeover returned, whichever is later, at most 60 s after it began. A
+  re-takeover is only started before that 60 s mark. So while the renderer
+  doesn't play, a gate set below about 15 s still lasts until both re-takeovers
+  had their 5 s; a renderer that plays ends the gate at once, whatever the
+  setting.
 - Apart from that restart it never stops the zone, and it never puts the room
   into standby itself; the Raumfeld's own auto power-off does that.
 - It never changes the Raumfeld's volume and sends no RenderingControl requests
@@ -118,7 +151,7 @@ the stream (the phone shows it paused).
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
-| `START_GATE_SECONDS` | `15` | Longest time (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. At most 60 s: holding the song any longer only leaves the phone standing still |
+| `START_GATE_SECONDS` | `15` | How long (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. A takeover in the gate always gets 5 s to start playing, so the hold can run past this value, but never past 60 s: holding the song any longer only leaves the phone standing still |
 | `STUCK_SECONDS` | `15` | How long (seconds, 1-300) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
