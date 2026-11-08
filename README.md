@@ -40,7 +40,7 @@ All audio is streamed using YouTube's **SABR (Server Adaptive Bit Rate) protocol
 Unlike direct URL approaches that break when YouTube changes client policies, SABR is YouTube's own native streaming protocol. It handles format negotiation, server redirects, retries, and backoff automatically.
 
 **Under the hood:**
-1. InnerTube `/player` call using WEB_REMIX client + credential transfer token (ctt) from the cast session for authenticated access. When casting from YouTube Music, the phone sends a per-video ctt automatically — no setup needed. Falls back to IOS/ANDROID clients without ctt (some tracks may be restricted without authentication)
+1. InnerTube `/player` call using WEB_REMIX client + credential transfer token (ctt) from the cast session for authenticated access. When casting from YouTube Music, the phone sends a per-video ctt automatically — no setup needed. Without a ctt (or if the anonymous YouTube Music session failed to load) it uses the IOS client, with ANDROID as a further fallback (some tracks may be restricted without authentication)
 2. Picks the highest-bitrate Opus audio format
 3. Opens a SABR session with YouTube's CDN using protobuf requests
 4. Parses UMP (Universal Media Protocol) binary response frames
@@ -59,7 +59,7 @@ The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions 
 - Graceful disconnect (stops playback when phone disconnects)
 - Best-quality Opus audio (itag 251, up to ~160kbps, 48kHz stereo)
 - Authenticated streaming via cast session credential transfer tokens (WEB_REMIX + ctt)
-- Full YouTube Music session context (fetches live ytcfg from music.youtube.com for WEB_REMIX /player)
+- Full YouTube Music session context (fetches live ytcfg anonymously from music.youtube.com for WEB_REMIX /player)
 - n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver in QuickJS
 - Dual Lounge sessions (YouTube + YouTube Music themes) for broad compatibility
 
@@ -86,18 +86,15 @@ export MPD_PORT=6600
 # (default: OS config dir, nsig cache in OS cache dir under ytcast/)
 export YTCAST_DATA_DIR=/data
 
-# Optional: cookie file (default: $YTCAST_DATA_DIR/ytm-cookies.txt if set, else ~/ytm-cookies.txt)
-export YTM_COOKIES=/data/ytm-cookies.txt
-
 # Run
 ./ytcast-open
 ```
 
 Open YouTube Music on your phone, tap Cast, and select your device.
 
-The receiver never logs in and stores no credentials of its own: authentication comes from the casting client, which sends a per-video credential transfer token (ctt) with each track. The optional cookie file (`YTM_COOKIES`) is still read if present.
+The receiver never logs in and stores no credentials of its own: authentication comes from the casting client, which sends a per-video credential transfer token (ctt) with each track. WEB_REMIX is used only when a cast supplies a ctt and the YouTube Music session loaded; otherwise the anonymous IOS client is used. At startup the public music.youtube.com page is fetched anonymously for the session context (visitor data, signature timestamp, nsig player); that one request carries a fixed consent cookie `SOCS=CAI` ("reject all") so EU visitors are not redirected to the consent page - it holds no account data and is not authentication. Requests carrying the ctt or the session fetch only follow redirects to Google hosts. Cookie files are no longer supported: `YTM_COOKIES` and `ytm-cookies.txt` are ignored, so delete any old `ytm-cookies.txt`.
 
-With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If a config or cookie file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
+With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If the config or an nsig cache file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
 
 ## Building
 
@@ -120,18 +117,18 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.rs` | ~1160 | Entry point, player command loop, MPD idle events, auto-advance |
+| `main.rs` | ~1190 | Entry point, player command loop, MPD idle events, auto-advance |
 | `lounge.rs` | ~1230 | YouTube Lounge API - session management, streaming long-poll, command parsing (session tokens and pairing codes are kept out of logs) |
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `cookies.rs` | ~440 | Cookie loading, YouTube Music session extraction (ytcfg), triple SAPISIDHASH auth |
-| `innertube.rs` | ~240 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
+| `music_session.rs` | ~600 | Anonymous YouTube Music session at startup: fetches the public music.youtube.com page for ytcfg context, visitor data, STS and the base.js player for nsig |
+| `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
 | `nsig.rs` | ~390 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
-| `dial.rs` | ~520 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
+| `dial.rs` | ~510 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
 | `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
-| `storage.rs` | ~350 | Data/cookie path resolution (`YTCAST_DATA_DIR`, `YTM_COOKIES`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
-| `sabr/stream.rs` | ~1850 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (cookies, PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
+| `storage.rs` | ~310 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
+| `sabr/stream.rs` | ~1830 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 
