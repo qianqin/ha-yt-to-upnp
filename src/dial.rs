@@ -25,6 +25,9 @@ pub struct DialState {
     pub pairing_tx: mpsc::Sender<String>,
     /// Channel to deliver pairing codes for the "m" (YouTube Music) session.
     pub pairing_tx_m: mpsc::Sender<String>,
+    /// Asks the player loop to start the silence pre-roll. Capacity 1: a
+    /// request still waiting covers any further launch.
+    pub preroll_tx: mpsc::Sender<()>,
     /// Human-readable name shown during discovery (e.g. "Living Room Pi").
     pub device_name: String,
     /// UPnP UUID for this device (without the "uuid:" prefix).
@@ -252,12 +255,27 @@ async fn app_launch(
     }
 
     state.running.store(true, Ordering::Relaxed);
+    request_preroll(&state.preroll_tx);
 
     // DIAL spec: 201 Created with LOCATION pointing to the running instance.
     let mut headers = HeaderMap::new();
     headers.insert(header::LOCATION, "/apps/YouTube/run".parse().unwrap());
 
     (StatusCode::CREATED, headers).into_response()
+}
+
+/// Start waking the speaker while the phone is still loading the song.
+/// Never waits: the DIAL answer must not be delayed by MPD.
+fn request_preroll(tx: &mpsc::Sender<()>) {
+    match tx.try_send(()) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(())) => {
+            tracing::debug!("DIAL launch: pre-roll request already pending");
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            tracing::debug!("DIAL launch: player loop gone, no pre-roll");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,9 +428,15 @@ mod tests {
     }
 
     fn test_state() -> Arc<DialState> {
+        let (preroll_tx, _) = mpsc::channel(1);
+        test_state_with(preroll_tx)
+    }
+
+    fn test_state_with(preroll_tx: mpsc::Sender<()>) -> Arc<DialState> {
         let (pairing_tx, _) = mpsc::channel(1);
         let (pairing_tx_m, _) = mpsc::channel(1);
         Arc::new(DialState {
+            preroll_tx,
             running: AtomicBool::new(false),
             pairing_tx,
             pairing_tx_m,
@@ -576,6 +600,49 @@ mod tests {
         let logs = capture.text();
         assert!(logs.contains("DIAL"), "log capture is not working: {logs:?}");
         assert!(!logs.contains(CODE), "pairing code leaked into logs: {logs}");
+    }
+
+    /// A DIAL launch as the phone sends it; fails the test if the handler
+    /// does not answer at once.
+    async fn launch(state: Arc<DialState>, theme: &str) -> StatusCode {
+        let handler = app_launch(
+            Method::POST,
+            "/apps/YouTube".parse().unwrap(),
+            ConnectInfo(peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))),
+            State(state),
+            format!("pairingCode=CODE&theme={theme}&v=dQw4w9WgXcQ&t=0"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("DIAL launch must not wait for the pre-roll")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn dial_launch_requests_a_preroll_for_both_themes() {
+        for theme in ["m", "cl"] {
+            let (tx, mut rx) = mpsc::channel(1);
+            assert_eq!(launch(test_state_with(tx), theme).await, StatusCode::CREATED);
+            assert_eq!(rx.try_recv(), Ok(()), "theme={theme}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_launches_queue_at_most_one_preroll_request() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = test_state_with(tx);
+        for _ in 0..3 {
+            assert_eq!(launch(state.clone(), "m").await, StatusCode::CREATED);
+        }
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_succeeds_when_nobody_takes_preroll_requests() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert_eq!(launch(test_state_with(tx), "m").await, StatusCode::CREATED);
     }
 
     #[tokio::test]

@@ -172,6 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (pairing_cl_tx, pairing_cl_rx) = tokio::sync::mpsc::channel::<String>(8);
     let (pairing_m_tx, pairing_m_rx) = tokio::sync::mpsc::channel::<String>(8);
 
+    // DIAL launch → player loop: start the silence pre-roll
+    let (preroll_tx, mut preroll_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     // Active session tracking — router checks this to decide where state goes
     let active_theme: std::sync::Arc<std::sync::RwLock<String>> =
         std::sync::Arc::new(std::sync::RwLock::new("cl".into()));
@@ -197,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         running: std::sync::atomic::AtomicBool::new(false),
         pairing_tx: pairing_cl_tx,
         pairing_tx_m: pairing_m_tx,
+        preroll_tx,
         device_name: device_name.clone(),
         uuid: config.uuid.clone(),
         local_ip,
