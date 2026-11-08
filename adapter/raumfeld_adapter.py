@@ -65,13 +65,15 @@ class MpdError(Exception):
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
-def _seconds(env, key, default, minimum):
+def _seconds(env, key, default, minimum, maximum=math.inf):
     try:
         value = float(env.get(key, default))
     except ValueError:
         raise ConfigError("%s must be a number" % key) from None
-    if not (math.isfinite(value) and value >= minimum):
-        raise ConfigError("%s must be at least %g" % (key, minimum))
+    if not (math.isfinite(value) and minimum <= value <= maximum):
+        if maximum == math.inf:
+            raise ConfigError("%s must be at least %g" % (key, minimum))
+        raise ConfigError("%s must be %g-%g" % (key, minimum, maximum))
     return value
 
 
@@ -95,8 +97,11 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
 
         # Below 1 s the adapter would hammer the speaker's API and SSDP.
         poll_seconds = _seconds(env, "SPEAKER_POLL_SECONDS", "5", 1)
-        stuck_seconds = _seconds(env, "STUCK_SECONDS", str(STUCK_S), 1)
-        start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0)
+        # Beyond a few minutes of silence a restart comes too late to be of use.
+        stuck_seconds = _seconds(env, "STUCK_SECONDS", str(STUCK_S), 1, 300)
+        # Capped at MPD's default connection_timeout: holding the song any longer only
+        # leaves the phone standing still.
+        start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0, 60)
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -548,7 +553,8 @@ class MpdClient:
         # default) while not in `idle`, e.g. while the adapter waits for a slow speaker.
         # Tracked so a lost connection can say so.
         self._quiet_since = time.monotonic()
-        self._silent_s = 0.0
+        self._silent_s = 0.0  # time outside idle before the last command
+        self._idle_since = None  # set while in `idle`
         try:
             banner = self._readline()
             if not banner.startswith("OK MPD "):
@@ -585,11 +591,10 @@ class MpdClient:
         if timeout is not None and timeout <= 0:
             raise ValueError("idle timeout must be positive or None, got %r" % timeout)
         self._send("idle player")
+        self._idle_since = time.monotonic()
         self.sock.settimeout(timeout)
         try:
             self._response()
-            # MPD restarts its connection_timeout when it ends an `idle`.
-            self._quiet_since = time.monotonic()
             return True
         except socket.timeout:
             self.sock.settimeout(self.timeout)
@@ -598,15 +603,22 @@ class MpdClient:
             return bool(self._response())
         finally:
             self.sock.settimeout(self.timeout)
+            # MPD restarts its connection_timeout when an `idle` ends.
+            self._idle_since = None
+            self._quiet_since = time.monotonic()
 
     def _command(self, command):
         self._send(command)
         self._response()
 
     def _send(self, command):
-        now = time.monotonic()
-        self._silent_s, self._quiet_since = now - self._quiet_since, now
-        self.sock.sendall(command.encode() + b"\n")
+        if self._idle_since is None:  # `noidle` ends a wait in idle, not a silence
+            now = time.monotonic()
+            self._silent_s, self._quiet_since = now - self._quiet_since, now
+        try:
+            self.sock.sendall(command.encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise self._lost() from e
 
     def _response(self):
         lines = []
@@ -623,15 +635,31 @@ class MpdClient:
         while b"\n" not in self.buf:
             if len(self.buf) > MPD_MAX_LINE:
                 raise MpdError("MPD line longer than %d bytes" % MPD_MAX_LINE)
-            chunk = self.sock.recv(4096)
+            try:
+                chunk = self.sock.recv(4096)
+            except ConnectionResetError as e:
+                raise self._lost() from e
             if not chunk:
-                raise ConnectionError(
-                    "MPD closed the connection after %.1f s without a command from the adapter "
-                    "(MPD hangs up on clients silent outside idle for longer than its "
-                    "connection_timeout, 60 s by default)" % self._silent_s)
+                raise self._lost()
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         return line.decode("utf-8", "replace")
+
+    def _lost(self):
+        """The error for a connection MPD closed or reset (an empty read, a reset, a broken
+        pipe: which one shows depends on timing), naming connection_timeout only when the
+        adapter had been silent outside idle for longer than it has been in idle since:
+        a drop late in a long idle is an MPD restart or the network, not the timeout."""
+        idle_s = 0.0 if self._idle_since is None else time.monotonic() - self._idle_since
+        if self._silent_s > idle_s:
+            return ConnectionError(
+                "MPD closed the connection after %.1f s without a command from the adapter "
+                "(MPD hangs up on clients silent outside idle for longer than its "
+                "connection_timeout, 60 s by default)" % self._silent_s)
+        if self._idle_since is None:
+            return ConnectionError("MPD closed the connection")
+        return ConnectionError("MPD closed the connection while the adapter waited in idle "
+                               "for %.1f s" % idle_s)
 
 
 # --------------------------------------------------------------------------- orchestration
@@ -704,7 +732,8 @@ class Follower:
     Start gate: when MPD starts playing and the adapter doesn't own the zone, it first
     asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
     pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). Its
-    own pause and resume are not followed. A stop or another song during the gate is
+    own pause and resume are not followed; a failed takeover lets MPD play at once and is
+    retried after PLAY_RETRY_S without the gate. A stop or another song during the gate is
     the user's doing and is never undone; a pause from the phone during the gate can't
     be told apart from ours (MPD is already paused, nothing changes), so it is undone."""
 

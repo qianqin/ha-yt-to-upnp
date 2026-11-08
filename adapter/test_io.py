@@ -2,6 +2,7 @@
 
 import os
 import socket
+import struct
 import threading
 import time
 import unittest
@@ -149,6 +150,125 @@ class MpdLimitsTest(unittest.TestCase):
         port = raw_server(self, lambda conn: conn.sendall(b"OK MPD " + b"x" * 70000))
         with self.assertRaises(ra.MpdError):
             ra.MpdClient("127.0.0.1", port)
+
+
+class BrokenSocket:
+    """Stands in for the MPD socket after MPD reset the connection: recv and sendall raise
+    what the OS reports then (deterministic, unlike a real RST racing a FIN)."""
+
+    def __init__(self, recv_error=None, send_error=None, recv_after_s=0.0):
+        self.recv_error = recv_error
+        self.send_error = send_error
+        self.recv_after_s = recv_after_s
+        self.sent = []
+
+    def settimeout(self, timeout):
+        pass
+
+    def sendall(self, data):
+        if self.send_error:
+            raise self.send_error
+        self.sent.append(data)
+
+    def recv(self, size):
+        time.sleep(self.recv_after_s)
+        if self.recv_error:
+            raise self.recv_error
+        return b""
+
+    def close(self):
+        pass
+
+
+class MpdConnectionLostTest(unittest.TestCase):
+    """MPD hangs up on a client silent outside `idle` for its connection_timeout. A lost
+    connection names that only when the adapter had been silent outside idle; a drop
+    during idle (an MPD restart) is reported plainly, however it shows: an empty read, a
+    reset on recv or a broken pipe on send."""
+
+    TIMEOUT_HINT = "connection_timeout"
+
+    def client(self, test_silence_s=0.0):
+        mpd = FakeMpd([["play"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        client._quiet_since -= test_silence_s  # as if the adapter had waited on the speaker
+        return client
+
+    def test_empty_read_after_silence_outside_idle_names_the_timeout(self):
+        def hang_up_after_a_command(conn):
+            conn.sendall(b"OK MPD 0.23.5\n")
+            conn.recv(4096)
+            conn.shutdown(socket.SHUT_WR)  # an orderly close: the client reads EOF
+            time.sleep(1)
+
+        client = ra.MpdClient("127.0.0.1", raw_server(self, hang_up_after_a_command))
+        self.addCleanup(client.close)
+        client._quiet_since -= 70
+        with self.assertRaises(ConnectionError) as cm:
+            client.status()
+        self.assertRegex(str(cm.exception), r"after 70\.\d s without a command")
+        self.assertIn(self.TIMEOUT_HINT, str(cm.exception))
+
+    def test_reset_after_silence_outside_idle_names_the_timeout(self):
+        for name, sock in (("recv", BrokenSocket(recv_error=ConnectionResetError(54, "reset"))),
+                           ("send", BrokenSocket(send_error=BrokenPipeError(32, "pipe")))):
+            with self.subTest(name):
+                client = self.client(test_silence_s=70)
+                client.sock = sock
+                with self.assertRaises(ConnectionError) as cm:
+                    client.status()
+                self.assertRegex(str(cm.exception), r"after 70\.\d s without a command")
+                self.assertIn(self.TIMEOUT_HINT, str(cm.exception))
+                self.assertNotIn("Errno", str(cm.exception))
+
+    def test_reset_right_after_connecting_is_reported_plainly(self):
+        def reset_before_the_banner(conn):
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+        with self.assertRaises(ConnectionError) as cm:
+            ra.MpdClient("127.0.0.1", raw_server(self, reset_before_the_banner))
+        self.assertEqual(str(cm.exception), "MPD closed the connection")
+
+    def test_drop_while_idle_does_not_blame_the_timeout(self):
+        def hang_up_during_idle(conn):
+            conn.sendall(b"OK MPD 0.23.5\n")
+            conn.recv(4096)  # idle player
+            time.sleep(0.3)  # MPD restarts while the adapter waits in idle
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(1)
+
+        client = ra.MpdClient("127.0.0.1", raw_server(self, hang_up_during_idle))
+        self.addCleanup(client.close)
+        with self.assertRaises(ConnectionError) as cm:
+            client.wait_player(None)
+        self.assertIn("idle", str(cm.exception))
+        self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
+
+    def test_reset_while_idle_does_not_blame_the_timeout(self):
+        client = self.client()
+        client.sock = BrokenSocket(recv_error=ConnectionResetError(54, "reset"), recv_after_s=0.2)
+        with self.assertRaises(ConnectionError) as cm:
+            client.wait_player(None)
+        self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
+        self.assertNotIn("Errno", str(cm.exception))
+
+    def test_noidle_into_a_dropped_connection_does_not_blame_the_timeout(self):
+        client = self.client()
+        client.sock = BrokenSocket(recv_error=socket.timeout("idle wait over"))
+        client.sock.recv_after_s = 0.2
+        real_sendall = client.sock.sendall
+
+        def sendall(data):
+            if data.startswith(b"noidle"):
+                raise BrokenPipeError(32, "pipe")
+            real_sendall(data)
+
+        client.sock.sendall = sendall
+        with self.assertRaises(ConnectionError) as cm:
+            client.wait_player(0.2)
+        self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
 
 
 class HttpLimitsTest(unittest.TestCase):

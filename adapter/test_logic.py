@@ -45,6 +45,14 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(c.stuck_seconds, 20)
         self.assertEqual(c.start_gate_seconds, 0)  # 0 turns the gate off
 
+    def test_timing_upper_bounds_are_allowed(self):
+        c = ra.Config.from_env(dict(REQUIRED, START_GATE_SECONDS="60", STUCK_SECONDS="300"))
+        self.assertEqual((c.start_gate_seconds, c.stuck_seconds), (60, 300))
+
+    def test_bound_is_named_in_the_error(self):
+        with self.assertRaisesRegex(ra.ConfigError, "START_GATE_SECONDS must be 0-60"):
+            ra.Config.from_env(dict(REQUIRED, START_GATE_SECONDS="90"))
+
     def test_missing_required_names_every_missing_var(self):
         with self.assertRaises(ra.ConfigError) as cm:
             ra.Config.from_env({"STREAM_URL": STREAM_URL})
@@ -63,6 +71,9 @@ class ConfigTest(unittest.TestCase):
                            ("STUCK_SECONDS", "nan"), ("STUCK_SECONDS", "later"),
                            ("START_GATE_SECONDS", "-1"), ("START_GATE_SECONDS", "inf"),
                            ("START_GATE_SECONDS", "x"),
+                           # A gate past MPD's default connection_timeout (60 s) would get
+                           # the adapter dropped; a renderer stuck for minutes is long gone.
+                           ("START_GATE_SECONDS", "61"), ("STUCK_SECONDS", "301"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
                            ("RAUMFELD_SPEAKER_UDN", "speaker"),
@@ -490,6 +501,25 @@ class StuckRendererTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             self.poll()
         self.assertEqual(self.restarts(), 2)
+
+    def test_our_own_stop_read_as_not_playing_does_not_end_the_episode(self):
+        self.ctl.verdict = ra.TRANSITIONING
+        times = []
+        restarted = False
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            for _ in range(100):
+                # The poll right after each restart reads STOPPED: our own Stop.
+                self.ctl.verdict = ra.NOT_PLAYING if restarted else ra.TRANSITIONING
+                before = self.restarts()
+                self.poll()
+                restarted = self.restarts() > before
+                if restarted:
+                    times.append(self.clock.now)
+        self.assertEqual(len(times), ra.STUCK_MAX_RESTARTS)
+        # The backoff continues across the stopped poll: 2 x 15 s, then 4 x 15 s.
+        self.assertEqual([b - a for a, b in zip(times, times[1:])],
+                         [2 * self.STUCK_S, 4 * self.STUCK_S])
+        self.assertEqual(self.f.take_mpd_requests(), [])
 
     def test_transitioning_while_mpd_is_paused_is_left_alone(self):
         self.f.on_mpd_state("pause")

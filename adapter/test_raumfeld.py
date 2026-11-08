@@ -156,6 +156,25 @@ class ControllerTest(unittest.TestCase):
         self.ctl.check()
         self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN] * 2)
 
+    def test_plays_stream_only_for_playing_on_our_stream(self):
+        self.rf.power = "ACTIVE"
+        self.ctl.check()  # the zone renderer is known from now on
+        self.rf.requests.clear()
+        for state, uri, plays in (("PLAYING", STREAM_URL, True),
+                                  ("PLAYING", LINE_IN_URI, False),  # line-in reports PLAYING
+                                  ("TRANSITIONING", STREAM_URL, False),
+                                  ("STOPPED", STREAM_URL, False)):
+            with self.subTest(state=state, uri=uri):
+                self.rf.transport_state, self.rf.current_uri = state, uri
+                self.assertIs(self.ctl.plays_stream(), plays)
+        self.assertEqual(self.rf.api_calls(), [])  # the renderer only, no getZones
+        self.assertEqual(set(self.rf.soap_actions()), {"GetTransportInfo", "GetMediaInfo"})
+
+    def test_plays_stream_without_a_known_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.plays_stream()
+        self.assertEqual(self.rf.requests, [])
+
     def test_speaker_not_found_raises_device_not_found(self):
         self.discover.speaker_present = False
         with self.assertRaises(ra.DeviceNotFound):
