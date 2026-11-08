@@ -162,6 +162,15 @@ mod real {
         port: u16,
     }
 
+    /// A URI as one quoted MPD argument; quotes and line breaks would let it
+    /// end the argument or the command early.
+    fn quoted_uri(uri: &str) -> Result<String> {
+        if uri.contains('"') || uri.contains('\n') || uri.contains('\r') {
+            return Err(MpdError::Protocol("URI contains forbidden characters".into()));
+        }
+        Ok(format!("\"{uri}\""))
+    }
+
     impl MpdClient {
         /// Connect to MPD and consume the greeting line (`OK MPD x.x.x`).
         pub async fn connect(host: &str, port: u16) -> Result<Self> {
@@ -218,10 +227,27 @@ mod real {
         }
 
         pub async fn add(&mut self, uri: &str) -> Result<()> {
-            if uri.contains('"') || uri.contains('\n') || uri.contains('\r') {
-                return Err(MpdError::Protocol("URI contains forbidden characters".into()));
-            }
-            self.command(&format!("add \"{uri}\"")).await?;
+            self.command(&format!("add {}", quoted_uri(uri)?)).await?;
+            Ok(())
+        }
+
+        /// Append `uri` to the queue and return its song id, which stays
+        /// valid while other songs are added or removed around it.
+        pub async fn addid(&mut self, uri: &str) -> Result<u32> {
+            let lines = self.command(&format!("addid {}", quoted_uri(uri)?)).await?;
+            lines
+                .iter()
+                .find_map(|l| l.strip_prefix("Id: ")?.parse().ok())
+                .ok_or_else(|| MpdError::Protocol("addid response without Id".into()))
+        }
+
+        pub async fn playid(&mut self, id: u32) -> Result<()> {
+            self.command(&format!("playid {id}")).await?;
+            Ok(())
+        }
+
+        pub async fn deleteid(&mut self, id: u32) -> Result<()> {
+            self.command(&format!("deleteid {id}")).await?;
             Ok(())
         }
 
@@ -466,6 +492,21 @@ mod mock {
             Ok(())
         }
 
+        pub async fn addid(&mut self, uri: &str) -> Result<u32> {
+            tracing::info!("[mock-mpd] addid: {}", &uri[..uri.len().min(80)]);
+            Ok(1)
+        }
+
+        pub async fn playid(&mut self, id: u32) -> Result<()> {
+            tracing::info!("[mock-mpd] playid {id}");
+            Ok(())
+        }
+
+        pub async fn deleteid(&mut self, id: u32) -> Result<()> {
+            tracing::info!("[mock-mpd] deleteid {id}");
+            Ok(())
+        }
+
         pub async fn pause(&mut self) -> Result<()> {
             tracing::info!("[mock-mpd] pause");
             Ok(())
@@ -585,34 +626,52 @@ mod tests {
     }
 
     #[cfg(not(feature = "mock-mpd"))]
+    mod command_client {
+        use super::super::*;
+        use crate::mpd::fake::fake_mpd;
+
+        #[tokio::test]
+        async fn addid_returns_the_new_song_id() {
+            let (port, server) = fake_mpd(vec![("addid", "Id: 42\nOK\n")]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            assert_eq!(mpd.addid("http://localhost:8008/silence").await.unwrap(), 42);
+            drop(mpd);
+            assert_eq!(server.await.unwrap(), vec!["addid \"http://localhost:8008/silence\""]);
+        }
+
+        #[tokio::test]
+        async fn addid_without_an_id_is_a_protocol_error() {
+            let (port, _server) = fake_mpd(vec![("addid", "OK\n")]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            assert!(matches!(mpd.addid("http://x/").await, Err(MpdError::Protocol(_))));
+        }
+
+        #[tokio::test]
+        async fn addid_rejects_uris_that_could_inject_commands() {
+            let (port, server) = fake_mpd(vec![]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            for uri in ["http://x/\"", "http://x/\nstop", "http://x/\r"] {
+                assert!(mpd.addid(uri).await.is_err(), "{uri:?}");
+            }
+            drop(mpd);
+            assert!(server.await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn playid_and_deleteid_address_songs_by_id() {
+            let (port, server) = fake_mpd(vec![("playid", "OK\n"), ("deleteid", "OK\n")]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            mpd.playid(7).await.unwrap();
+            mpd.deleteid(3).await.unwrap();
+            drop(mpd);
+            assert_eq!(server.await.unwrap(), vec!["playid 7", "deleteid 3"]);
+        }
+    }
+
+    #[cfg(not(feature = "mock-mpd"))]
     mod idle_client {
         use super::super::*;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpListener;
-
-        /// Scripted in-process MPD: for each expected command, reply with the
-        /// given response. Returns the commands it actually received.
-        async fn fake_mpd(script: Vec<(&'static str, &'static str)>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let handle = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (rd, mut wr) = tokio::io::split(stream);
-                let mut rd = BufReader::new(rd);
-                wr.write_all(b"OK MPD 0.23.5\n").await.unwrap();
-                let mut seen = Vec::new();
-                for (_expected, reply) in script {
-                    let mut line = String::new();
-                    if rd.read_line(&mut line).await.unwrap() == 0 {
-                        break;
-                    }
-                    seen.push(line.trim_end().to_owned());
-                    wr.write_all(reply.as_bytes()).await.unwrap();
-                }
-                seen
-            });
-            (port, handle)
-        }
+        use crate::mpd::fake::fake_mpd;
 
         #[tokio::test]
         async fn connect_subscribes_and_release_message_is_reported() {
@@ -673,5 +732,37 @@ mod tests {
             .await;
             assert!(MpdIdleClient::connect("127.0.0.1", port).await.is_err());
         }
+    }
+}
+
+/// Scripted in-process MPD shared by the tests of every module that drives
+/// an `MpdClient` or `MpdIdleClient`.
+#[cfg(all(test, not(feature = "mock-mpd")))]
+pub(crate) mod fake {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// Scripted in-process MPD: for each expected command, reply with the
+    /// given response. Returns the commands it actually received.
+    pub async fn fake_mpd(script: Vec<(&'static str, &'static str)>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut rd = BufReader::new(rd);
+            wr.write_all(b"OK MPD 0.23.5\n").await.unwrap();
+            let mut seen = Vec::new();
+            for (_expected, reply) in script {
+                let mut line = String::new();
+                if rd.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                seen.push(line.trim_end().to_owned());
+                wr.write_all(reply.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (port, handle)
     }
 }
