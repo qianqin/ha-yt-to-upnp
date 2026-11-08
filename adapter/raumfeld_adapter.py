@@ -400,10 +400,13 @@ class MpdClient:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.buf = b""
-        banner = self._readline()
-        if not banner.startswith("OK MPD "):
+        try:
+            banner = self._readline()
+            if not banner.startswith("OK MPD "):
+                raise MpdError("not an MPD server: %r" % banner[:40])
+        except BaseException:
             self.close()
-            raise MpdError("not an MPD server: %r" % banner[:40])
+            raise
 
     def close(self):
         self.sock.close()
