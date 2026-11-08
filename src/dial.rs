@@ -47,14 +47,11 @@ pub struct DialState {
 }
 
 impl DialState {
-    fn record_stream_failure(&self, video_id: &str, reason: String) {
-        *self.stream_failure.lock().unwrap() = Some((video_id.to_owned(), reason));
-    }
-
-    /// A successful `/stream` makes any earlier failure stale: MPD plays one
-    /// stream at a time.
-    fn clear_stream_failure(&self) {
-        *self.stream_failure.lock().unwrap() = None;
+    /// Records a failed `/stream` for `video_id`, or forgets any earlier
+    /// failure on success: MPD plays one stream at a time, so it is stale.
+    fn note_stream_result(&self, video_id: &str, result: std::result::Result<(), String>) {
+        *self.stream_failure.lock().unwrap() =
+            result.err().map(|reason| (video_id.to_owned(), reason));
     }
 
     /// Takes the recorded failure; returns its reason if it was for `video_id`.
@@ -304,7 +301,7 @@ async fn stream_audio(
     let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
     match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session).await {
         Ok((info, rx)) => {
-            state.clear_stream_failure();
+            state.note_stream_result(&video_id, Ok(()));
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
             // so we can inspect with ffprobe if MPD crashes.
@@ -361,7 +358,7 @@ async fn stream_audio(
         Err(e) => {
             tracing::error!("[stream] {} failed: {}", video_id, e);
             // Recorded before responding, so it is visible once MPD stops.
-            state.record_stream_failure(&video_id, e.to_string());
+            state.note_stream_result(&video_id, Err(e.to_string()));
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error: {}", e),
@@ -543,7 +540,7 @@ mod tests {
     #[test]
     fn stream_failure_is_taken_once_for_its_video() {
         let state = test_state();
-        state.record_stream_failure("aaaaaaaaaaa", "nsig decode failed".into());
+        state.note_stream_result("aaaaaaaaaaa", Err("nsig decode failed".into()));
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa").as_deref(), Some("nsig decode failed"));
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
@@ -551,17 +548,17 @@ mod tests {
     #[test]
     fn stream_failure_of_another_video_is_dropped() {
         let state = test_state();
-        state.record_stream_failure("aaaaaaaaaaa", "boom".into());
+        state.note_stream_result("aaaaaaaaaaa", Err("boom".into()));
         assert_eq!(state.take_stream_failure("bbbbbbbbbbb"), None);
         // A stale failure must not mark a later stop of its video as failed.
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
 
     #[test]
-    fn cleared_stream_failure_is_not_taken() {
+    fn successful_stream_clears_earlier_failure() {
         let state = test_state();
-        state.record_stream_failure("aaaaaaaaaaa", "boom".into());
-        state.clear_stream_failure();
+        state.note_stream_result("aaaaaaaaaaa", Err("boom".into()));
+        state.note_stream_result("aaaaaaaaaaa", Ok(()));
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
 }
