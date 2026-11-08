@@ -17,9 +17,9 @@ class MpdClientTest(unittest.TestCase):
         self.addCleanup(mpd.close)
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
-        self.assertEqual(client.state(), "stop")
+        self.assertEqual(client.status().state, "stop")
         self.assertTrue(client.wait_player(None))
-        self.assertEqual(client.state(), "play")
+        self.assertEqual(client.status().state, "play")
         self.assertEqual(mpd.commands, ["status", "idle player", "status"])
 
     def test_idle_timeout_sends_noidle_and_connection_stays_usable(self):
@@ -30,8 +30,28 @@ class MpdClientTest(unittest.TestCase):
         started = time.monotonic()
         self.assertFalse(client.wait_player(0.2))
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(client.state(), "pause")
+        self.assertEqual(client.status().state, "pause")
         self.assertEqual(mpd.commands, ["idle player", "noidle", "status"])
+
+    def test_status_reports_the_song_id(self):
+        mpd = FakeMpd([[("play", "7"), "stop"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        self.assertEqual(client.status(), ("play", "7"))
+        client.wait_player(None)
+        self.assertEqual(client.status(), ("stop", None))  # no current song
+
+    def test_resume_sends_pause_0(self):
+        mpd = FakeMpd([[("play", "7")]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        client.pause()
+        self.assertEqual(client.status(), ("pause", "7"))
+        client.resume()
+        self.assertEqual(client.status(), ("play", "7"))
+        self.assertEqual(mpd.commands, ["pause 1", "status", "pause 0", "status"])
 
     def test_non_positive_idle_timeout_is_rejected(self):
         mpd = FakeMpd([["stop"]])
@@ -40,7 +60,7 @@ class MpdClientTest(unittest.TestCase):
         self.addCleanup(client.close)
         with self.assertRaises(ValueError):
             client.wait_player(0.0)
-        self.assertEqual(client.state(), "stop")
+        self.assertEqual(client.status().state, "stop")
 
     def test_pause_and_release_message(self):
         mpd = FakeMpd([["play"]])
@@ -49,7 +69,7 @@ class MpdClientTest(unittest.TestCase):
         self.addCleanup(client.close)
         client.pause()
         client.send_message(ra.CAST_CHANNEL, ra.CAST_RELEASE_MESSAGE)
-        self.assertEqual(client.state(), "pause")
+        self.assertEqual(client.status().state, "pause")
         self.assertEqual(mpd.commands, ["pause 1", "sendmessage ytcast release", "status"])
 
     def test_send_message_without_subscriber_raises_mpd_error(self):
@@ -60,7 +80,7 @@ class MpdClientTest(unittest.TestCase):
         self.addCleanup(client.close)
         with self.assertRaises(ra.MpdError):
             client.send_message(ra.CAST_CHANNEL, ra.CAST_RELEASE_MESSAGE)
-        self.assertEqual(client.state(), "play")  # the connection stays usable
+        self.assertEqual(client.status().state, "play")  # the connection stays usable
 
     def test_send_message_refuses_unsafe_tokens(self):
         mpd = FakeMpd([["play"]])
@@ -216,7 +236,7 @@ class RecordingFollower:
         self.ticks = 0
         self.stop_after = stop_after
 
-    def on_mpd_state(self, state):
+    def on_mpd_state(self, state, songid=None):
         self.states.append(state)
 
     def tick(self):

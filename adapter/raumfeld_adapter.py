@@ -516,9 +516,13 @@ class Controller:
 _MPD_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
+MpdStatus = namedtuple("MpdStatus", "state songid")  # songid is None without a current song
+
+
 class MpdClient:
-    """Minimal MPD protocol client: `status`, `idle player`, `pause 1` and `sendmessage`.
-    Never `stop`: the receiver takes an MPD stop for the end of the track and advances."""
+    """Minimal MPD protocol client: `status`, `idle player`, `pause 1`/`pause 0` and
+    `sendmessage`. Never `stop`: the receiver takes an MPD stop for the end of the track
+    and advances."""
 
     def __init__(self, host, port, timeout=HTTP_TIMEOUT_S):
         self.timeout = timeout
@@ -536,16 +540,18 @@ class MpdClient:
     def close(self):
         self.sock.close()
 
-    def state(self):
+    def status(self):
         self._send("status")
-        for line in self._response():
-            key, _, value = line.partition(": ")
-            if key == "state":
-                return value
-        raise MpdError("status without state")
+        fields = dict(line.partition(": ")[::2] for line in self._response())
+        if "state" not in fields:
+            raise MpdError("status without state")
+        return MpdStatus(fields["state"], fields.get("songid"))
 
     def pause(self):
         self._command("pause 1")
+
+    def resume(self):
+        self._command("pause 0")
 
     def send_message(self, channel, text):
         for token in (channel, text):
@@ -663,7 +669,7 @@ class Follower:
         self.stopped_polls = 0
         self._requests = []
 
-    def on_mpd_state(self, state):
+    def on_mpd_state(self, state, songid=None):
         previous, self.mpd_state = self.mpd_state, state
         self.stopped_polls = 0
         if self.yielded:
@@ -797,7 +803,7 @@ def _serve_requests(follower, mpd):
                 # Note the pause before the message goes out: a receiver that ends the
                 # session right away would otherwise fold our pause and its stop into one
                 # MPD event.
-                follower.on_mpd_state(mpd.state())
+                follower.on_mpd_state(*mpd.status())
             else:
                 _send_release(mpd)
         except BaseException:
@@ -828,7 +834,7 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
             continue
         backoff = 1
         try:
-            follower.on_mpd_state(mpd.state())
+            follower.on_mpd_state(*mpd.status())
             # Tick right away too: a deadline may have passed while MPD was unreachable.
             follower.tick()
             _serve_requests(follower, mpd)
@@ -836,7 +842,7 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
                 wait = follower.seconds_until_deadline()
                 # Only a real player change is an MPD event; a timeout just means "tick".
                 if mpd.wait_player(None if wait is None else max(wait, MIN_WAIT_S)):
-                    follower.on_mpd_state(mpd.state())
+                    follower.on_mpd_state(*mpd.status())
                 follower.tick()
                 # Outside `idle`: the connection is free for our own commands.
                 _serve_requests(follower, mpd)
