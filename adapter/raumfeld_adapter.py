@@ -145,14 +145,15 @@ def is_line_in(uri):
 
 
 def decide_play(status, stream_url):
-    """MPD started playing. `status` is None when the room is not active or has no zone."""
-    if status is None or status.transport_state not in _PLAYING_STATES:
-        return TAKE_OVER
-    if status.current_uri == stream_url:
+    """MPD started playing. `status` is None when the room is not active or has no zone.
+
+    An explicit cast wins over any other source, even one reporting PLAYING: the
+    Raumfeld stays on line-in after Home Assistant switches it there, and line-in
+    reports PLAYING without any audio."""
+    if (status is not None and status.transport_state in _PLAYING_STATES
+            and status.current_uri == stream_url):
         return ALREADY_PLAYING
-    # Someone else plays on the speaker (line-in from a Chromecast Audio or karaoke
-    # machine, another stream): never fight it; the cast ends instead.
-    return OTHER_SOURCE
+    return TAKE_OVER
 
 
 def judge_speaker(power, zone, status, stream_url):
@@ -421,10 +422,9 @@ class Controller:
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
             return decision
-        if decision == OTHER_SOURCE:
+        if room.status and room.status.current_uri not in ("", self.config.stream_url):
             source = "line-in" if is_line_in(room.status.current_uri) else "another source"
-            log.info("zone %r is playing %s; not taking over", room.zone, source)
-            return decision
+            log.info("zone %r was on %s; the cast takes over", room.zone, source)
 
         room_param = quote(self.config.room_udn, safe="")
         if wake:

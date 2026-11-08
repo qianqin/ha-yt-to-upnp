@@ -7,12 +7,13 @@ Raumfeld room play the receiver's MPD stream automatically.
   wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
   it to a new one only if it has none) and tells the zone's renderer to play
   `STREAM_URL` via UPnP AVTransport.
-- If the zone already plays the stream, it does nothing. If the zone is actively
-  playing anything else, e.g. the Raumfeld **line-in** (a Chromecast Audio or a
-  karaoke machine) or another stream, it never takes over: the speaker is busy,
-  which counts as *taken away* (see below), so the cast ends instead of MPD
-  playing into nothing. That also holds for a new cast and for a user resume.
-  Another source that sits stopped or paused is taken over as usual.
+- If the zone already plays the stream, it does nothing. **An explicit cast
+  wins at takeover:** a new cast or a user resume takes the room over from any
+  other source, e.g. the Raumfeld **line-in** (a Chromecast Audio or a karaoke
+  machine) or another stream, even if it reports `PLAYING`. The Raumfeld stays
+  on line-in after Home Assistant switches it there, and line-in reports
+  `PLAYING` without any audio, so "playing" can't tell a busy speaker from an
+  idle one.
 - **The speaker's own controls win.** While the adapter owns the zone (MPD
   playing, paused or stopped), it looks at the room every `SPEAKER_POLL_SECONDS` (one
   `getZones` plus `GetTransportInfo`/`GetMediaInfo`, reusing the last SSDP
@@ -30,8 +31,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   3. stops polling and leaves the room alone. A song change does not wake the
      room again; if one slips in, MPD is paused again. Only a user resume from
      the phone (MPD pause -> play) lets it take the room back, waking it as
-     usual; a new session (MPD pause -> stop, then play) takes over as usual too.
-     If another source still plays at that moment, the cast ends again.
+     usual; a new session (MPD pause -> stop, then play) takes over as usual too,
+     even if another source plays at that moment.
 - If the room goes away while MPD is **stopped** (the cast session already
   ended, e.g. the Raumfeld's auto power-off later), there is nothing to end:
   the adapter just lets go of the room and stops polling, without pause or

@@ -174,32 +174,32 @@ class SpeakerYieldTest(unittest.TestCase):
         self.poll()
         self.released_while_playing()
 
-    def test_user_resume_after_a_line_in_yield_while_line_in_still_plays_ends_the_cast(self):
+    def test_user_resume_after_a_line_in_yield_while_line_in_still_plays_takes_over(self):
         self.cast_is_playing()
         self.rf.current_uri = LINE_IN_URI
         self.poll()
         self.released_while_playing()
-        self.mpd("pause", "play")
-        self.assertFalse(self.taken_over())
-        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
-        self.released_while_playing()  # MPD does not play into nothing
-        self.rf.requests.clear()
+        self.mpd("pause", "play")  # an explicit resume wins
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.nothing_requested()
+        self.rf.current_uri = LINE_IN_URI  # ...and a later switch still ends the cast
         self.poll()
-        self.assertEqual(self.rf.requests, [])  # yielded: no polling
+        self.released_while_playing()
 
-    def test_new_cast_while_line_in_plays_ends_the_cast(self):
+    def test_new_cast_while_line_in_plays_takes_over_and_sends_nothing(self):
+        # Home Assistant leaves the room on line-in, which reports PLAYING without audio.
         self.rf.power = "ACTIVE"
         self.rf.transport_state = "PLAYING"
-        self.rf.current_uri = LINE_IN_URI  # the karaoke machine is on
+        self.rf.current_uri = LINE_IN_URI
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
             self.mpd("play")
-        self.assertFalse(self.taken_over())
-        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
-        self.released_while_playing()
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
         self.assertTrue(any("line-in" in m for m in logs.output), logs.output)
-        self.mpd("stop", "play")  # a song change does not retry
-        self.assertFalse(self.taken_over())
-        self.repaused()
+        self.nothing_requested()
+        self.poll()  # owned and watched like any cast
+        self.nothing_requested()
 
     def test_new_cast_while_line_in_is_idle_takes_over(self):
         self.rf.power = "ACTIVE"
@@ -290,16 +290,16 @@ class SpeakerYieldTest(unittest.TestCase):
         self.assertEqual(self.rf.transport_state, "PLAYING")
         self.nothing_requested()
 
-    def test_session_end_then_line_in_then_new_cast_ends_the_cast(self):
+    def test_session_end_then_line_in_then_new_cast_takes_over(self):
         self.cast_is_playing()
         self.mpd("stop")
         self.rf.current_uri = LINE_IN_URI  # the user switches to the karaoke machine
         self.poll()
         self.nothing_requested()
-        self.mpd("play")  # a new cast while line-in plays: busy speaker
-        self.assertFalse(self.taken_over())
-        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
-        self.released_while_playing()
+        self.mpd("play")  # a new cast while line-in plays: the cast wins
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.nothing_requested()
 
     def test_session_end_then_idle_line_in_then_new_cast_takes_over(self):
         self.cast_is_playing()

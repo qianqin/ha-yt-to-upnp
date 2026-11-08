@@ -77,30 +77,31 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
         self.assertEqual(self.rf.api_calls(), ["getZones"])
 
-    def test_line_in_active_is_not_taken_over(self):
+    def test_a_cast_takes_over_line_in_even_while_it_plays(self):
+        # Home Assistant leaves the room on line-in, which reports PLAYING without audio.
         self.rf.power = "ACTIVE"
         self.rf.transport_state = "PLAYING"
         self.rf.current_uri = LINE_IN_URI
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
-            self.ctl.ensure_playing()
+            self.assertEqual(self.ctl.ensure_playing(), ra.TAKE_OVER)
         self.assertTrue(any("line-in" in m.lower() for m in logs.output), logs.output)
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
-        self.assertEqual(self.rf.api_calls(), ["getZones"])
-        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        self.assertEqual(self.rf.soap_actions(),
+                         ["GetTransportInfo", "GetMediaInfo", "SetAVTransportURI", "Play"])
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
 
-    def test_other_stream_actively_playing_is_not_taken_over(self):
+    def test_a_cast_takes_over_another_playing_stream(self):
         self.rf.power = "ACTIVE"
         self.rf.transport_state = "PLAYING"
         self.rf.current_uri = "http://radio.invalid/live.mp3"
-        self.assertEqual(self.ctl.ensure_playing(), ra.OTHER_SOURCE)
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
-        self.assertEqual(self.rf.api_calls(), ["getZones"])
+        self.assertEqual(self.ctl.ensure_playing(), ra.TAKE_OVER)
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
 
     def test_takeover_reports_its_decision(self):
         self.assertEqual(self.ctl.ensure_playing(), ra.TAKE_OVER)
         self.assertEqual(self.ctl.ensure_playing(), ra.ALREADY_PLAYING)
         self.rf.current_uri = LINE_IN_URI
-        self.assertEqual(self.ctl.ensure_playing(), ra.OTHER_SOURCE)
+        self.assertEqual(self.ctl.ensure_playing(), ra.TAKE_OVER)
 
     def test_without_wake_a_room_in_standby_is_left_off(self):
         self.assertEqual(self.ctl.ensure_playing(wake=False), ra.STANDBY)
