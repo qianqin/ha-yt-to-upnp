@@ -212,12 +212,16 @@ class MpdConnectionLostTest(unittest.TestCase):
 
     TIMEOUT_HINT = "connection_timeout"
 
-    def client(self, test_silence_s=0.0):
+    def client(self, test_silence_s=0.0, sock=None):
+        """A connected client; with sock, that stub replaces (and closes) the real socket."""
         mpd = FakeMpd([["play"]])
         self.addCleanup(mpd.close)
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         client._quiet_since -= test_silence_s  # as if the adapter had waited on the speaker
+        if sock is not None:
+            client.sock.close()
+            client.sock = sock
         return client
 
     def test_empty_read_after_silence_outside_idle_names_the_timeout(self):
@@ -241,8 +245,7 @@ class MpdConnectionLostTest(unittest.TestCase):
                            ("send reset",
                             BrokenSocket(send_error=ConnectionResetError(54, "reset")))):
             with self.subTest(name):
-                client = self.client(test_silence_s=70)
-                client.sock = sock
+                client = self.client(test_silence_s=70, sock=sock)
                 with self.assertRaises(ConnectionError) as cm:
                     client.status()
                 self.assertRegex(str(cm.exception), r"after 70\.\d s without a command")
@@ -267,8 +270,8 @@ class MpdConnectionLostTest(unittest.TestCase):
 
     def test_short_silence_outside_idle_does_not_blame_the_timeout(self):
         # A few seconds without a command is far below any connection_timeout worth naming.
-        client = self.client(test_silence_s=5)
-        client.sock = BrokenSocket(recv_error=ConnectionResetError(54, "reset"))
+        client = self.client(test_silence_s=5,
+                             sock=BrokenSocket(recv_error=ConnectionResetError(54, "reset")))
         with self.assertRaises(ConnectionError) as cm:
             client.status()
         self.assertEqual(str(cm.exception), "MPD closed the connection")
@@ -276,9 +279,8 @@ class MpdConnectionLostTest(unittest.TestCase):
     def test_drop_right_after_a_long_idle_wait_does_not_blame_the_timeout(self):
         # MPD restarts its connection_timeout when an idle ends, so the time spent in idle
         # is no silence, even when the wait ended by timeout and noidle.
-        client = self.client()
-        client.sock = ScriptedSocket([socket.timeout("idle wait over"), b"OK\n"],
-                                     recv_after_s=0.1)
+        client = self.client(sock=ScriptedSocket([socket.timeout("idle wait over"), b"OK\n"],
+                                                 recv_after_s=0.1))
         with mock.patch.object(ra, "TIMEOUT_HINT_S", 0.05):
             self.assertFalse(client.wait_player(0.1))
             with self.assertRaises(ConnectionError) as cm:
@@ -301,17 +303,16 @@ class MpdConnectionLostTest(unittest.TestCase):
         self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
 
     def test_reset_while_idle_does_not_blame_the_timeout(self):
-        client = self.client()
-        client.sock = BrokenSocket(recv_error=ConnectionResetError(54, "reset"), recv_after_s=0.2)
+        client = self.client(sock=BrokenSocket(recv_error=ConnectionResetError(54, "reset"),
+                                               recv_after_s=0.2))
         with self.assertRaises(ConnectionError) as cm:
             client.wait_player(None)
         self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
         self.assertNotIn("Errno", str(cm.exception))
 
     def test_noidle_into_a_dropped_connection_does_not_blame_the_timeout(self):
-        client = self.client()
-        client.sock = BrokenSocket(recv_error=socket.timeout("idle wait over"))
-        client.sock.recv_after_s = 0.2
+        client = self.client(sock=BrokenSocket(recv_error=socket.timeout("idle wait over"),
+                                               recv_after_s=0.2))
         real_sendall = client.sock.sendall
 
         def sendall(data):

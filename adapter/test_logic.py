@@ -1,6 +1,8 @@
 """Pure logic: config, line-in detection, decisions, DIDL/SOAP building, Follower."""
 
+import contextlib
 import io
+import logging
 import time
 import unittest
 import xml.etree.ElementTree as ET
@@ -9,6 +11,16 @@ from unittest import mock
 
 import raumfeld_adapter as ra
 from fakes import LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL
+
+@contextlib.contextmanager
+def no_logs(test, name, level):
+    """assertNoLogs for Python 3.9: a sentinel record must be the only one captured."""
+    with test.assertLogs(name, level) as captured:
+        yield
+        logging.getLogger(name).log(level, "no_logs sentinel")
+    sentinel = "%s:%s:no_logs sentinel" % (logging.getLevelName(level), name)
+    test.assertEqual(captured.output, [sentinel])
+
 
 REQUIRED = {
     "RAUMFELD_ROOM_UDN": ROOM_UDN,
@@ -713,7 +725,12 @@ class StartGateTest(unittest.TestCase):
                     self.f.on_mpd_state("play", "1")
                 self.f.requeue_mpd_requests(self.requests())
                 self.f.on_mpd_connected()
-                self.f.on_mpd_state("play", song)
+                gate, deadline = self.f._gate, self.f.deadline
+                self.clock.now += 3  # a gate opened now would have a later deadline
+                with no_logs(self, "raumfeld_adapter", logging.INFO):
+                    self.f.on_mpd_state("play", song)
+                self.assertIs(self.f._gate, gate)
+                self.assertEqual(self.f.deadline, deadline)
                 self.assertEqual(self.ctl.calls, [])
                 self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
                 self.f.on_mpd_state("pause", song)  # run() reports our pause 1

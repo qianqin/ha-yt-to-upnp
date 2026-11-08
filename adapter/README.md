@@ -86,8 +86,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   away". If the MPD connection drops while `pause 1`, `pause 0` or the release
   message is being sent, whatever is left is sent again after the reconnect. A
   failed takeover is retried on the next change in MPD's state or after 30
-  seconds while MPD keeps playing; a failed poll is retried at the next poll. Lost MPD
-  connections are re-established with backoff.
+  seconds while MPD keeps playing; a failed poll is retried at the next poll.
+  Lost MPD connections are re-established with backoff.
 - Speaker requests run between MPD commands, outside MPD's `idle`. MPD hangs up on
   a client that stays silent there for longer than its `connection_timeout` (60 s
   by default), so a speaker that keeps answering slowly (each request up to its
