@@ -144,11 +144,9 @@ class ParsingTest(unittest.TestCase):
 
     def test_utf16_without_doctype_is_refused_by_the_nul_check(self):
         doc = '<?xml version="1.0" encoding="UTF-16"?><zoneConfig/>'
-        for codec in ("utf-16", "utf-16-le"):
-            with self.subTest(codec=codec), self.assertRaises(ra.RaumfeldError):
-                ra.zone_of_room(doc.encode(codec), ROOM_UDN)
-        with self.assertRaises(ra.RaumfeldError):
-            ra.zone_of_room(b"<zoneConfig>\x00</zoneConfig>", ROOM_UDN)
+        for data in (doc.encode("utf-16"), doc.encode("utf-16-le"), b"<zoneConfig>\x00</zoneConfig>"):
+            with self.subTest(data=data), self.assertRaisesRegex(ra.RaumfeldError, "NUL bytes"):
+                ra.zone_of_room(data, ROOM_UDN)
 
     def test_doctype_is_refused_by_the_parser_not_a_byte_scan(self):
         # The parser, not a byte pattern, enforces the rule: a tab after DOCTYPE still counts.

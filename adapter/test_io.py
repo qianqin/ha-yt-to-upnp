@@ -159,7 +159,7 @@ class HttpLimitsTest(unittest.TestCase):
         with self.assertRaisesRegex(ra.RaumfeldError, "too many redirects"):
             ra.http_get("http://127.0.0.1:%d/x" % port)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(len(requests), ra.MAX_REDIRECTS + 1)
+        self.assertEqual(len(requests), 4)  # the original request plus 3 redirects, pinned
 
     def test_post_redirect_is_not_followed(self):
         requests = []
