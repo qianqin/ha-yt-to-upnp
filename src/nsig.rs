@@ -96,12 +96,15 @@ const MEM_LIMITS: MemLimits = MemLimits {
 /// from the player. Such a failure says nothing about the cached player.
 /// [`fmt_js_error`] and the solver call report memory failures with these.
 fn is_resource_error(err: &str) -> bool {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 6] = [
         "out of memory",
         NULL_EXCEPTION,
         // rquickjs::Error::Allocation
         "Allocation failed",
         "Maximum call stack size exceeded",
+        // Debug form of a null/undefined exception value.
+        "failed: Null",
+        "failed: Undefined",
     ];
     MARKERS.iter().any(|m| err.contains(m))
 }
@@ -514,6 +517,9 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
             ("QuickJS context failed: Allocation failed while creating object", true),
             ("set _preprocessed failed: Allocation failed while creating object", true),
             ("jsc(preprocessed) failed: Maximum call stack size exceeded", true),
+            // Debug form of a null/undefined exception value.
+            ("lib.js eval failed: Null\"null\"", true),
+            ("core.js eval failed: Undefined", true),
             ("jsc error: _result is not defined", false),
             ("jsc error: invalid assignment left-hand side", false),
             ("jsc n error: no solutions", false),
