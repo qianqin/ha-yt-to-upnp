@@ -12,33 +12,37 @@ pub struct StreamInfo {
 /// Makes a lightweight InnerTube /player call to get the real title and
 /// duration (needed for YouTube seekbar sync), then returns a localhost URL
 /// that the DIAL server will handle via SABR when MPD connects.
+///
+/// Requests go through `credential_client()`: the body carries the cast's
+/// ctt, so redirects must not re-send it off Google hosts.
 pub async fn resolve_stream(
-    client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     _playlist_id: Option<&str>,
     yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<Option<StreamInfo>> {
+    let client = crate::sabr::stream::credential_client();
     let stream_url = format!("http://localhost:8008/stream/{}", video_id);
 
-    // WEB_REMIX is the only client that accepts the cast's credential
-    // transfer token; without one there is nothing to authenticate with.
-    let (title, duration) = if ctt.is_some() {
-        match web_remix_player(client, video_id, ctt, yt_session).await {
+    let (title, duration) = match player_request(client, video_id, ctt, yt_session) {
+        Ok(PlayerRequest::WebRemix(req)) => match player_call(client, video_id, req).await {
             Ok(td) => td,
             Err(e) => {
                 tracing::warn!("[innertube] WEB_REMIX failed: {}, trying IOS", e);
-                ios_player(client, video_id).await.unwrap_or_else(|e2| {
-                    tracing::warn!("[innertube] IOS failed: {}, using fallback", e2);
-                    (video_id.to_owned(), 0)
-                })
+                ios_or_fallback(client, video_id).await
             }
-        }
-    } else {
-        ios_player(client, video_id).await.unwrap_or_else(|e| {
-            tracing::warn!("[innertube] IOS failed: {}, using fallback", e);
+        },
+        Ok(PlayerRequest::Ios(req)) => match player_call(client, video_id, req).await {
+            Ok(td) => td,
+            Err(e) => {
+                tracing::warn!("[innertube] IOS failed: {}, using fallback", e);
+                (video_id.to_owned(), 0)
+            }
+        },
+        Err(e) => {
+            tracing::warn!("[innertube] could not build /player request: {}, using fallback", e);
             (video_id.to_owned(), 0)
-        })
+        }
     };
 
     tracing::info!("[stream] {video_id} → \"{}\" [{}s] via SABR", title, duration);
@@ -49,16 +53,46 @@ pub async fn resolve_stream(
     }))
 }
 
-const WEB_REMIX_FALLBACK_VERSION: &str = "1.20260114.03.00";
+/// The first /player request to try, by client.
+enum PlayerRequest {
+    WebRemix(reqwest::Request),
+    Ios(reqwest::Request),
+}
 
-async fn web_remix_player(
+/// WEB_REMIX when the cast sent a ctt and the page session exists (the rule
+/// in `music_session::web_remix_auth`), IOS otherwise.
+fn player_request(
     client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     yt_session: Option<&crate::music_session::YtMusicSession>,
+) -> Result<PlayerRequest> {
+    match crate::music_session::web_remix_auth(ctt, yt_session) {
+        Ok(auth) => Ok(PlayerRequest::WebRemix(web_remix_request(client, video_id, auth)?)),
+        Err(reason) => {
+            tracing::info!("[innertube] {} — using IOS", reason);
+            Ok(PlayerRequest::Ios(ios_request(client, video_id)?))
+        }
+    }
+}
+
+async fn ios_or_fallback(client: &reqwest::Client, video_id: &str) -> (String, u64) {
+    let result = match ios_request(client, video_id) {
+        Ok(req) => player_call(client, video_id, req).await,
+        Err(e) => Err(e),
+    };
+    result.unwrap_or_else(|e| {
+        tracing::warn!("[innertube] IOS failed: {}, using fallback", e);
+        (video_id.to_owned(), 0)
+    })
+}
+
+async fn player_call(
+    client: &reqwest::Client,
+    video_id: &str,
+    req: reqwest::Request,
 ) -> Result<(String, u64)> {
-    let req = web_remix_request(client, video_id, ctt, yt_session)?;
-    let resp = client.execute(req).await?;
+    let resp = client.execute(req).await.map_err(|e| e.without_url())?;
 
     if !resp.status().is_success() {
         return Err(format!("/player HTTP {}", resp.status()).into());
@@ -72,50 +106,24 @@ async fn web_remix_player(
 fn web_remix_request(
     client: &reqwest::Client,
     video_id: &str,
-    ctt: Option<&str>,
-    yt_session: Option<&crate::music_session::YtMusicSession>,
+    auth: crate::music_session::WebRemixAuth<'_>,
 ) -> Result<reqwest::Request> {
-    let body = if let Some(session) = yt_session {
-        let mut playback_ctx = serde_json::json!({
-            "contentPlaybackContext": {
-                "html5Preference": "HTML5_PREF_WANTS",
-            }
-        });
-        if let Some(sts) = session.signature_timestamp {
-            playback_ctx["contentPlaybackContext"]["signatureTimestamp"] = serde_json::json!(sts);
+    let session = auth.session;
+    let mut playback_ctx = serde_json::json!({
+        "contentPlaybackContext": {
+            "html5Preference": "HTML5_PREF_WANTS",
         }
-        serde_json::json!({
-            "videoId": video_id,
-            "context": session.player_context(ctt),
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-            "playbackContext": playback_ctx,
-        })
-    } else {
-        // Minimal context (may return UNPLAYABLE without full ytcfg)
-        let mut context = serde_json::json!({
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": WEB_REMIX_FALLBACK_VERSION,
-                "hl": "en",
-                "gl": "US",
-            }
-        });
-        if let Some(token) = ctt {
-            context["user"] = serde_json::json!({
-                "credentialTransferTokens": [{
-                    "scope": "VIDEO",
-                    "token": token,
-                }]
-            });
-        }
-        serde_json::json!({
-            "videoId": video_id,
-            "context": context,
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-        })
-    };
+    });
+    if let Some(sts) = session.signature_timestamp {
+        playback_ctx["contentPlaybackContext"]["signatureTimestamp"] = serde_json::json!(sts);
+    }
+    let body = serde_json::json!({
+        "videoId": video_id,
+        "context": session.player_context(Some(auth.ctt)),
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+        "playbackContext": playback_ctx,
+    });
 
     let mut req = client
         .post("https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false")
@@ -123,24 +131,18 @@ fn web_remix_request(
         .header("Content-Type", "application/json")
         .header("Origin", "https://music.youtube.com")
         .header("Referer", "https://music.youtube.com/")
-        .header("X-YouTube-Client-Name", "67")
-        .header("X-YouTube-Client-Version",
-            yt_session
-                .and_then(|s| s.client_version())
-                .unwrap_or(WEB_REMIX_FALLBACK_VERSION)
-        );
-
-    if let Some(vd) = yt_session.and_then(|s| s.visitor_data()) {
+        .header("X-YouTube-Client-Name", "67");
+    if let Some(version) = session.client_version() {
+        req = req.header("X-YouTube-Client-Version", version);
+    }
+    if let Some(vd) = session.visitor_data() {
         req = req.header("X-Goog-Visitor-Id", vd);
     }
 
-    Ok(req.json(&body).build()?)
+    Ok(req.json(&body).build().map_err(|e| e.without_url())?)
 }
 
-async fn ios_player(
-    client: &reqwest::Client,
-    video_id: &str,
-) -> Result<(String, u64)> {
+fn ios_request(client: &reqwest::Client, video_id: &str) -> Result<reqwest::Request> {
     let body = serde_json::json!({
         "videoId": video_id,
         "context": {
@@ -159,19 +161,12 @@ async fn ios_player(
         "racyCheckOk": true,
     });
 
-    let resp = client
+    Ok(client
         .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
         .header("User-Agent", "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)")
         .header("Content-Type", "application/json")
         .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("/player HTTP {}", resp.status()).into());
-    }
-
-    parse_player_response(video_id, resp).await
+        .build()?)
 }
 
 async fn parse_player_response(
@@ -208,13 +203,23 @@ mod tests {
         serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap()
     }
 
+    fn assert_no_stored_credentials(req: &reqwest::Request) {
+        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
     #[test]
     fn web_remix_request_carries_ctt_and_no_stored_credentials() {
         let session = crate::music_session::test_fixtures::session();
         let client = reqwest::Client::new();
 
-        let req = web_remix_request(&client, "dQw4w9WgXcQ", Some("cast-token"), Some(&session)).unwrap();
+        let Ok(PlayerRequest::WebRemix(req)) =
+            player_request(&client, "dQw4w9WgXcQ", Some("cast-token"), Some(&session))
+        else {
+            panic!("expected WEB_REMIX with ctt and session");
+        };
 
+        assert_eq!(req.url().host_str(), Some("music.youtube.com"));
         let body = body_json(&req);
         assert_eq!(
             body["context"]["user"]["credentialTransferTokens"],
@@ -224,16 +229,22 @@ mod tests {
         assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20391);
         assert_eq!(req.headers()["x-youtube-client-version"], "1.20261102.01.00");
         assert_eq!(req.headers()["x-goog-visitor-id"], "CgtWSVNJVE9SLUlE");
-        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
-        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        assert_no_stored_credentials(&req);
     }
 
     #[test]
-    fn web_remix_request_without_session_still_carries_ctt() {
+    fn ios_is_used_without_ctt_or_session() {
+        let session = crate::music_session::test_fixtures::session();
         let client = reqwest::Client::new();
-        let req = web_remix_request(&client, "dQw4w9WgXcQ", Some("cast-token"), None).unwrap();
-        assert_eq!(body_json(&req)["context"]["user"]["credentialTransferTokens"][0]["token"], "cast-token");
-        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
-        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        for (ctt, session) in [(Some("cast-token"), None), (None, Some(&session)), (None, None)] {
+            let Ok(PlayerRequest::Ios(req)) = player_request(&client, "dQw4w9WgXcQ", ctt, session) else {
+                panic!("expected IOS for ctt={:?} session={}", ctt, session.is_some());
+            };
+            assert_eq!(req.url().host_str(), Some("www.youtube.com"));
+            let body = body_json(&req);
+            assert_eq!(body["context"]["client"]["clientName"], "IOS");
+            assert!(body["context"].get("user").is_none(), "ctt must not go to IOS");
+            assert_no_stored_credentials(&req);
+        }
     }
 }

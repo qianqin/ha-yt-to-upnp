@@ -1,7 +1,8 @@
 //! Where persistent files live and how they are written.
 //!
-//! `YTCAST_DATA_DIR` moves config and the nsig cache into one directory (e.g. `/data` in a container). When it is unset, the
-//! historical per-user locations are used.
+//! `YTCAST_DATA_DIR` moves config and the nsig cache into one directory
+//! (e.g. `/data` in a container). When it is unset, the historical per-user
+//! locations are used.
 //!
 //! Path resolution takes the env value as a parameter so it can be tested
 //! without mutating the process environment.

@@ -260,7 +260,7 @@ fn check_streaming_url(url: &str) -> Result<(), SabrError> {
 /// Client for credentialed YouTube requests. The default reqwest policy
 /// follows up to 10 redirects to any host and re-sends POST bodies on
 /// 307/308; this one only follows redirects that stay on Google hosts.
-fn credential_client() -> &'static reqwest::Client {
+pub(crate) fn credential_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -294,11 +294,11 @@ struct AdaptiveFormat {
 // InnerTube /player call
 // ---------------------------------------------------------------------------
 
-/// Build a minimal InnerTube context from hardcoded client constants.
-/// Used for IOS/ANDROID/WEB, and for WEB_REMIX when no YtMusicSession is available.
+/// Build a minimal anonymous InnerTube context from hardcoded client
+/// constants, for the fallback clients (IOS/ANDROID/WEB). WEB_REMIX never uses
+/// it: it always gets the page session's context (see `PlayerTarget`).
 fn build_minimal_context(
     itclient: &InnerTubeClient,
-    ctt: Option<&str>,
     visitor_data: Option<&str>,
 ) -> serde_json::Value {
     let mut client_obj = serde_json::json!({
@@ -327,30 +327,26 @@ fn build_minimal_context(
         client_obj["androidSdkVersion"] = serde_json::json!(sdk);
     }
 
-    let mut context = serde_json::json!({ "client": client_obj });
+    serde_json::json!({ "client": client_obj })
+}
 
-    if let Some(token) = ctt {
-        context["user"] = serde_json::json!({
-            "credentialTransferTokens": [{
-                "scope": "VIDEO",
-                "token": token,
-            }]
-        });
-    }
-
-    context
+/// Which /player call to make. WEB_REMIX can only be built from a
+/// `WebRemixAuth`, so it always carries both the ctt and the page session.
+#[derive(Clone, Copy)]
+enum PlayerTarget<'a> {
+    WebRemix(crate::music_session::WebRemixAuth<'a>),
+    /// An anonymous fallback client (IOS/ANDROID/WEB) with a minimal context.
+    Anonymous(&'static InnerTubeClient),
 }
 
 async fn innertube_player(
     http: &reqwest::Client,
     video_id: &str,
-    itclient: &InnerTubeClient,
-    ctt: Option<&str>,
+    target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
-    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<PlayerData, SabrError> {
-    let req = player_request(http, video_id, itclient, ctt, visitor_data, po_token, yt_session)?;
+    let req = player_request(http, video_id, target, visitor_data, po_token)?;
     let resp = http.execute(req).await.map_err(|e| e.without_url())?;
     parse_player_data(video_id, resp).await
 }
@@ -360,29 +356,26 @@ async fn innertube_player(
 fn player_request(
     http: &reqwest::Client,
     video_id: &str,
-    itclient: &InnerTubeClient,
-    ctt: Option<&str>,
+    target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
-    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<reqwest::Request, SabrError> {
-    let is_web_remix = itclient.client_name == "WEB_REMIX";
-
     // --- Build context ---
-    // When we have a live YtMusicSession (from fetching music.youtube.com),
-    // use the full 22+ field INNERTUBE_CONTEXT. Without this, WEB_REMIX /player
-    // returns UNPLAYABLE. yt-dlp always fetches the page first for this reason.
-    let (context, sig_timestamp) = if is_web_remix {
-        if let Some(session) = yt_session {
-            (session.player_context(ctt), session.signature_timestamp)
-        } else {
-            // No session — build minimal context (may fail with UNPLAYABLE)
-            (build_minimal_context(itclient, ctt, visitor_data), None)
+    // WEB_REMIX uses the page session's full 22+ field INNERTUBE_CONTEXT plus
+    // the ctt. Without that context, WEB_REMIX /player returns UNPLAYABLE;
+    // yt-dlp always fetches the page first for this reason.
+    let (itclient, context, sig_timestamp, session) = match target {
+        PlayerTarget::WebRemix(auth) => (
+            &WEB_REMIX_CLIENT,
+            auth.session.player_context(Some(auth.ctt)),
+            auth.session.signature_timestamp,
+            Some(auth.session),
+        ),
+        PlayerTarget::Anonymous(itclient) => {
+            (itclient, build_minimal_context(itclient, visitor_data), None, None)
         }
-    } else {
-        // Non-WEB_REMIX (IOS, ANDROID, WEB): always use minimal context
-        (build_minimal_context(itclient, ctt, visitor_data), None)
     };
+    let is_web_remix = session.is_some();
 
     // --- Build playbackContext ---
     let mut playback_ctx = serde_json::json!({
@@ -418,18 +411,17 @@ fn player_request(
     debug_assert!(is_trusted_google_host(url));
 
     // Client version from live session (changes frequently) or hardcoded constant.
-    let client_version = yt_session
+    let client_version = session
         .and_then(|s| s.client_version())
         .unwrap_or(itclient.client_version);
 
     tracing::info!(
-        "[sabr] innertube /player for {} using {} v{}{}{}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}",
         video_id,
         itclient.client_name,
         client_version,
-        if ctt.is_some() { " +ctt" } else { "" },
+        if is_web_remix { " +ctt +session" } else { "" },
         if po_token.is_some() { " +potoken" } else { "" },
-        if yt_session.is_some() { " +session" } else { "" },
     );
 
     let mut req = http
@@ -444,16 +436,8 @@ fn player_request(
             req = req
                 .header("Origin", "https://music.youtube.com")
                 .header("Referer", "https://music.youtube.com/");
-
-            // Visitor data — prefer page's visitorData, fall back to generated
-            if let Some(session) = yt_session {
-                if let Some(vd) = session.visitor_data() {
-                    req = req.header("X-Goog-Visitor-Id", vd);
-                }
-            } else if let Some(vd) = visitor_data {
-                if !vd.is_empty() {
-                    req = req.header("X-Goog-Visitor-Id", vd);
-                }
+            if let Some(vd) = session.and_then(|s| s.visitor_data()) {
+                req = req.header("X-Goog-Visitor-Id", vd);
             }
         }
         "WEB" | "MWEB" => {
@@ -591,46 +575,28 @@ async fn get_player_data(
 
     // --- Attempt 1: WEB_REMIX + ctt ---
     // Requires nsig decoding of SABR URL (handled by caller).
-    if let Some(session) = web_remix_session(ctt, yt_session) {
-        tracing::info!("[sabr] WEB_REMIX /player (ctt=true, session=true)");
-        match innertube_player(
-            http, video_id, &WEB_REMIX_CLIENT, ctt, None, None, Some(session),
-        ).await {
-            Ok(data) => {
-                tracing::info!("[sabr] WEB_REMIX /player OK");
-                return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
-            }
-            Err(e) => {
-                tracing::warn!("[sabr] WEB_REMIX /player failed: {}", e);
+    match crate::music_session::web_remix_auth(ctt, yt_session) {
+        Ok(auth) => {
+            tracing::info!("[sabr] WEB_REMIX /player (ctt=true, session=true)");
+            match innertube_player(http, video_id, PlayerTarget::WebRemix(auth), None, None).await {
+                Ok(data) => {
+                    tracing::info!("[sabr] WEB_REMIX /player OK");
+                    return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
+                }
+                Err(e) => {
+                    tracing::warn!("[sabr] WEB_REMIX /player failed: {}", e);
+                }
             }
         }
+        Err(reason) => tracing::info!("[sabr] {} — skipping WEB_REMIX", reason),
     }
 
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None).await?;
+    let data = innertube_player(http, video_id, PlayerTarget::Anonymous(&IOS_CLIENT), None, None).await?;
     tracing::info!("[sabr] IOS /player OK");
     Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
-}
-
-/// The session to use for WEB_REMIX, or `None` (with the reason logged) when
-/// WEB_REMIX cannot work: it needs both the cast's ctt and the page session.
-fn web_remix_session<'a>(
-    ctt: Option<&str>,
-    yt_session: Option<&'a crate::music_session::YtMusicSession>,
-) -> Option<&'a crate::music_session::YtMusicSession> {
-    match (ctt, yt_session) {
-        (Some(_), Some(session)) => Some(session),
-        (None, _) => {
-            tracing::info!("[sabr] no ctt from the cast — skipping WEB_REMIX");
-            None
-        }
-        (Some(_), None) => {
-            tracing::warn!("[sabr] no YouTube Music session — skipping WEB_REMIX despite ctt");
-            None
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,10 +1788,10 @@ mod tests {
     #[test]
     fn web_remix_player_body_carries_ctt_without_stored_credentials() {
         let session = crate::music_session::test_fixtures::session();
+        let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
 
         let req = player_request(
-            credential_client(), "dQw4w9WgXcQ", &WEB_REMIX_CLIENT,
-            Some("cast-token"), None, None, Some(&session),
+            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None,
         )
         .unwrap();
 
@@ -1836,8 +1802,10 @@ mod tests {
             body["context"]["user"]["credentialTransferTokens"],
             serde_json::json!([{ "scope": "VIDEO", "token": "cast-token" }])
         );
+        assert_eq!(body["context"]["client"]["clientName"], "WEB_REMIX");
         assert_eq!(body["context"]["client"]["clientVersion"], "1.20261102.01.00");
         assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20391);
+        assert_eq!(req.headers()["x-youtube-client-version"], "1.20261102.01.00");
         assert_eq!(req.headers()["x-goog-visitor-id"], "CgtWSVNJVE9SLUlE");
         assert!(req.headers().get(reqwest::header::COOKIE).is_none());
         assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
@@ -1847,25 +1815,13 @@ mod tests {
     fn fallback_clients_send_no_stored_credentials() {
         for client in [&IOS_CLIENT, &ANDROID_CLIENT, &WEB_CLIENT] {
             let req = player_request(
-                credential_client(), "dQw4w9WgXcQ", client, None, Some("visitor"), None, None,
+                credential_client(), "dQw4w9WgXcQ", PlayerTarget::Anonymous(client), Some("visitor"), None,
             )
             .unwrap();
+            assert_eq!(req.url().host_str(), Some("www.youtube.com"));
             assert!(body_json(&req)["context"].get("user").is_none(), "{}", client.client_name);
             assert!(req.headers().get(reqwest::header::COOKIE).is_none());
             assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
         }
-    }
-
-    #[test]
-    fn web_remix_needs_ctt_and_session() {
-        let session = crate::music_session::test_fixtures::session();
-        assert!(web_remix_session(Some("t"), Some(&session)).is_some());
-
-        let (logs, _guard) = capture_logs();
-        assert!(web_remix_session(Some("t"), None).is_none());
-        assert!(web_remix_session(None, Some(&session)).is_none());
-        let logs = logs.text();
-        assert!(logs.contains("no YouTube Music session"), "{logs}");
-        assert!(logs.contains("no ctt from the cast"), "{logs}");
     }
 }

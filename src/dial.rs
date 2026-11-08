@@ -33,7 +33,8 @@ pub struct DialState {
     pub local_ip: std::net::Ipv4Addr,
     /// Port this DIAL server listens on.
     pub port: u16,
-    /// Credential transfer token from the casting session (YTM Premium auth).
+    /// Credential transfer token from the casting session: the receiver's
+    /// only authentication, sent per video with WEB_REMIX /player.
     pub ctt: std::sync::RwLock<Option<String>>,
     /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,

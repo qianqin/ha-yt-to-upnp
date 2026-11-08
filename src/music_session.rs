@@ -1,18 +1,26 @@
 //! Anonymous YouTube Music session extraction.
 //!
-//! Fetches the public music.youtube.com page (no cookies, no account) and
-//! extracts the live INNERTUBE_CONTEXT from ytcfg, plus the player version
-//! (base.js) for the signature timestamp and nsig decoding.
+//! Fetches the public music.youtube.com page (no account, no stored
+//! credentials) and extracts the live INNERTUBE_CONTEXT from ytcfg, plus the
+//! player version (base.js) for the signature timestamp and nsig decoding.
+//! The page fetch carries one fixed consent cookie (see `CONSENT_COOKIE`);
+//! nothing else in this module, or anywhere else, sends a cookie.
 //!
 //! yt-dlp does the same thing: it downloads the page first to get the full
 //! client context (22+ fields) and visitor data. Without this, WEB_REMIX
 //! /player returns UNPLAYABLE even with the cast's credential transfer
 //! token (ctt), which is the only authentication this receiver uses.
 
-const MUSIC_ORIGIN: &str = "https://music.youtube.com";
+const MUSIC_PAGE_URL: &str = "https://music.youtube.com/";
 const PLAYER_ORIGIN: &str = "https://www.youtube.com";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+/// Cookie-consent answer ("reject all"), not authentication. Without it EU
+/// visitors are redirected to consent.youtube.com instead of the page. A
+/// compile-time constant, sent only on the anonymous page GET; never read
+/// from config, env or Set-Cookie.
+const CONSENT_COOKIE: &str = "SOCS=CAI";
 
 /// Live session data extracted from the public music.youtube.com page.
 pub struct YtMusicSession {
@@ -58,8 +66,40 @@ impl YtMusicSession {
 
 /// Fetch the public music.youtube.com page anonymously and extract the session.
 /// Returns `None` (after logging why) when the page cannot be used.
-pub async fn fetch_music_session(http: &reqwest::Client) -> Option<YtMusicSession> {
-    fetch_session_from(http, &format!("{MUSIC_ORIGIN}/"), PLAYER_ORIGIN).await
+pub async fn fetch_music_session() -> Option<YtMusicSession> {
+    fetch_session_from(crate::sabr::stream::credential_client(), MUSIC_PAGE_URL, PLAYER_ORIGIN).await
+}
+
+/// Both parts WEB_REMIX /player needs: the cast's ctt (the only
+/// authentication) and the anonymous page session (without its full context
+/// WEB_REMIX returns UNPLAYABLE).
+#[derive(Clone, Copy)]
+pub struct WebRemixAuth<'a> {
+    pub ctt: &'a str,
+    pub session: &'a YtMusicSession,
+}
+
+/// The single rule for using WEB_REMIX: only with a ctt AND a session.
+/// `Err` carries the reason for the caller's log.
+pub fn web_remix_auth<'a>(
+    ctt: Option<&'a str>,
+    session: Option<&'a YtMusicSession>,
+) -> Result<WebRemixAuth<'a>, &'static str> {
+    match (ctt, session) {
+        (Some(ctt), Some(session)) => Ok(WebRemixAuth { ctt, session }),
+        (None, _) => Err("no ctt from the cast"),
+        (Some(_), None) => Err("no YouTube Music session"),
+    }
+}
+
+/// True if a redirect chain for `requested` ended on the same scheme, host
+/// and port (for the real page: https://music.youtube.com, a trusted Google
+/// host), i.e. not on a consent or sign-in page.
+fn landed_on_requested_origin(final_url: &reqwest::Url, requested: &str) -> bool {
+    let Ok(requested) = reqwest::Url::parse(requested) else { return false };
+    final_url.scheme() == requested.scheme()
+        && final_url.host_str() == requested.host_str()
+        && final_url.port_or_known_default() == requested.port_or_known_default()
 }
 
 async fn fetch_session_from(
@@ -70,6 +110,7 @@ async fn fetch_session_from(
     let resp = match http
         .get(page_url)
         .header("User-Agent", BROWSER_UA)
+        .header("Cookie", CONSENT_COOKIE)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -85,9 +126,12 @@ async fn fetch_session_from(
         tracing::warn!("[ytcfg] music.youtube.com returned HTTP {}", resp.status());
         return None;
     }
-    // Without a consent cookie, EU visitors are redirected to a consent page.
-    if resp.url().host_str().is_some_and(|h| h.starts_with("consent.")) {
-        tracing::warn!("[ytcfg] music.youtube.com redirected to the consent page");
+    // E.g. a consent page, should YouTube stop accepting CONSENT_COOKIE.
+    if !landed_on_requested_origin(resp.url(), page_url) {
+        tracing::warn!(
+            "[ytcfg] music.youtube.com redirected to {}",
+            crate::sabr::stream::host_for_log(resp.url().as_str())
+        );
         return None;
     }
 
@@ -295,6 +339,7 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::MUSIC_PAGE;
     use super::*;
+    use crate::storage::test_util::LogBuf;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -349,11 +394,46 @@ mod tests {
         assert!(session.player_context(None)["user"].get("credentialTransferTokens").is_none());
     }
 
-    /// Serves `page` at `/` and `base_js` under `/s/player/`, recording every
-    /// raw request (lowercased).
-    async fn spawn_fake_youtube(page: String, base_js: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    /// Captures all tracing output on this thread while the guard lives.
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let logs = LogBuf::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn response(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The default fake YouTube: `page` at `/`, `base_js` under `/s/player/`.
+    fn pages(
+        page_status: &'static str,
+        page: String,
+        base_js: &'static str,
+    ) -> impl Fn(&str) -> String + Send + Sync + 'static {
+        move |req| {
+            if req.starts_with("get /s/player/") {
+                response("200 OK", "", base_js)
+            } else {
+                response(page_status, "", &page)
+            }
+        }
+    }
+
+    /// Answers each request with `handler(raw request, lowercased)` and records
+    /// the raw requests. Returns the listener's address.
+    async fn spawn_fake_youtube(
+        handler: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let record = seen.clone();
         tokio::spawn(async move {
@@ -369,21 +449,25 @@ mod tests {
                     req.extend_from_slice(&buf[..n]);
                 }
                 let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
-                let body = if req.starts_with("get /s/player/") { base_js } else { page.as_str() };
+                let resp = handler(&req);
                 record.lock().unwrap().push(req);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
-        (origin, seen)
+        (addr, seen)
+    }
+
+    fn cookie_lines(req: &str) -> Vec<&str> {
+        req.lines().filter(|l| l.starts_with("cookie:")).collect()
     }
 
     #[tokio::test]
-    async fn anonymous_fetch_sends_no_credentials_and_keeps_player_js() {
-        let (origin, seen) = spawn_fake_youtube(MUSIC_PAGE.to_owned(), "var p;signatureTimestamp:20391;").await;
+    async fn anonymous_fetch_sends_only_the_consent_cookie_on_the_page() {
+        let (addr, seen) = spawn_fake_youtube(pages(
+            "200 OK", MUSIC_PAGE.to_owned(), "var p;signatureTimestamp:20391;",
+        ))
+        .await;
+        let origin = format!("http://{addr}");
         let http = reqwest::Client::new();
 
         let session = fetch_session_from(&http, &format!("{origin}/"), &origin).await.unwrap();
@@ -394,28 +478,123 @@ mod tests {
         assert_eq!(session.visitor_data(), Some("CgtWSVNJVE9SLUlE"));
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen[1].starts_with("get /s/player/4e67f8a0/player_ias.vflset/en_us/base.js"), "{seen:?}");
+        let (page_req, js_req) = (&seen[0], &seen[1]);
+        assert!(page_req.starts_with("get / "), "{page_req}");
+        assert_eq!(cookie_lines(page_req), ["cookie: socs=cai"], "{page_req}");
+        assert!(js_req.starts_with("get /s/player/4e67f8a0/player_ias.vflset/en_us/base.js"), "{js_req}");
+        assert!(cookie_lines(js_req).is_empty(), "{js_req}");
         for req in &seen {
-            assert!(!req.contains("\r\ncookie:"), "{req}");
             assert!(!req.contains("\r\nauthorization:"), "{req}");
         }
+    }
+
+    #[test]
+    fn consent_cookie_is_a_bare_socs_value() {
+        let value = CONSENT_COOKIE.strip_prefix("SOCS=CA").expect(CONSENT_COOKIE);
+        assert!(value.len() <= 64, "{CONSENT_COOKIE}");
+        assert!(
+            value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "{CONSENT_COOKIE}"
+        );
+    }
+
+    #[test]
+    fn real_page_url_is_a_trusted_google_host() {
+        assert!(crate::sabr::stream::is_trusted_google_host(MUSIC_PAGE_URL));
+        let page = reqwest::Url::parse(MUSIC_PAGE_URL).unwrap();
+        assert!(landed_on_requested_origin(&page, MUSIC_PAGE_URL));
+        for other in [
+            "https://consent.youtube.com/m?continue=x",
+            "http://music.youtube.com/",
+            "https://music.youtube.com:8443/",
+        ] {
+            let url = reqwest::Url::parse(other).unwrap();
+            assert!(!landed_on_requested_origin(&url, MUSIC_PAGE_URL), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_redirect_yields_no_session() {
+        let (addr, seen) = spawn_fake_youtube(move |req: &str| {
+            if req.contains("\r\nhost: consent.youtube.com") {
+                response("200 OK", "", "<html>Before you continue to YouTube</html>")
+            } else {
+                let port = req.split("\r\nhost: music.youtube.com:").nth(1).unwrap_or("").lines().next().unwrap_or("");
+                response(
+                    "302 Found",
+                    &format!("location: http://consent.youtube.com:{port}/m?continue=x\r\n"),
+                    "",
+                )
+            }
+        })
+        .await;
+        let http = reqwest::Client::builder()
+            .resolve("music.youtube.com", addr)
+            .resolve("consent.youtube.com", addr)
+            .build()
+            .unwrap();
+        let (logs, _guard) = capture_logs();
+
+        let page_url = format!("http://music.youtube.com:{}/", addr.port());
+        let session = fetch_session_from(&http, &page_url, &format!("http://{addr}")).await;
+
+        assert!(session.is_none());
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "redirect not followed or base.js fetched: {seen:?}");
+        let logs = logs.contents();
+        assert!(logs.contains("music.youtube.com redirected to consent.youtube.com"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn http_error_page_yields_no_session() {
+        let (addr, seen) = spawn_fake_youtube(pages("503 Service Unavailable", MUSIC_PAGE.to_owned(), "")).await;
+        let origin = format!("http://{addr}");
+        let (logs, _guard) = capture_logs();
+
+        let session = fetch_session_from(&reqwest::Client::new(), &format!("{origin}/"), &origin).await;
+
+        assert!(session.is_none());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let logs = logs.contents();
+        assert!(logs.contains("music.youtube.com returned HTTP 503"), "{logs}");
     }
 
     #[tokio::test]
     async fn sts_falls_back_to_player_js_when_page_has_none() {
         let page = MUSIC_PAGE.replace("\"STS\":20391,", "");
-        let (origin, _seen) = spawn_fake_youtube(page, "signatureTimestamp:20400").await;
-        let http = reqwest::Client::new();
+        let (addr, _seen) = spawn_fake_youtube(pages("200 OK", page, "signatureTimestamp:20400")).await;
+        let origin = format!("http://{addr}");
 
-        let session = fetch_session_from(&http, &format!("{origin}/"), &origin).await.unwrap();
+        let session = fetch_session_from(&reqwest::Client::new(), &format!("{origin}/"), &origin)
+            .await
+            .unwrap();
 
         assert_eq!(session.signature_timestamp, Some(20400));
     }
 
     #[tokio::test]
     async fn unusable_page_yields_no_session() {
-        let (origin, _seen) = spawn_fake_youtube("<html>deprecated</html>".to_owned(), "").await;
-        let http = reqwest::Client::new();
-        assert!(fetch_session_from(&http, &format!("{origin}/"), &origin).await.is_none());
+        let (addr, _seen) = spawn_fake_youtube(pages("200 OK", "<html>deprecated</html>".to_owned(), "")).await;
+        let origin = format!("http://{addr}");
+        let (logs, _guard) = capture_logs();
+
+        let session = fetch_session_from(&reqwest::Client::new(), &format!("{origin}/"), &origin).await;
+
+        assert!(session.is_none());
+        let logs = logs.contents();
+        assert!(logs.contains("could not extract INNERTUBE_CONTEXT"), "{logs}");
+    }
+
+    #[test]
+    fn web_remix_needs_ctt_and_session() {
+        let session = super::test_fixtures::session();
+
+        let auth = web_remix_auth(Some("t"), Some(&session)).unwrap();
+        assert_eq!(auth.ctt, "t");
+        assert!(std::ptr::eq(auth.session, &session));
+
+        assert_eq!(web_remix_auth(Some("t"), None).err(), Some("no YouTube Music session"));
+        assert_eq!(web_remix_auth(None, Some(&session)).err(), Some("no ctt from the cast"));
+        assert_eq!(web_remix_auth(None, None).err(), Some("no ctt from the cast"));
     }
 }

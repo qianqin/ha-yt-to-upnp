@@ -102,8 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(6600);
     let dial_port: u16 = 8008;
 
-    // 4. Create reqwest client (shared across innertube + lounge). No cookie
-    // store: the only authentication is the ctt each cast hands over.
+    // 4. Create the reqwest client for the Lounge sessions. No cookie store:
+    // the only authentication is the ctt each cast hands over. InnerTube, SABR
+    // and the session fetch use sabr::stream::credential_client(), which only
+    // follows redirects on Google hosts.
     let http_client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0")
         .build()?;
@@ -111,13 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 5. Fetch the anonymous YouTube Music session (INNERTUBE_CONTEXT from page)
     // This is critical: without the full 22+ field context from ytcfg,
     // WEB_REMIX /player returns UNPLAYABLE even with a ctt. yt-dlp does the same thing.
-    let yt_session = match music_session::fetch_music_session(&http_client).await {
+    let yt_session = match music_session::fetch_music_session().await {
         Some(session) => {
             tracing::info!("[init] YouTube Music session extracted (anonymous)");
             Some(Arc::new(session))
         }
         None => {
-            tracing::warn!("[init] No YouTube Music session — casts use the IOS client instead of WEB_REMIX + ctt");
+            tracing::warn!("[init] No YouTube Music session — WEB_REMIX + ctt is off until restart; every cast uses the IOS client");
             None
         }
     };
@@ -335,7 +337,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //
     // - Idle events detect song endings instantly for auto-advance
     // - Position timer reports playback progress to YouTube every 3s (seekbar sync)
-    let innertube_client = http_client;
     let innertube_session = yt_session;
     let mut playlist = PlaylistState::default();
     let mut play_started = false;
@@ -385,7 +386,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Err(e) = handle_command(
                     cmd,
                     &mut mpd_client,
-                    &innertube_client,
                     &state_tx,
                     &mut playlist,
                     &mut play_started,
@@ -443,7 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 playlist.last_state = messages::PlayerState::Idle;
 
                                 match play_video(
-                                    &mut mpd_client, &innertube_client, &state_tx,
+                                    &mut mpd_client, &state_tx,
                                     &mut playlist, &video_id, 0.0,
                                     innertube_session.as_ref().map(|s| s.as_ref()),
                                 ).await {
@@ -530,7 +530,6 @@ type CmdResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 async fn handle_command(
     cmd: lounge::PlayerCommand,
     mpd: &mut mpd::MpdClient,
-    http: &reqwest::Client,
     state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
     playlist: &mut PlaylistState,
     play_started: &mut bool,
@@ -574,7 +573,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_session).await?;
+            *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
         }
 
         PlayerCommand::SetVideo {
@@ -598,7 +597,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_session).await?;
+            *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
         }
 
         PlayerCommand::Play => {
@@ -734,7 +733,7 @@ async fn handle_command(
                 tracing::info!("[player] Previous -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_session).await?;
+                *play_started = play_video(mpd, state_tx, playlist, &video_id, 0.0, yt_session).await?;
             } else {
                 tracing::info!("[player] Previous: already at start");
             }
@@ -747,7 +746,7 @@ async fn handle_command(
                 tracing::info!("[player] Next -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_session).await?;
+                *play_started = play_video(mpd, state_tx, playlist, &video_id, 0.0, yt_session).await?;
             } else {
                 tracing::info!("[player] Next: end of playlist");
                 *play_started = false;
@@ -796,7 +795,6 @@ fn current_video_id(playlist: &PlaylistState) -> String {
 /// and returns `false`. Does NOT auto-skip — let YouTube handle navigation.
 async fn play_video(
     mpd: &mut mpd::MpdClient,
-    http: &reqwest::Client,
     state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
     playlist: &mut PlaylistState,
     video_id: &str,
@@ -807,7 +805,6 @@ async fn play_video(
     send_state(mpd, state_tx, playlist, messages::PlayerState::Loading).await?;
 
     let stream = innertube::resolve_stream(
-        http,
         video_id,
         playlist.ctt.as_deref(),
         if playlist.list_id.is_empty() {
@@ -1039,10 +1036,15 @@ mod no_stored_credentials_tests {
         b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
     }
 
+    /// The one permitted Cookie header: the fixed consent cookie on the
+    /// anonymous music.youtube.com page fetch (music_session.rs only).
+    const CONSENT_COOKIE_SITE: &str = concat!("\"Coo", "kie\", CONSENT_", "COOKIE)");
+
     /// Stored-credential violations in `src`: bearer or basic auth, any
     /// Authorization or Cookie request header (string literal in any case, or
     /// the reqwest constant), a cookie jar, and the old cookie-file plumbing.
-    fn credential_violations(src: &str) -> Vec<String> {
+    /// With `consent_cookie_allowed`, exactly `CONSENT_COOKIE_SITE` is exempt.
+    fn credential_violations(src: &str, consent_cookie_allowed: bool) -> Vec<String> {
         let mut found = Vec::new();
         // ASCII lowercasing keeps byte offsets aligned with `src`.
         let lower = src.to_ascii_lowercase();
@@ -1070,7 +1072,10 @@ mod no_stored_credentials_tests {
                 let literal = i > 0
                     && bytes[i - 1] == b'"'
                     && matches!(bytes.get(end), Some(b'"') | Some(b':'));
-                if constant || literal {
+                let consent_site = consent_cookie_allowed
+                    && literal
+                    && src[i - 1..].starts_with(CONSENT_COOKIE_SITE);
+                if (constant || literal) && !consent_site {
                     found.push(format!("{name} header: {}", line_at(src, i)));
                 }
             }
@@ -1085,10 +1090,14 @@ mod no_stored_credentials_tests {
         &src[start..end]
     }
 
+    fn is_music_session(path: &std::path::Path) -> bool {
+        path.file_name().unwrap() == "music_session.rs"
+    }
+
     #[test]
     fn no_stored_credential_headers_or_cookie_files() {
         for (path, src) in production_sources() {
-            let found = credential_violations(&src);
+            let found = credential_violations(&src, is_music_session(&path));
             assert!(found.is_empty(), "{}: {found:?}", path.display());
         }
     }
@@ -1111,9 +1120,52 @@ mod no_stored_credentials_tests {
             "cookies::load_cookie_file(p)",
             "let sapisid = x; // \u{2014}",
             "reqwest::Client::builder().cookie_store(true)",
+            // Only the exact consent site is exempt, even where it is allowed.
+            "req.header(\"Cookie\", other)",
+            "req.header(\"cookie\", CONSENT_COOKIE)",
+            "req.header(header::COOKIE, CONSENT_COOKIE)",
+            "req.header(\"Cookie\", CONSENT_COOKIES)",
         ] {
-            assert!(!credential_violations(bad).is_empty(), "not caught: {bad}");
+            assert!(!credential_violations(bad, true).is_empty(), "not caught: {bad}");
         }
+    }
+
+    #[test]
+    fn consent_cookie_is_exempt_only_where_allowed() {
+        let site = concat!(".header(\"Coo", "kie\", CONSENT_", "COOKIE)");
+        assert!(credential_violations(site, true).is_empty());
+        assert!(!credential_violations(site, false).is_empty());
+    }
+
+    #[test]
+    fn consent_cookie_is_a_constant_used_once_in_music_session() {
+        let name = concat!("CONSENT_", "COOKIE");
+        for (path, src) in production_sources() {
+            let uses: usize = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.matches(name).count())
+                .sum();
+            if is_music_session(&path) {
+                // In code: the `const` definition plus the single page-fetch header.
+                assert_eq!(uses, 2, "{}", path.display());
+                assert!(src.contains(&format!("const {name}: &str = \"SOCS=")), "{}", path.display());
+                assert_eq!(src.matches(CONSENT_COOKIE_SITE).count(), 1);
+            } else {
+                assert_eq!(uses, 0, "{} uses {name}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn reqwest_cookie_feature_is_off() {
+        let manifest = include_str!("../Cargo.toml");
+        let reqwest = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("reqwest"))
+            .expect("reqwest dependency");
+        assert!(reqwest.contains("features"), "{reqwest}");
+        assert!(!reqwest.contains(concat!("\"coo", "kies\"")), "{reqwest}");
     }
 
     #[test]
@@ -1127,7 +1179,7 @@ mod no_stored_credentials_tests {
             "/// Never sends an Authorization header \u{2014} only the ctt.",
             "// no Cookie header \u{2014}\u{2014}\nlet x = \"\u{2014}\";",
         ] {
-            let found = credential_violations(good);
+            let found = credential_violations(good, false);
             assert!(found.is_empty(), "{good}: {found:?}");
         }
     }
