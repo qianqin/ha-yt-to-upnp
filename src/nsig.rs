@@ -95,13 +95,14 @@ const MEM_LIMITS: MemLimits = MemLimits {
 /// Whether a decode error comes from an exhausted QuickJS limit rather than
 /// from the player. Such a failure says nothing about the cached player.
 fn is_resource_error(err: &str) -> bool {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 5] = [
         "out of memory",
         // Thrown when even the error object could not be allocated.
         "null exception (OOM?)",
         // rquickjs::Error::Allocation
         "Allocation failed",
         "Maximum call stack size exceeded",
+        "interrupted",
     ];
     MARKERS.iter().any(|m| err.contains(m))
 }
@@ -194,15 +195,6 @@ fn run_solver(
         }
         ok => ok,
     }
-}
-
-/// Runs a cached player with 3/4 of the cached-path limit, so a live test
-/// fails while some headroom is left. Not 1/2: the measured peak sits right
-/// at half the limit and varies by a few MiB between runs.
-#[cfg(test)]
-#[allow(dead_code)] // used by the binary crate's network test
-pub(crate) fn decode_cached_below_limit(preprocessed: &str, n_value: &str) -> Result<String, String> {
-    decode_nsig_inner("", n_value, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|r| r.decoded)
 }
 
 /// A cached player the solver rejects is never retried: drop it from memory
@@ -499,6 +491,7 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
             ("QuickJS context failed: Allocation failed while creating object", true),
             ("set _preprocessed failed: Allocation failed while creating object", true),
             ("jsc(preprocessed) failed: Maximum call stack size exceeded", true),
+            ("jsc(preprocessed) failed: interrupted", true),
             ("jsc error: _result is not defined", false),
             ("jsc error: invalid assignment left-hand side", false),
             ("jsc n error: no solutions", false),
@@ -547,5 +540,31 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         let player = "(function(g){ var a = 1; }).call(this, {});";
         let err = decode_nsig_cached_at(player, "abc", "test-no-solution", None).unwrap_err();
         assert!(err.starts_with("jsc n error: no solutions"), "{err}");
+    }
+
+    /// Network: the current player's cached path must fit in half the cached
+    /// limit, keeping the 2x headroom `MEM_LIMITS` promises.
+    /// Run with `cargo test --locked -- --ignored current_player`.
+    #[tokio::test]
+    #[ignore]
+    async fn current_player_cached_path_has_memory_headroom() {
+        const ORIGIN: &str = "https://www.youtube.com";
+        let http = reqwest::Client::builder().user_agent("Mozilla/5.0").build().unwrap();
+        let get = |url: String| async { http.get(url).send().await?.error_for_status()?.text().await };
+        let page = get(format!("{ORIGIN}/")).await.expect("youtube.com page");
+        let hash: String = page.split("/s/player/").nth(1).expect("player hash")
+            .chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        let js = get(format!("{ORIGIN}/s/player/{hash}/player_ias.vflset/en_US/base.js")).await.expect("base.js");
+        let n = "ZdZIqFPQK-Ty8wIdab";
+
+        tokio::task::spawn_blocking(move || {
+            let fresh = decode_nsig_inner(&js, n, None, MEM_LIMITS.fresh).unwrap();
+            let preprocessed = fresh.preprocessed.expect("preprocessed player");
+            let cached = decode_nsig_inner("", n, Some(&preprocessed), MEM_LIMITS.cached / 2)
+                .unwrap_or_else(|e| panic!("{} byte player at half the cached limit: {e}", preprocessed.len()));
+            assert_eq!(cached.decoded, fresh.decoded);
+        })
+        .await
+        .unwrap();
     }
 }

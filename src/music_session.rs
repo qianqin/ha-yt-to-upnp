@@ -615,29 +615,4 @@ mod tests {
         assert!(!fresh.is_empty() && fresh != n);
         assert_eq!(cached, fresh);
     }
-
-    /// Network: the current player's cached path fits in 3/4 of the nsig
-    /// cached-path memory limit. Run with `cargo test --locked -- --ignored current_player`.
-    #[tokio::test]
-    #[ignore]
-    async fn current_player_cached_path_has_memory_headroom() {
-        let session = fetch_music_session().await.expect("music.youtube.com session");
-        let hash = session.player_hash.expect("player hash");
-        let js = session.player_js.expect("base.js");
-        let tmp = crate::storage::test_util::TempDir::new("nsig-headroom");
-        let path = tmp.path().join("nsig-preprocessed-headroom.js");
-        let n = "ZdZIqFPQK-Ty8wIdab";
-
-        tokio::task::spawn_blocking(move || {
-            // Own key: a hit in the shared in-memory cache would skip the disk write.
-            let key = format!("{hash}-headroom");
-            let fresh = crate::nsig::decode_nsig_cached_at(&js, n, &key, Some(path.clone())).unwrap();
-            let preprocessed = std::fs::read_to_string(&path).expect("preprocessed player cached");
-            let cached = crate::nsig::decode_cached_below_limit(&preprocessed, n)
-                .unwrap_or_else(|e| panic!("player {hash} ({} bytes) below the cached limit: {e}", preprocessed.len()));
-            assert_eq!(cached, fresh);
-        })
-        .await
-        .unwrap();
-    }
 }
