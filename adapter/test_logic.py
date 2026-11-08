@@ -292,9 +292,15 @@ class RecordingController:
         self.restart_fail = None
         self.plays = True
         self.plays_fail = None
+        self.renderer = "STOPPED"  # what renderer_state reports while not playing
+        self.clock = None
+        self.takeover_s = 0
 
-    def ensure_playing(self, wake=True):
-        self.calls.append("ensure_playing" if wake else "ensure_playing(no wake)")
+    def ensure_playing(self, wake=True, force=False):
+        self.calls.append("ensure_playing(force)" if force else
+                          "ensure_playing" if wake else "ensure_playing(no wake)")
+        if self.takeover_s:
+            self.clock.now += self.takeover_s  # a slow speaker
         if self.fail:
             raise self.fail
         return self.decision
@@ -305,11 +311,11 @@ class RecordingController:
             raise self.fail
         return self.verdict
 
-    def plays_stream(self):
-        self.calls.append("plays_stream")
+    def renderer_state(self):
+        self.calls.append("renderer_state")
         if self.plays_fail:
             raise self.plays_fail
-        return self.plays
+        return "PLAYING" if self.plays else self.renderer
 
     def restart_renderer(self):
         self.calls.append("restart_renderer")
@@ -581,6 +587,7 @@ class StartGateTest(unittest.TestCase):
         self.clock = FakeClock()
         self.ctl = RecordingController()
         self.ctl.plays = False
+        self.ctl.clock = self.clock
         self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
                              start_gate_seconds=self.GATE_S)
 
@@ -604,6 +611,26 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
         self.f.on_mpd_state("play", song)  # run() reports our pause 0
 
+    def gate_runs_out(self, level="INFO"):
+        """Tick the held gate until it asks for pause 0; the logs of the way there."""
+        with self.assertLogs("raumfeld_adapter", level) as logs:
+            for _ in range(200):
+                self.advance(ra.GATE_POLL_S)
+                if self.f._requests:
+                    break
+        return logs.output
+
+    def timed_out(self):
+        """A cast whose renderer never plays during the gate: MPD is resumed anyway."""
+        self.held()
+        self.gate_runs_out()
+        self.released()
+        self.ctl.calls.clear()
+
+    def poll(self, times=1):
+        for _ in range(times):
+            self.advance(5)
+
     def test_takeover_holds_mpd_until_the_renderer_plays(self):
         self.held()
         self.assertEqual(self.f.seconds_until_deadline(), ra.GATE_POLL_S)
@@ -615,7 +642,7 @@ class StartGateTest(unittest.TestCase):
             self.advance(ra.GATE_POLL_S)
         self.released()
         self.f.on_mpd_state("play", "1")  # the idle event of our own pause 0
-        self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["plays_stream"] * 3)
+        self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["renderer_state"] * 3)
         self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual from now on
         self.assertEqual(self.requests(), [])
 
@@ -626,7 +653,7 @@ class StartGateTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.advance(ra.GATE_POLL_S)
         self.released()
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "plays_stream"])  # no wake again
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "renderer_state"])  # no wake again
         self.assertFalse(self.f.yielded)
         self.assertEqual(self.requests(), [])  # no release
 
@@ -667,6 +694,142 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
         self.assertEqual(self.requests(), [])
 
+    # -- re-takeover during the gate (a speaker still shutting down drops the first one)
+
+    def test_renderer_not_playing_is_taken_over_again_after_the_retake_delay(self):
+        self.held()
+        for _ in range(int(ra.GATE_RETAKE_S / ra.GATE_POLL_S) - 1):
+            self.advance(ra.GATE_POLL_S)
+        self.assertNotIn("ensure_playing(force)", self.ctl.calls)
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.ctl.calls[-1], "ensure_playing(force)")
+        self.assertTrue(any("'STOPPED'" in m and "again" in m for m in logs.output), logs.output)
+        self.assertEqual(self.requests(), [])  # MPD is still held
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.released()
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), 1)
+
+    def test_retakeovers_are_bounded_and_the_gate_still_ends(self):
+        self.ctl.renderer = "TRANSITIONING"  # maybe dropped the stream: retaken as well
+        self.held()
+        self.gate_runs_out()
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), ra.GATE_MAX_RETAKES)
+        # A takeover that returns at once needs no more time than the configured gate.
+        self.assertEqual(self.clock.now, 1000 + self.GATE_S)
+        self.released()
+
+    def test_a_slow_takeover_extends_the_gate_so_each_retake_has_time_to_play(self):
+        self.ctl.takeover_s = 3  # as in the live incident
+        self.held()  # the first takeover returns at +3 s
+        logs = self.gate_runs_out()
+        # Retakes at +8 s (back at +11 s) and +16 s (back at +19 s); the second one gets
+        # GATE_RETAKE_S to play, past the configured 15 s.
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), 2)
+        self.assertEqual(self.clock.now, 1019 + ra.GATE_RETAKE_S)
+        self.assertTrue(any("after 24.0 s" in m for m in logs), logs)
+        self.released()
+
+    def test_the_gate_never_holds_mpd_beyond_the_configured_maximum(self):
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
+                             start_gate_seconds=ra.START_GATE_MAX_S)
+        self.ctl.takeover_s = 27
+        self.held()  # back at +27 s; the retake at +32 s is back at +59 s
+        self.gate_runs_out()
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), 1)
+        self.assertEqual(self.clock.now, 1000 + ra.START_GATE_MAX_S)
+        self.released()
+
+    def test_failed_retakes_are_logged_and_keep_the_gate_bounded(self):
+        self.held()
+        self.ctl.fail = OSError("speaker unreachable")
+        logs = self.gate_runs_out("WARNING")
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), ra.GATE_MAX_RETAKES)
+        self.assertTrue(any("speaker unreachable" in m for m in logs), logs)
+        self.assertEqual(self.clock.now, 1000 + self.GATE_S)
+        self.released()
+
+    def test_gate_timeout_names_the_last_renderer_state_and_the_room_verdict(self):
+        self.ctl.verdict = ra.STANDBY
+        self.held()
+        logs = self.gate_runs_out("WARNING")
+        timeout = [m for m in logs if "anyway" in m]
+        self.assertEqual(len(timeout), 1, logs)
+        self.assertIn("renderer 'STOPPED'", timeout[0])
+        self.assertIn("room 'standby'", timeout[0])
+        self.assertTrue(timeout[0].startswith("WARNING:"), timeout)
+
+    def test_gate_timeout_names_a_failing_renderer_check(self):
+        self.held()
+        self.ctl.plays_fail = OSError("connection refused")
+        self.ctl.verdict = ra.NO_ZONE
+        logs = self.gate_runs_out("WARNING")
+        timeout = [m for m in logs if "anyway" in m][0]
+        self.assertIn("connection refused", timeout)
+        self.assertIn("room 'no_zone'", timeout)
+
+    # -- after a gate timeout: a renderer that never started gets one more takeover
+
+    def test_renderer_never_started_after_a_gate_timeout_gets_one_more_takeover(self):
+        self.timed_out()
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        self.assertEqual(self.requests(), [])
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.poll()
+        self.assertEqual(self.ctl.calls[-1], "ensure_playing(force)")
+        self.assertTrue(any("never" in m for m in logs.output), logs.output)
+        self.assertEqual(self.requests(), [])  # not taken away
+        self.assertFalse(self.f.yielded)
+        # Still stopped after that one: now the speaker counts as taken away.
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        self.assertEqual(self.requests(), [])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(self.ctl.calls.count("ensure_playing(force)"), 1)
+
+    def test_renderer_that_ran_after_a_gate_timeout_and_then_stops_is_taken_away(self):
+        for verdict in (ra.OURS, ra.TRANSITIONING):
+            with self.subTest(verdict=verdict):
+                self.setUp()
+                self.timed_out()
+                self.ctl.verdict = verdict
+                self.poll()
+                self.ctl.verdict = ra.NOT_PLAYING  # the user stopped it
+                self.poll(ra.STOPPED_GRACE_POLLS)
+                with self.assertLogs("raumfeld_adapter", "INFO"):
+                    self.poll()
+                self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+                self.assertNotIn("ensure_playing(force)", self.ctl.calls)
+
+    def test_mpd_change_after_a_gate_timeout_drops_the_extra_takeover(self):
+        self.timed_out()
+        self.f.on_mpd_state("stop", None)
+        self.f.on_mpd_state("play", "2")  # the phone skipped: restarts our stream, no wake
+        self.assertEqual(self.ctl.calls, ["ensure_playing(no wake)"])
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertNotIn("ensure_playing(force)", self.ctl.calls)
+
+    def test_gate_ended_by_a_playing_renderer_gets_no_extra_takeover(self):
+        self.held()
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.released()
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.poll(ra.STOPPED_GRACE_POLLS)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertNotIn("ensure_playing(force)", self.ctl.calls)
+
     def test_stop_from_the_phone_during_the_gate_is_not_overridden(self):
         self.held()
         with self.assertLogs("raumfeld_adapter", "INFO"):
@@ -675,7 +838,8 @@ class StartGateTest(unittest.TestCase):
         for _ in range(4):
             self.advance(5)
         self.assertEqual(self.requests(), [])  # never pause 0
-        self.assertNotIn("plays_stream", self.ctl.calls)
+        self.assertNotIn("renderer_state", self.ctl.calls)
+        self.assertNotIn("ensure_playing(force)", self.ctl.calls)  # no retake either
 
     def test_song_change_during_the_gate_is_not_overridden_and_does_not_wake(self):
         for state in ("play", "pause"):
@@ -689,6 +853,7 @@ class StartGateTest(unittest.TestCase):
                     self.advance(5)
                 self.assertEqual(self.requests(), [])
                 self.assertEqual(self.ctl.calls.count("ensure_playing"), 1)
+                self.assertNotIn("ensure_playing(force)", self.ctl.calls)
 
     def test_song_change_while_our_resume_is_on_its_way_ends_the_gate(self):
         self.held()

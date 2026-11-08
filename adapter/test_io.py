@@ -528,7 +528,7 @@ class RunLoopTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             run_bounded(self, follower, mpd, sleep=lambda s: None,
                         should_stop=lambda: "pause 0" in mpd.commands)
-        self.assertEqual(ctl.calls[:3], ["mpd sent: ['pause 1']", "ensure_playing", "plays_stream"])
+        self.assertEqual(ctl.calls[:3], ["mpd sent: ['pause 1']", "ensure_playing", "renderer_state"])
         self.assertEqual([c for c in mpd.commands if c.startswith("pause")], ["pause 1", "pause 0"])
 
     def test_failed_takeover_in_the_gate_resumes_mpd_right_away(self):

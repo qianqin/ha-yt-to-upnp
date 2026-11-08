@@ -103,7 +103,8 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
         # Holding the song any longer only leaves the phone standing still. (The gate goes
         # back to idle every GATE_POLL_S, so its length never counts toward MPD's
         # connection_timeout.)
-        start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0, 60)
+        start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0,
+                                      START_GATE_MAX_S)
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -432,16 +433,20 @@ class Controller:
         self._api = None
         self._control = None  # (zone UDN, AVTransport control URL)
 
-    def ensure_playing(self, wake=True):
+    def ensure_playing(self, wake=True, force=False):
         """Make the room play our stream; returns the decision taken. With wake=False
         (a track change on a zone we already own) a room someone took away is left
-        alone and its verdict returned instead."""
+        alone and its verdict returned instead. With force=True (a takeover done again
+        because the renderer did not start) a renderer TRANSITIONING on our stream is
+        set up afresh too; one that PLAYS our stream is still left alone."""
         room = self._inspect()
         if not wake:
             verdict = judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
             if verdict in TAKEN_AWAY:
                 return verdict
         decision = decide_play(room.status, self.config.stream_url)
+        if force and room.status and room.status.transport_state != "PLAYING":
+            decision = TAKE_OVER
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
             return decision
@@ -472,14 +477,15 @@ class Controller:
             raise
         return judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
 
-    def plays_stream(self):
-        """Whether the zone renderer of the last takeover or look reports PLAYING on our
-        stream. Only the renderer is asked: right after a wake the room's power state in
-        getZones may still lag behind."""
+    def renderer_state(self):
+        """Transport state of the zone renderer of the last takeover or look, e.g. PLAYING
+        or STOPPED, with " (another source)" appended unless it holds our stream. Only the
+        renderer is asked: right after a wake the room's power state in getZones may still
+        lag behind."""
         control = self._known_control()
         state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
         uri = soap_call(control, "GetMediaInfo", []).get("CurrentURI", "")
-        return state == "PLAYING" and uri == self.config.stream_url
+        return state if uri == self.config.stream_url else state + " (another source)"
 
     def restart_renderer(self):
         """Stop, then Play, on the zone renderer of the last look at the room. A renderer that
@@ -704,6 +710,15 @@ STUCK_MAX_RESTARTS = 3
 # GATE_POLL_S seconds meanwhile.
 START_GATE_S = 15
 GATE_POLL_S = 0.5
+# Highest START_GATE_SECONDS, and the hard bound on the hold however the gate is extended:
+# holding the song any longer only leaves the phone standing still.
+START_GATE_MAX_S = 60
+# A speaker still finishing its standby when woken accepts the takeover and drops it. So a
+# renderer not PLAYING our stream GATE_RETAKE_S after the takeover returned gets the whole
+# takeover again, at most GATE_MAX_RETAKES times per gate. Each one may push the gate's end
+# to GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has time to play.
+GATE_RETAKE_S = 5
+GATE_MAX_RETAKES = 2
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
@@ -727,6 +742,9 @@ class _Gate:
         self.song = song
         self.started = started
         self.deadline = started + seconds
+        self.taken = None  # when the last takeover returned
+        self.retakes = 0
+        self.seen = "not asked yet"  # the last renderer state, for the timeout warning
 
 _REASONS = {
     STANDBY: "room went to standby",
@@ -764,6 +782,10 @@ class Follower:
         self.clock = clock
         self._gate = None  # the start gate in progress, if any
         self._stuck = None  # (first seen, restarts so far, next restart due) of a stuck episode
+        # A start gate timed out and every look at the room since found our renderer
+        # stopped: it never started, so nobody can have stopped it; one more takeover is
+        # due before the speaker counts as taken away.
+        self._unstarted = False
         self.pending = None
         self.deadline = None
         self.mpd_state = None
@@ -794,6 +816,8 @@ class Follower:
                 return
             # The gate was ended by someone else; our own pause was no user pause.
             previous = "play"
+        # A user change: a renderer stopped from now on is no longer ours to restart.
+        self._unstarted = False
         if self.yielded:
             if previous != "pause" or state == "pause":
                 if state == "play":
@@ -872,6 +896,7 @@ class Follower:
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
+            self._gate.taken = self.clock()
             self._schedule(_GATE)
         else:
             # The takeover failed and is retried later; never keep the phone waiting for it.
@@ -886,18 +911,45 @@ class Follower:
             self._requests = [r for r in self._requests if r != PAUSE_PLAYER]
             self.wake = True
             return self._attempt(_PLAY)
+        gate = self._gate
         try:
-            plays = self.controller.plays_stream()
+            gate.seen = self.controller.renderer_state()
         except _ERRORS as e:
             log.debug("start gate: renderer check failed: %r", e)
-            plays = False
-        if plays:
-            log.info("speaker plays; resuming MPD after %.1f s", self.clock() - self._gate.started)
+            gate.seen = "check failed: %r" % e
+        now = self.clock()
+        if gate.seen == "PLAYING":
+            log.info("speaker plays; resuming MPD after %.1f s", now - gate.started)
             self._end_gate()
-        elif self.clock() >= self._gate.deadline:
-            self._release_gate("the renderer does not play after %g s" % self.start_gate_seconds)
+        elif (gate.retakes < GATE_MAX_RETAKES and now >= gate.taken + GATE_RETAKE_S
+              and now < gate.started + START_GATE_MAX_S):
+            self._gate_retake(now)
+        elif now >= gate.deadline:
+            self._gate_timeout(now)
         else:
             self._schedule(_GATE)
+
+    def _gate_retake(self, now):
+        gate = self._gate
+        gate.retakes += 1
+        log.info("start gate: renderer %r %.1f s after the takeover; taking over again "
+                 "(%d of %d)", gate.seen, now - gate.taken, gate.retakes, GATE_MAX_RETAKES)
+        # A failed one counts too: _attempt logs it, and the next is due GATE_RETAKE_S later.
+        gate.taken = now
+        self.controller.ensure_playing(wake=True, force=True)
+        gate.taken = self.clock()
+        gate.deadline = min(max(gate.deadline, gate.taken + GATE_RETAKE_S),
+                            gate.started + START_GATE_MAX_S)
+        self._schedule(_GATE)
+
+    def _gate_timeout(self, now):
+        try:
+            room = self.controller.check()
+        except _ERRORS as e:
+            room = "check failed: %r" % e
+        self._unstarted = True
+        self._release_gate("the renderer does not play after %.1f s (renderer %r, room %r)"
+                           % (now - self._gate.started, self._gate.seen, room))
 
     def _release_gate(self, reason):
         log.warning("start gate: %s; resuming MPD anyway", reason)
@@ -942,8 +994,12 @@ class Follower:
             return
         if verdict in TAKEN_AWAY:
             return self._yield(verdict)
+        if verdict != NOT_PLAYING:
+            self._unstarted = False
         if verdict == NOT_PLAYING and self.mpd_state == "play":
             self.stopped_polls += 1
+            if self.stopped_polls > STOPPED_GRACE_POLLS and self._unstarted:
+                return self._take_over_unstarted()
             if self.stopped_polls > STOPPED_GRACE_POLLS:
                 return self._yield(verdict)
         elif verdict in (OURS, TRANSITIONING):
@@ -978,6 +1034,15 @@ class Follower:
                     now - since, restarts, STUCK_MAX_RESTARTS)
         self.stopped_polls = 0
         self.controller.restart_renderer()
+
+    def _take_over_unstarted(self):
+        log.info("zone renderer has never played since the start gate gave up; taking over "
+                 "once more before the speaker counts as taken away")
+        self._unstarted = False
+        self.stopped_polls = 0
+        # Schedule first: a failing takeover is logged by _attempt and must not stop polling.
+        self._schedule(_POLL)
+        self.controller.ensure_playing(wake=True, force=True)
 
     def _yield(self, verdict):
         log.info("speaker taken away (%s): ending the cast; not taking the room back "

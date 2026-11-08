@@ -432,6 +432,105 @@ class StartGateScenarioTest(unittest.TestCase):
         self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
 
 
+class GateRetakeoverScenarioTest(unittest.TestCase):
+    """Scenario (live incident): the user switches the speaker off and casts again a few
+    seconds later. The speaker, still finishing its standby, accepts the takeover and
+    drops it. The adapter takes over again instead of letting the cast fail."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.clock = FakeClock()
+        self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
+                                    poll_seconds=POLL_S, clock=self.clock, start_gate_seconds=15)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def requests(self):
+        return self.follower.take_mpd_requests()
+
+    def cast(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")  # run() reports our pause 1
+
+    def gate_until_released(self):
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            for _ in range(100):
+                self.clock.now += ra.GATE_POLL_S
+                self.follower.tick()
+                requests = self.requests()
+                if requests:
+                    break
+        self.assertEqual(requests, [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")  # run() reports our pause 0
+        return logs.output
+
+    def poll(self):
+        self.clock.now += POLL_S
+        self.follower.tick()
+
+    def plays(self):
+        return [a for a in self.rf.soap_actions() if a == "Play"]
+
+    def test_dropped_takeover_is_done_again_within_the_gate(self):
+        self.rf.drop_plays = 1
+        self.cast()
+        self.assertEqual(self.rf.transport_state, "STOPPED")  # accepted, dropped
+        logs = self.gate_until_released()
+        self.assertTrue(any("taking over again" in m for m in logs), logs)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertEqual(len(self.plays()), 2)
+        for _ in range(4):
+            self.poll()
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(self.follower.yielded)
+
+    def test_room_back_in_standby_during_the_gate_is_woken_again(self):
+        self.rf.drop_plays = 1
+        self.cast()
+        with self.rf.lock:
+            self.rf.power = "MANUAL_STANDBY"  # its shutdown completes after our wake
+        self.gate_until_released()
+        self.assertEqual(self.rf.api_calls().count("leaveStandby"), 2)
+        self.assertEqual(self.rf.power, "ACTIVE")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_renderer_never_started_after_the_gate_gets_one_more_takeover(self):
+        self.rf.drop_plays = 1 + ra.GATE_MAX_RETAKES
+        self.cast()
+        logs = self.gate_until_released()
+        timeout = [m for m in logs if "anyway" in m]
+        self.assertTrue(timeout and timeout[0].startswith("WARNING:"), logs)
+        self.assertIn("renderer 'STOPPED'", timeout[0])
+        self.assertIn("room 'not_playing'", timeout[0])
+        for _ in range(ra.STOPPED_GRACE_POLLS):
+            self.poll()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        for _ in range(4):
+            self.poll()
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(self.follower.yielded)
+
+    def test_user_stopping_the_speaker_after_it_played_is_still_respected(self):
+        self.cast()
+        self.gate_until_released()
+        self.poll()
+        with self.rf.lock:
+            self.rf.transport_state = "STOPPED"  # e.g. stopped from the Raumfeld app
+        for _ in range(ra.STOPPED_GRACE_POLLS):
+            self.poll()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(len(self.plays()), 1)
+
+
 class SpeakerYieldRunTest(unittest.TestCase):
     """End to end through run(): the adapter talks to MPD over its own connection."""
 
