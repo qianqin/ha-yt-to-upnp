@@ -642,7 +642,7 @@ const PREMIUM_ONLY_AUDIO_ITAGS: [i32; 2] = [774, 141];
 /// Choose the best audio format, preferring Opus/WebM at the highest bitrate.
 fn choose_audio_format(formats: &[AdaptiveFormat]) -> Result<&AdaptiveFormat, SabrError> {
     let audio = formats.iter().filter(|f| f.mime_type.starts_with("audio/"));
-    if audio.clone().count() == 0 {
+    if !formats.iter().any(|f| f.mime_type.starts_with("audio/")) {
         return Err("no suitable audio format found".into());
     }
     audio
@@ -658,7 +658,12 @@ fn choose_audio_format(formats: &[AdaptiveFormat]) -> Result<&AdaptiveFormat, Sa
             codec_priority + f.bitrate
         })
         .ok_or_else(|| {
-            "only YouTube Music Premium audio formats (itag 774/141) listed; SABR does not serve them to this session".into()
+            let itags: Vec<String> = PREMIUM_ONLY_AUDIO_ITAGS.iter().map(|i| i.to_string()).collect();
+            format!(
+                "only YouTube Music Premium audio formats (itag {}) listed; SABR does not serve them to this session",
+                itags.join("/"),
+            )
+            .into()
         })
 }
 
@@ -1960,30 +1965,30 @@ mod tests {
     async fn reload_request_stops_the_loop_after_one_request() {
         let mut state = test_state(GOOD_URL);
         let (tx, _rx) = mpsc::channel(1);
-        // Stands in for SABR round trips whose UMP body is a single
-        // RELOAD_PLAYER_RESPONSE part (the network path refuses non-Google hosts).
-        struct ReloadEveryTime {
+        // The first round trip's UMP body is a single RELOAD_PLAYER_RESPONSE
+        // part (the network path refuses non-Google hosts). Any further round
+        // trip ends the stream cleanly, so a loop that ignores or retries the
+        // reload finishes with Ok instead of hanging.
+        struct ReloadOnce {
             requests: u32,
         }
-        impl SabrCycle for ReloadEveryTime {
+        impl SabrCycle for ReloadOnce {
             fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
                 self.requests += 1;
+                let first = self.requests == 1;
                 Box::pin(async move {
+                    if !first {
+                        return Ok(false);
+                    }
                     let reload = part(ump::RELOAD_PLAYER_RESPONSE, vec![0x0a, 0x02, 0x0a, 0x00]);
                     handle_part(state, &reload)?;
                     Ok(true)
                 })
             }
         }
-        let mut cycle = ReloadEveryTime { requests: 0 };
+        let mut cycle = ReloadOnce { requests: 0 };
 
-        // Retrying would sleep 0.5 s + 1 s + 2 s + ... and hit this timeout.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(400),
-            drive_loop(&mut state, &tx, &mut cycle),
-        )
-        .await
-        .expect("a reload request must end the loop without retry backoff");
+        let result = drive_loop(&mut state, &tx, &mut cycle).await;
 
         let err = result.unwrap_err();
         assert!(err.is::<ReloadRequested>(), "{err}");
