@@ -813,7 +813,19 @@ class StartGateTest(unittest.TestCase):
         self.assertTrue(all(t < cap for t in self.ctl.takeover_times), self.ctl.takeover_times)
         self.released()
 
-    def test_renderer_playing_another_source_is_never_taken_over_again(self):
+    def assert_yielded_from_the_gate(self):
+        """MPD stays paused (no pause 0, no second pause 1), the cast is released, the gate
+        is over and the room left alone."""
+        self.assertEqual(self.requests(), [ra.RELEASE_CAST])
+        self.assertTrue(self.f.yielded)
+        self.assertFalse(self.f.owned)
+        self.assertIsNone(self.f._gate)
+        self.assertIsNone(self.f.seconds_until_deadline())
+        self.f.on_mpd_state("stop", None)  # the receiver ends the session
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(self.f.yielded)
+
+    def test_renderer_playing_a_new_source_is_respected_straight_from_the_gate(self):
         for seen in ("PLAYING (another source)", "TRANSITIONING (another source)"):
             with self.subTest(seen=seen):
                 self.setUp()
@@ -822,18 +834,32 @@ class StartGateTest(unittest.TestCase):
                 logs = self.gate_runs_out("INFO")
                 self.assertNotIn("ensure_playing(retake)", self.ctl.calls)
                 self.assertNotIn("restart_renderer", self.ctl.calls)
-                # Not taken for our stream playing: the gate ends with a warning naming it.
+                # Not taken for our stream playing.
                 self.assertFalse(any("speaker plays" in m for m in logs), logs)
-                ended = [m for m in logs if "anyway" in m]
-                self.assertTrue(ended and ended[0].startswith("WARNING:"), logs)
-                self.assertIn(seen, ended[0])
+                self.assertTrue(any(seen in m for m in logs), logs)
                 self.assertEqual(self.clock.now, 1000 + ra.GATE_POLL_S)  # at the first look
-                self.released()
-                self.ctl.verdict = ra.OTHER_SOURCE
-                with self.assertLogs("raumfeld_adapter", "INFO"):
-                    self.poll()  # the next look at the room yields as usual
-                self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
-                self.assertTrue(self.f.yielded)
+                self.assert_yielded_from_the_gate()
+
+    def test_renderer_back_on_the_source_before_the_takeover_is_taken_over_again(self):
+        # e.g. line-in the cast took over: the speaker dropped the takeover.
+        self.ctl.renderer = "PLAYING (source before the takeover)"
+        self.held()
+        logs = self.gate_runs_out()
+        self.assertEqual(self.ctl.calls.count("ensure_playing(retake)"), ra.GATE_MAX_RETAKES)
+        self.assertTrue(any("taking over again" in m for m in logs), logs)
+        self.released()  # the gate ran out as usual: pause 0
+        self.assertFalse(self.f.yielded)
+
+    def test_retakes_of_the_source_before_the_takeover_keep_the_60_s_bound(self):
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
+                             start_gate_seconds=ra.START_GATE_MAX_S)
+        self.ctl.renderer = "PLAYING (source before the takeover)"
+        self.ctl.takeover_s = 41
+        self.held()
+        self.gate_runs_out()
+        self.assertNotIn("ensure_playing(retake)", self.ctl.calls)
+        self.assertEqual(self.clock.now, 1000 + ra.START_GATE_MAX_S)
+        self.released()
 
     def test_renderer_stopped_on_another_uri_is_taken_over_again(self):
         self.ctl.renderer = "STOPPED (another source)"  # our URI never got loaded
@@ -842,19 +868,14 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.ctl.calls.count("ensure_playing(retake)"), ra.GATE_MAX_RETAKES)
         self.released()
 
-    def test_a_retake_finding_another_source_ends_the_gate_and_the_poll_yields(self):
+    def test_a_retake_finding_a_new_source_yields_straight_from_the_gate(self):
         self.ctl.retake_decision = ra.OTHER_SOURCE
         self.held()
         logs = self.gate_runs_out("INFO")
         self.assertEqual(self.ctl.calls.count("ensure_playing(retake)"), 1)
         self.assertEqual(self.clock.now, 1000 + ra.GATE_RETAKE_S)  # right after the retake
-        self.assertTrue(any("another source" in m and "anyway" in m for m in logs), logs)
-        self.released()
-        self.ctl.verdict = ra.OTHER_SOURCE
-        with self.assertLogs("raumfeld_adapter", "INFO"):
-            self.poll()
-        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
-        self.assertNotIn("ensure_playing", self.ctl.calls[-1])
+        self.assertTrue(any("another source" in m for m in logs), logs)
+        self.assert_yielded_from_the_gate()
 
     def test_renderer_transitioning_on_our_stream_is_restarted_not_taken_over_again(self):
         self.ctl.renderer = "TRANSITIONING"  # connecting and buffering -- or hanging

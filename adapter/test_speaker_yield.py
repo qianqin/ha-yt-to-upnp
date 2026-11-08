@@ -14,6 +14,7 @@ from fakes import (LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN, Fak
 from test_logic import FakeClock
 
 POLL_S = 5
+RADIO_URI = "http://radio.invalid/live.mp3"
 
 
 def make_controller(rf, discover):
@@ -528,18 +529,60 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
         self.assertEqual(self.requests(), [])
         self.assertFalse(self.follower.yielded)
 
-    def test_another_source_started_during_the_gate_is_not_overridden(self):
-        self.rf.drop_plays = 1
-        self.cast()
-        with self.rf.lock:  # someone switches the room to line-in meanwhile
-            self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
-        logs = self.gate_until_released()
+    def gate_until_requests(self):
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            for _ in range(100):
+                self.clock.now += ra.GATE_POLL_S
+                self.follower.tick()
+                requests = self.requests()
+                if requests:
+                    return requests, logs.output
+        self.fail("the gate never asked MPD for anything")
+
+    def assert_respected(self, uri):
+        """The gate yields to the source: MPD stays paused, the cast is released."""
+        requests, logs = self.gate_until_requests()
+        self.assertEqual(requests, [ra.RELEASE_CAST])  # no pause 0
         self.assertFalse(any("again" in m for m in logs), logs)
         self.assertEqual(self.rf.soap_actions().count("SetAVTransportURI"), 1)
-        with self.assertLogs("raumfeld_adapter", "INFO"):
+        self.assertEqual(self.rf.current_uri, uri)
+        self.assertTrue(self.follower.yielded)
+        for _ in range(4):
             self.poll()
-        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.rf.current_uri, uri)
+
+    def test_line_in_started_during_the_gate_after_standby_is_respected(self):
+        self.rf.drop_plays = 1
+        self.cast()  # from standby: nothing played before
+        with self.rf.lock:  # someone switches the room to line-in meanwhile
+            self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.assert_respected(LINE_IN_URI)
+
+    def test_dropped_takeover_of_line_in_is_taken_over_again(self):
+        # A karaoke machine on line-in; the cast takes over, the speaker drops it.
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.rf.drop_takeovers = 1
+        self.cast()
         self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        logs = self.gate_until_released()
+        self.assertTrue(any("taking over again" in m for m in logs), logs)
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        for _ in range(4):
+            self.poll()
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(self.follower.yielded)
+
+    def test_radio_started_after_a_dropped_takeover_of_line_in_is_respected(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.rf.drop_takeovers = 1
+        self.cast()
+        with self.rf.lock:  # someone starts a radio station instead
+            self.rf.current_uri = RADIO_URI
+        self.assert_respected(RADIO_URI)
 
     def test_renderer_hanging_in_transitioning_is_restarted_within_the_gate(self):
         self.rf.stuck = True  # Play leaves it TRANSITIONING; Stop, Play brings it back

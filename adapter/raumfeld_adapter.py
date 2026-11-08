@@ -162,7 +162,10 @@ NO_ZONE = "no_zone"
 OTHER_SOURCE = "other_source"
 # Someone else has the speaker now; the adapter must give it up.
 TAKEN_AWAY = (STANDBY, NO_ZONE, OTHER_SOURCE)
-# Appended by Controller.renderer_state when the renderer holds a URI other than ours.
+# Appended by Controller.renderer_state when the renderer holds a URI other than ours: the
+# one it held when the last takeover set up our stream (that takeover was dropped), or
+# another one (someone chose it since).
+PREVIOUS_SOURCE = " (source before the takeover)"
 ANOTHER_SOURCE = " (another source)"
 # The longest transport state taken from a device into a log line.
 MAX_STATE_LEN = 64
@@ -448,19 +451,25 @@ class Controller:
         self.zone_poll_s = zone_poll_s
         self._api = None
         self._control = None  # (zone UDN, AVTransport control URL)
+        # The URI the zone held when the last takeover (not a re-takeover) set up our
+        # stream; "" if none (standby, no zone, nothing loaded).
+        self._source_before = ""
 
     def ensure_playing(self, wake=True, retake=False):
         """Make the room play our stream; returns the decision taken. With wake=False
         (a track change on a zone we already own) a room someone took away is left
         alone and its verdict returned instead. With retake=True (a takeover done again
-        because the renderer did not start) a zone that plays another source is left
-        alone and OTHER_SOURCE returned: someone started it after our takeover."""
+        because the renderer did not start) a zone that plays another source than the one
+        before the last takeover is left alone and OTHER_SOURCE returned: someone chose
+        it since. The source before the takeover is taken over again: the speaker
+        dropped our takeover."""
         room = self._inspect()
         if not wake:
             verdict = judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
             if verdict in TAKEN_AWAY:
                 return verdict
-        if retake and plays_another_source(room.status, self.config.stream_url):
+        if (retake and plays_another_source(room.status, self.config.stream_url)
+                and not self._was_source_before(room.status.current_uri)):
             log.info("zone %r plays another source now; not taking it over again", room.zone)
             return OTHER_SOURCE
         decision = decide_play(room.status, self.config.stream_url)
@@ -470,6 +479,9 @@ class Controller:
         if room.status and room.status.current_uri not in ("", self.config.stream_url):
             source = "line-in" if is_line_in(room.status.current_uri) else "another source"
             log.info("zone %r was on %s; the cast takes over", room.zone, source)
+        if not retake:
+            uri = room.status.current_uri if room.status else ""
+            self._source_before = "" if uri == self.config.stream_url else uri
 
         room_param = quote(self.config.room_udn, safe="")
         zone, control = room.zone, room.control
@@ -500,14 +512,20 @@ class Controller:
 
     def renderer_state(self):
         """Transport state of the zone renderer of the last takeover or look, e.g. PLAYING
-        or STOPPED, with " (another source)" appended unless it holds our stream. Only the
+        or STOPPED, with PREVIOUS_SOURCE or ANOTHER_SOURCE appended unless it holds our
+        stream. Only the
         renderer is asked: right after a wake the room's power state in getZones may still
         lag behind."""
         control = self._known_control()
         state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
         state = state[:MAX_STATE_LEN]  # device-supplied, and it ends up in log lines
         uri = soap_call(control, "GetMediaInfo", []).get("CurrentURI", "")
-        return state if uri == self.config.stream_url else state + ANOTHER_SOURCE
+        if uri == self.config.stream_url:
+            return state
+        return state + (PREVIOUS_SOURCE if self._was_source_before(uri) else ANOTHER_SOURCE)
+
+    def _was_source_before(self, uri):
+        return bool(self._source_before) and uri == self._source_before
 
     def restart_renderer(self):
         """Stop, then Play, on the zone renderer of the last look at the room. A renderer that
@@ -760,7 +778,8 @@ START_GATE_MAX_S = 60
 # at most GATE_MAX_RETAKES times per gate, and only while it can still have its wake wait
 # and GATE_RETAKE_S before START_GATE_MAX_S. Every takeover in the gate may push its end to
 # GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has time to play.
-# Never taken over again: a renderer playing another source (someone started it) or one
+# Never taken over again: a renderer playing another source than the one before the
+# takeover (someone chose it: the gate yields to it, MPD stays paused) or one
 # TRANSITIONING on our stream (buffering); the latter is restarted (Stop, Play) once if
 # still TRANSITIONING 2 * GATE_RETAKE_S after the takeover, and after the gate the stuck
 # handling (STUCK_S) takes over.
@@ -808,7 +827,9 @@ class _Gate:
                 and now >= self.taken + 2 * GATE_RETAKE_S and self.fits(now, 0))
 
 
-# What renderer_state reports for a renderer someone else made play: never taken over again.
+# What renderer_state reports for a renderer someone made play another source than the one
+# before the takeover: never taken over again. (Back on the source before the takeover, the
+# speaker dropped our takeover: that is taken over again.)
 _OTHER_SOURCE_PLAYING = tuple(state + ANOTHER_SOURCE for state in _PLAYING_STATES)
 
 _REASONS = {
@@ -836,8 +857,8 @@ class Follower:
     renderer that does not start gets the takeover again (GATE_RETAKE_S,
     GATE_MAX_RETAKES), one TRANSITIONING on our stream a restart instead; if it still has
     never played when the gate ends, it gets one more takeover before it counts as taken
-    away. A renderer someone made play another source ends the gate at once and the next
-    look at the room yields to it. Its own pause and resume are not followed; a failed
+    away. A renderer someone made play another source than the one before the takeover
+    ends the gate at once: it yields (MPD stays paused, the cast is released). Its own pause and resume are not followed; a failed
     takeover lets MPD play at once and is retried after PLAY_RETRY_S without the gate. A
     stop or another song during the gate is the user's doing and is never undone; a pause
     from the phone during the gate can't be told apart from ours (MPD is already paused,
@@ -991,8 +1012,8 @@ class Follower:
             log.info("speaker plays; resuming MPD after %.1f s", now - gate.started)
             self._end_gate()
         elif gate.seen in _OTHER_SOURCE_PLAYING:
-            # Someone started another source during the gate: it is not ours to override.
-            self._release_gate("the zone plays another source (renderer %r)" % gate.seen)
+            # Someone chose another source during the gate: it is not ours to override.
+            self._gate_yield("the zone plays another source (renderer %r)" % gate.seen)
         elif gate.restart_due(now):
             self._gate_restart(now)
         elif gate.retake_due(now):
@@ -1014,7 +1035,7 @@ class Follower:
             # _attempt that runs this gate check, which logs it.
             self._give_time()
         if decision in TAKEN_AWAY:
-            self._release_gate("someone started another source during the takeover")
+            self._gate_yield("someone started another source during the takeover")
 
     def _gate_restart(self, now):
         gate = self._gate
@@ -1043,6 +1064,15 @@ class Follower:
         self._unstarted = True
         self._release_gate("the renderer does not play after %.1f s (renderer %r, room %r)"
                            % (now - self._gate.started, self._gate.seen, room))
+
+    def _gate_yield(self, reason):
+        """End the gate by yielding: MPD stays paused (ours, so no new pause), the cast is
+        released and the room left alone."""
+        log.info("start gate: %s; not taking it over", reason)
+        self._gate = None
+        self._requests = [r for r in self._requests if r not in (PAUSE_PLAYER, RESUME_PLAYER)]
+        self.pending = None
+        self._yield(OTHER_SOURCE)
 
     def _release_gate(self, reason):
         log.warning("start gate: %s; resuming MPD anyway", reason)

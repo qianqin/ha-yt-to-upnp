@@ -10,6 +10,8 @@ from fakes import (LINE_IN_URI, NEW_ZONE_UDN, ROOM_UDN, SPEAKER_UDN, STREAM_URL,
                    FakeDiscovery, FakeRaumfeld)
 from test_speaker_yield import assert_speaker_left_alone
 
+OTHER_URI = "http://radio.invalid/live.mp3"
+
 
 class ControllerTest(unittest.TestCase):
     metadata = True
@@ -259,6 +261,43 @@ class ControllerTest(unittest.TestCase):
                 self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
                 self.assertEqual(self.rf.api_calls(), ["getZones"])  # not woken either
                 self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+
+    def test_renderer_state_tells_the_source_before_the_takeover_from_a_new_one(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.ctl.ensure_playing()  # the cast takes line-in over
+        for uri, seen in ((LINE_IN_URI, "PLAYING (source before the takeover)"),
+                          (OTHER_URI, "PLAYING (another source)"),
+                          (STREAM_URL, "PLAYING")):
+            with self.subTest(uri=uri):
+                self.rf.current_uri, self.rf.transport_state = uri, "PLAYING"
+                self.assertEqual(self.ctl.renderer_state(), seen)
+
+    def test_after_a_takeover_from_standby_any_source_is_a_new_one(self):
+        self.ctl.ensure_playing()  # nothing was playing before
+        for uri in (LINE_IN_URI, ""):
+            with self.subTest(uri=uri):
+                self.rf.current_uri, self.rf.transport_state = uri, "PLAYING"
+                self.assertEqual(self.ctl.renderer_state(), "PLAYING (another source)")
+
+    def test_retake_takes_over_the_source_before_the_takeover_again(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.rf.drop_takeovers = 1
+        self.ctl.ensure_playing()
+        self.assertEqual(self.rf.current_uri, LINE_IN_URI)  # dropped
+        self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_retake_leaves_a_source_other_than_the_one_before_the_takeover_alone(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.rf.drop_takeovers = 1
+        self.ctl.ensure_playing()
+        self.rf.current_uri = OTHER_URI  # someone starts a radio station
+        self.assertEqual(self.ctl.ensure_playing(retake=True), ra.OTHER_SOURCE)
+        self.assertEqual(self.rf.current_uri, OTHER_URI)
 
     def test_retake_sets_up_a_renderer_that_lost_our_stream(self):
         self.rf.power = "ACTIVE"

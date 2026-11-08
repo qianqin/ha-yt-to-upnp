@@ -42,6 +42,10 @@ class FakeRaumfeld:
         self.stuck = False
         # A speaker still finishing its standby: this many Plays are accepted and dropped.
         self.drop_plays = 0
+        # A speaker that drops this many whole takeovers: SetAVTransportURI and the Play after
+        # it are accepted and ignored, so it stays on whatever it played.
+        self.drop_takeovers = 0
+        self._dropping = False
         # A slow wake: getZones keeps reporting standby this many times after leaveStandby;
         # the room may come back in another zone.
         self.wake_after_polls = 0
@@ -168,11 +172,17 @@ class FakeRaumfeld:
         elif action == "GetMediaInfo":
             out = "<CurrentURI>%s</CurrentURI>" % _xml_escape(self.current_uri)
         elif action == "SetAVTransportURI":
-            self.current_uri = args["CurrentURI"]
-            self.transport_state = "STOPPED"
+            if self.drop_takeovers > 0:
+                self.drop_takeovers -= 1
+                self._dropping = True
+            else:
+                self.current_uri = args["CurrentURI"]
+                self.transport_state = "STOPPED"
         elif action == "Play":
             assert args.get("Speed") == "1"
-            if self.drop_plays > 0:
+            if self._dropping:
+                self._dropping = False
+            elif self.drop_plays > 0:
                 self.drop_plays -= 1
             else:
                 self.transport_state = "TRANSITIONING" if self.stuck else "PLAYING"

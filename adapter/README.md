@@ -23,8 +23,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`, and sends
   `pause 0` as soon as it is. **Re-takeover:** if the renderer has not loaded or
   does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover returned
-  (`STOPPED`, `NO_MEDIA_PRESENT`, a URI not ours that does not play, the room
-  back in standby or out of its zone, or no answer), the adapter does the whole
+  (`STOPPED`, `NO_MEDIA_PRESENT`, a URI not ours that does not play, back on
+  the source it played before the takeover, e.g. the line-in the cast took over,
+  the room back in standby or out of its zone, or no answer), the adapter does the whole
   takeover again (wake, wait for the room, `SetAVTransportURI`, `Play`; same UDN
   discovery, no volume), at most twice per gate (`GATE_MAX_RETAKES`), and logs
   each one at INFO with the state that triggered it. A re-takeover only starts
@@ -33,9 +34,10 @@ Raumfeld room play the receiver's MPD stream automatically.
   is still `TRANSITIONING` 10 s after the takeover, it is restarted once
   (`Stop`, `Play`, as for a stuck renderer, below), and if it still is when the
   gate ends, the stuck-renderer handling carries on from there. Nor a renderer
-  that plays another source (someone started it during the gate, also if a
-  re-takeover finds it): the gate ends at once with a warning naming it, and the
-  next look at the room counts the speaker as taken away. Every takeover or
+  that plays a source other than the one before the takeover (someone chose it
+  during the gate, also if a re-takeover finds it; after a takeover from standby
+  any source is such a choice): the gate ends at once by yielding, MPD stays
+  paused (no `pause 0`) and the adapter sends the release message. Every takeover or
   restart in the gate gets those 5 s to start playing, so the gate may run past
   `START_GATE_SECONDS` (by default up to about 25 s with two re-takeovers on a
   speaker answering in 3 s; more on a slower one), but never past 60 s, the
