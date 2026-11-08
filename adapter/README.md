@@ -16,7 +16,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`, and sends
   `pause 0` as soon as it is. If that doesn't happen within `START_GATE_SECONDS`,
   or the takeover fails, it sends `pause 0` anyway and logs a warning: playback is
-  never blocked. The adapter's own pause is not followed to the speaker (no
+  never blocked. A failed takeover is retried after 30 seconds without holding MPD
+  again; MPD's report of the adapter's own `pause 0` (same state, same `songid`) is
+  no new start. The adapter's own pause is not followed to the speaker (no
   AVTransport `Pause`, no "taken away"). If MPD stops or switches to another song
   (MPD `songid`) during the gate, that was the user (or the receiver) and the
   adapter does not unpause. **Limit:** a pause from the phone during the gate
@@ -79,8 +81,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
   and accepts only `uuid:<letters, digits, dashes>` UDNs.
 - Network and device errors are logged, never fatal, and never count as "taken
-  away". If the MPD connection drops while `pause 1` or the release message is
-  being sent, whatever is left is sent again after the reconnect. A failed takeover is retried on the next MPD event or after 30 seconds
+  away". If the MPD connection drops while `pause 1`, `pause 0` or the release
+  message is being sent, whatever is left is sent again after the reconnect. A failed takeover is retried on the next MPD event or after 30 seconds
   while MPD keeps playing; a failed poll is retried at the next poll. Lost MPD
   connections are re-established with backoff.
 - Speaker requests run between MPD commands, outside MPD's `idle`. MPD hangs up on
@@ -88,7 +90,10 @@ Raumfeld room play the receiver's MPD stream automatically.
   by default), so a speaker that keeps answering slowly (each request up to its
   10 s deadline, plus SSDP) can cost the MPD connection. The adapter then
   reconnects and re-reads MPD's state; the warning says how long it had sent MPD
-  nothing, so such a drop can be told apart from MPD going away.
+  nothing, so such a drop can be told apart from MPD going away. It names
+  `connection_timeout` only when the adapter had been silent outside `idle`
+  (whether the drop shows as a closed connection, a reset or a broken pipe); a
+  drop while it waited in `idle`, e.g. an MPD restart, is reported as such.
 
 ## Ending the cast: MPD channel `ytcast`
 
@@ -110,8 +115,8 @@ the stream (the phone shows it paused).
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
-| `START_GATE_SECONDS` | `15` | Longest time (seconds) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off |
-| `STUCK_SECONDS` | `15` | How long (seconds, at least 1) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
+| `START_GATE_SECONDS` | `15` | Longest time (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. At most 60 s, so the gate stays under MPD's default `connection_timeout` |
+| `STUCK_SECONDS` | `15` | How long (seconds, 1-300) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
