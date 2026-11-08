@@ -42,6 +42,11 @@ class FakeRaumfeld:
         self.stuck = False
         # A speaker still finishing its standby: this many Plays are accepted and dropped.
         self.drop_plays = 0
+        # A slow wake: getZones keeps reporting standby this many times after leaveStandby;
+        # the room may come back in another zone.
+        self.wake_after_polls = 0
+        self.zone_after_wake = None
+        self._waking = None
         self.fail_paths = set()  # substrings of paths that answer 500
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.redirect_base = HOST_PREFIX  # where the API's 307 points
@@ -109,6 +114,11 @@ class FakeRaumfeld:
     def _api(self, name, query):
         room = query.get("roomUDN", [None])[0]
         if name == "getZones":
+            if self._waking is not None:
+                if self._waking <= 0:
+                    self._wake()
+                else:
+                    self._waking -= 1
             if self._pending_new_zone is not None:
                 if self.polls_until_new_zone <= 0:
                     self.zone_udn, self._pending_new_zone = self._pending_new_zone, None
@@ -117,7 +127,10 @@ class FakeRaumfeld:
             return self.zones_xml()
         assert room == ROOM_UDN, "unexpected roomUDN %r" % room
         if name == "leaveStandby":
-            self.power = "ACTIVE"
+            if self.wake_after_polls:
+                self._waking = self.wake_after_polls
+            else:
+                self._wake()
         elif name == "enterManualStandby":
             self.power = "MANUAL_STANDBY"
         elif name == "connectRoomToZone":
@@ -125,6 +138,11 @@ class FakeRaumfeld:
         else:
             raise AssertionError("unknown API " + name)
         return ""
+
+    def _wake(self):
+        self.power, self._waking = "ACTIVE", None
+        if self.zone_after_wake:
+            self.zone_udn = self.zone_after_wake
 
     def _soap(self, action, body):
         root = ET.fromstring(body)

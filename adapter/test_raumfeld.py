@@ -34,7 +34,8 @@ class ControllerTest(unittest.TestCase):
 
     def test_cast_starts_speaker_in_standby_reuses_existing_zone(self):
         self.ctl.ensure_playing()
-        self.assertEqual(self.rf.api_calls(), ["getZones", "leaveStandby"])
+        # The room is seen awake (ACTIVE, in its zone) before the renderer is set up.
+        self.assertEqual(self.rf.api_calls(), ["getZones", "leaveStandby", "getZones"])
         self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
         self.assertEqual(self.rf.current_uri, STREAM_URL)
         self.assertEqual(self.rf.transport_state, "PLAYING")
@@ -54,11 +55,45 @@ class ControllerTest(unittest.TestCase):
         self.ctl.ensure_playing()
         calls = self.rf.api_calls()
         self.assertEqual(calls.count("connectRoomToZone"), 1)
-        self.assertEqual(calls[:3], ["getZones", "leaveStandby", "connectRoomToZone"])
-        self.assertEqual(calls[3:], ["getZones"] * 4)
+        # A room without a zone is not waited for to show up in one: it is connected.
+        self.assertEqual(calls[:4], ["getZones", "leaveStandby", "getZones", "connectRoomToZone"])
+        self.assertEqual(calls[4:], ["getZones"] * 4)
         self.assertEqual(self.sleeps, [0.5] * 3)
         self.assertEqual(self.discover.searches[-1], NEW_ZONE_UDN)
         self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def test_wake_waits_until_the_room_reports_active_in_its_zone(self):
+        self.rf.wake_after_polls = 3
+        self.ctl.ensure_playing()
+        self.assertEqual(self.rf.api_calls(), ["getZones", "leaveStandby"] + ["getZones"] * 4)
+        self.assertEqual(self.sleeps, [ra.WAKE_POLL_S] * 3)
+        last_look = max(i for i, r in enumerate(self.rf.requests) if r[1].endswith("getZones"))
+        first_soap = min(i for i, r in enumerate(self.rf.requests) if r[2])
+        self.assertLess(last_look, first_soap)  # nothing sent to a room still asleep
+        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def test_wake_resolves_zone_and_renderer_afresh(self):
+        # Whatever was known before the wake may belong to a speaker still shutting down.
+        self.rf.wake_after_polls = 1
+        self.rf.zone_after_wake = NEW_ZONE_UDN
+        self.ctl.ensure_playing()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, NEW_ZONE_UDN])
+        self.assertNotIn("connectRoomToZone", self.rf.api_calls())
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_room_not_awake_in_time_is_taken_over_anyway_with_a_warning(self):
+        self.rf.wake_after_polls = 1000
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            self.ctl.ensure_playing()
+        self.assertTrue(any("anyway" in m for m in logs.output), logs.output)
+        self.assertEqual(len(self.sleeps), int(ra.WAKE_WAIT_S / ra.WAKE_POLL_S))
+        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def test_active_room_is_not_waited_for(self):
+        self.rf.power = "ACTIVE"
+        self.ctl.ensure_playing()
+        self.assertEqual(self.rf.api_calls(), ["getZones", "leaveStandby"])
+        self.assertEqual(self.sleeps, [])
 
     def test_zone_never_appears_raises_after_wait(self):
         self.rf.zone_udn = None

@@ -35,6 +35,11 @@ AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and redirects
 MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a few KiB
 MPD_MAX_LINE = 64 * 1024
+# After leaveStandby the room is asked every WAKE_POLL_S whether it is awake (ACTIVE, in
+# its zone), at most WAKE_WAIT_S; a speaker still finishing its standby accepts the
+# takeover and drops it.
+WAKE_WAIT_S = 10
+WAKE_POLL_S = 0.5
 UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
 STREAM_TITLE = "YouTube Music cast"
 # MPD client-to-client channel the receiver subscribes to; "release" ends its cast session.
@@ -430,6 +435,7 @@ class Controller:
         self.sleep = sleep
         self.zone_polls = int(zone_wait_s / zone_poll_s)
         self.zone_poll_s = zone_poll_s
+        self.wake_polls = int(WAKE_WAIT_S / WAKE_POLL_S)
         self._api = None
         self._control = None  # (zone UDN, AVTransport control URL)
 
@@ -455,10 +461,14 @@ class Controller:
             log.info("zone %r was on %s; the cast takes over", room.zone, source)
 
         room_param = quote(self.config.room_udn, safe="")
+        zone, control = room.zone, room.control
         if wake:
             http_get(room.api + "leaveStandby?roomUDN=" + room_param)
-        zone = room.zone or self._connect_zone(room.api, room_param)
-        control = room.control or self._zone_control(zone, reuse=False)
+            if room.power != "ACTIVE":
+                # What was seen before the wake may belong to a speaker still shutting down.
+                zone, control = self._wait_awake(room.api, had_zone=zone is not None), None
+        zone = zone or self._connect_zone(room.api, room_param)
+        control = control or self._zone_control(zone, reuse=False)
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
                     if self.config.stream_metadata else "")
         soap_call(control, "SetAVTransportURI",
@@ -522,6 +532,19 @@ class Controller:
         if not (reuse and self._control and self._control[0] == zone):
             self._control = (zone, self._control_url(zone))
         return self._control[1]
+
+    def _wait_awake(self, api, had_zone):
+        """The room's zone once getZones reports the room ACTIVE (and, if it had one before
+        the wake, in a zone); after WAKE_WAIT_S whatever it reports then."""
+        for look in range(self.wake_polls + 1):
+            if look:
+                self.sleep(WAKE_POLL_S)
+            zones = http_get(api + "getZones")
+            zone = zone_of_room(zones, self.config.room_udn)
+            if room_power_state(zones, self.config.room_udn) == "ACTIVE" and (zone or not had_zone):
+                return zone
+        log.warning("room not awake %g s after leaveStandby; taking over anyway", WAKE_WAIT_S)
+        return zone
 
     def _connect_zone(self, api, room):
         # connectRoomToZone makes a brand-new zone each time, so call it exactly once.

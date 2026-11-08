@@ -165,7 +165,7 @@ class SpeakerYieldTest(unittest.TestCase):
         self.released_while_playing()
         self.mpd("pause")  # our own pause 1 arrives as an MPD event
         self.mpd("play")  # an old receiver kept the session; the user presses play
-        self.assertEqual(self.rf.api_calls()[-1], "leaveStandby")
+        self.assertEqual(self.rf.api_calls()[-2:], ["leaveStandby", "getZones"])  # woken, seen awake
         self.assertEqual(self.rf.power, "ACTIVE")
         self.assertEqual(self.rf.current_uri, STREAM_URL)
         self.assertEqual(self.rf.transport_state, "PLAYING")
@@ -426,7 +426,7 @@ class StartGateScenarioTest(unittest.TestCase):
         self.follower.take_mpd_requests()
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.follower.on_mpd_state("pause", "1")
-        self.assertEqual(self.rf.api_calls()[-1], "leaveStandby")
+        self.assertEqual(self.rf.api_calls()[-2:], ["leaveStandby", "getZones"])  # woken, seen awake
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.gate_tick()  # the fake renderer plays right after Play
         self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
@@ -497,6 +497,15 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
         self.gate_until_released()
         self.assertEqual(self.rf.api_calls().count("leaveStandby"), 2)
         self.assertEqual(self.rf.power, "ACTIVE")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_slow_wake_is_waited_for_and_needs_no_second_takeover(self):
+        self.rf.wake_after_polls = 4  # still shutting down when woken
+        self.cast()
+        self.assertEqual(self.rf.power, "ACTIVE")
+        logs = self.gate_until_released()
+        self.assertFalse(any("again" in m for m in logs), logs)
+        self.assertEqual(len(self.plays()), 1)
         self.assertEqual(self.rf.transport_state, "PLAYING")
 
     def test_renderer_never_started_after_the_gate_gets_one_more_takeover(self):
