@@ -11,6 +11,7 @@ reuses the last discovery until a request fails or the zone changes), never by I
 this module sends no RenderingControl requests at all.
 """
 
+import errno
 import http.client
 import logging
 import math
@@ -99,8 +100,9 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
         poll_seconds = _seconds(env, "SPEAKER_POLL_SECONDS", "5", 1)
         # Beyond a few minutes of silence a restart comes too late to be of use.
         stuck_seconds = _seconds(env, "STUCK_SECONDS", str(STUCK_S), 1, 300)
-        # Capped at MPD's default connection_timeout: holding the song any longer only
-        # leaves the phone standing still.
+        # Holding the song any longer only leaves the phone standing still. (The gate goes
+        # back to idle every GATE_POLL_S, so its length never counts toward MPD's
+        # connection_timeout.)
         start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0, 60)
 
         try:
@@ -538,6 +540,11 @@ _MPD_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 MpdStatus = namedtuple("MpdStatus", "state songid")  # songid is None without a current song
 
+# A lost connection names MPD's connection_timeout (60 s by default) only after at least
+# this much silence outside idle; after less it is far more likely an MPD restart or the
+# network.
+TIMEOUT_HINT_S = 30
+
 
 class MpdClient:
     """Minimal MPD protocol client: `status`, `idle player`, `pause 1`/`pause 0` and
@@ -546,8 +553,6 @@ class MpdClient:
 
     def __init__(self, host, port, timeout=HTTP_TIMEOUT_S):
         self.timeout = timeout
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.buf = b""
         # MPD hangs up on a client that sends nothing for its connection_timeout (60 s by
         # default) while not in `idle`, e.g. while the adapter waits for a slow speaker.
@@ -555,7 +560,19 @@ class MpdClient:
         self._quiet_since = time.monotonic()
         self._silent_s = 0.0  # time outside idle before the last command
         self._idle_since = None  # set while in `idle`
+        # A reset right after the connect shows at whichever step comes first; each is
+        # reported as the lost connection it is.
         try:
+            self.sock = socket.create_connection((host, port), timeout=timeout)
+        except ConnectionResetError as e:
+            raise self._lost() from e
+        try:
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError as e:
+                if e.errno != errno.EINVAL:  # macOS: EINVAL on a socket already reset
+                    raise
+                raise self._lost() from e
             banner = self._readline()
             if not banner.startswith("OK MPD "):
                 raise MpdError("not an MPD server: %r" % banner[:40])
@@ -648,10 +665,11 @@ class MpdClient:
     def _lost(self):
         """The error for a connection MPD closed or reset (an empty read, a reset, a broken
         pipe: which one shows depends on timing), naming connection_timeout only when the
-        adapter had been silent outside idle for longer than it has been in idle since:
-        a drop late in a long idle is an MPD restart or the network, not the timeout."""
+        adapter had been silent outside idle for at least TIMEOUT_HINT_S and for longer than
+        it has been in idle since: a drop late in a long idle is an MPD restart or the
+        network, not the timeout."""
         idle_s = 0.0 if self._idle_since is None else time.monotonic() - self._idle_since
-        if self._silent_s > idle_s:
+        if self._silent_s >= TIMEOUT_HINT_S and self._silent_s > idle_s:
             return ConnectionError(
                 "MPD closed the connection after %.1f s without a command from the adapter "
                 "(MPD hangs up on clients silent outside idle for longer than its "
@@ -756,10 +774,18 @@ class Follower:
         self.stopped_polls = 0
         self._requests = []
 
+    def on_mpd_connected(self):
+        """A new MPD connection: its first state is followed even if it looks unchanged.
+        An MPD that restarted and restored play has a new stream (the renderer lost the old
+        one) and song ids that start again at 0, so the same songid is no proof of the same
+        playback."""
+        self.mpd_song = None
+
     def on_mpd_state(self, state, songid=None):
         if songid is not None and (state, songid) == (self.mpd_state, self.mpd_song):
-            # No change: the idle event of our own pause 0 after the status read that already
-            # reported it, or a seek. Taken as a new start it would hold MPD again at once.
+            # No change within this connection: the idle event of our own pause 0 after the
+            # status read that already reported it, or a seek. Taken as a new start it would
+            # hold MPD again at once.
             return
         previous, self.mpd_state, self.mpd_song = self.mpd_state, state, songid
         self.stopped_polls = 0
@@ -826,7 +852,9 @@ class Follower:
             self._gate_take_over()
             return True
         if gate.phase == _PAUSING and state == "play":
-            return True  # our pause 1 is still on its way (e.g. after a reconnect)
+            # Our pause 1 is still to go out (requeued at a reconnect) and holds whatever
+            # song MPD plays by then.
+            return True
         if state == "pause" and song == gate.song and gate.phase != _PAUSING:
             return True  # ours (an event that arrives late), or a phone pause we can't tell apart
         if gate.phase == _RESUMING and state == "play" and song == gate.song:
@@ -1017,6 +1045,7 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
             continue
         backoff = 1
         try:
+            follower.on_mpd_connected()
             follower.on_mpd_state(*mpd.status())
             # Tick right away too: a deadline may have passed while MPD was unreachable.
             follower.tick()

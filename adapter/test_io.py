@@ -1,8 +1,8 @@
 """I/O edges: MPD client and main loop against a fake MPD server, SSDP against a local responder."""
 
+import errno
 import os
 import socket
-import struct
 import threading
 import time
 import unittest
@@ -156,14 +156,21 @@ class BrokenSocket:
     """Stands in for the MPD socket after MPD reset the connection: recv and sendall raise
     what the OS reports then (deterministic, unlike a real RST racing a FIN)."""
 
-    def __init__(self, recv_error=None, send_error=None, recv_after_s=0.0):
+    def __init__(self, recv_error=None, send_error=None, recv_after_s=0.0,
+                 setsockopt_error=None):
         self.recv_error = recv_error
         self.send_error = send_error
         self.recv_after_s = recv_after_s
+        self.setsockopt_error = setsockopt_error
         self.sent = []
+        self.closed = False
 
     def settimeout(self, timeout):
         pass
+
+    def setsockopt(self, *args):
+        if self.setsockopt_error:
+            raise self.setsockopt_error
 
     def sendall(self, data):
         if self.send_error:
@@ -177,14 +184,31 @@ class BrokenSocket:
         return b""
 
     def close(self):
-        pass
+        self.closed = True
+
+
+class ScriptedSocket(BrokenSocket):
+    """recv returns (or raises) the scripted replies in order, then EOF; the first after
+    recv_after_s seconds."""
+
+    def __init__(self, replies, recv_after_s=0.0):
+        super().__init__(recv_after_s=recv_after_s)
+        self.replies = list(replies)
+
+    def recv(self, size):
+        time.sleep(self.recv_after_s)
+        self.recv_after_s = 0.0
+        reply = self.replies.pop(0) if self.replies else b""
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
 
 class MpdConnectionLostTest(unittest.TestCase):
     """MPD hangs up on a client silent outside `idle` for its connection_timeout. A lost
-    connection names that only when the adapter had been silent outside idle; a drop
-    during idle (an MPD restart) is reported plainly, however it shows: an empty read, a
-    reset on recv or a broken pipe on send."""
+    connection names that only when the adapter had been silent outside idle for at least
+    TIMEOUT_HINT_S; a drop during idle (an MPD restart) is reported plainly, however it
+    shows: an empty read, a reset on recv, or a broken pipe or reset on send."""
 
     TIMEOUT_HINT = "connection_timeout"
 
@@ -213,7 +237,9 @@ class MpdConnectionLostTest(unittest.TestCase):
 
     def test_reset_after_silence_outside_idle_names_the_timeout(self):
         for name, sock in (("recv", BrokenSocket(recv_error=ConnectionResetError(54, "reset"))),
-                           ("send", BrokenSocket(send_error=BrokenPipeError(32, "pipe")))):
+                           ("send pipe", BrokenSocket(send_error=BrokenPipeError(32, "pipe"))),
+                           ("send reset",
+                            BrokenSocket(send_error=ConnectionResetError(54, "reset")))):
             with self.subTest(name):
                 client = self.client(test_silence_s=70)
                 client.sock = sock
@@ -223,12 +249,40 @@ class MpdConnectionLostTest(unittest.TestCase):
                 self.assertIn(self.TIMEOUT_HINT, str(cm.exception))
                 self.assertNotIn("Errno", str(cm.exception))
 
-    def test_reset_right_after_connecting_is_reported_plainly(self):
-        def reset_before_the_banner(conn):
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    def test_reset_while_connecting_is_reported_plainly(self):
+        # A reset that lands before the banner shows at whichever step comes first (on
+        # macOS the connect itself, or EINVAL from setsockopt); stubbed, so no step races.
+        reset = ConnectionResetError(54, "Connection reset by peer")
+        for step, connect in (
+                ("connect", mock.Mock(side_effect=reset)),
+                ("keepalive", mock.Mock(return_value=BrokenSocket(
+                    setsockopt_error=OSError(errno.EINVAL, "Invalid argument")))),
+                ("banner", mock.Mock(return_value=BrokenSocket(recv_error=reset)))):
+            with self.subTest(step), mock.patch.object(ra.socket, "create_connection", connect):
+                with self.assertRaises(ConnectionError) as cm:
+                    ra.MpdClient("127.0.0.1", 9)
+                self.assertEqual(str(cm.exception), "MPD closed the connection")
+                if step != "connect":
+                    self.assertTrue(connect.return_value.closed)  # no socket left open
 
+    def test_short_silence_outside_idle_does_not_blame_the_timeout(self):
+        # A few seconds without a command is far below any connection_timeout worth naming.
+        client = self.client(test_silence_s=5)
+        client.sock = BrokenSocket(recv_error=ConnectionResetError(54, "reset"))
         with self.assertRaises(ConnectionError) as cm:
-            ra.MpdClient("127.0.0.1", raw_server(self, reset_before_the_banner))
+            client.status()
+        self.assertEqual(str(cm.exception), "MPD closed the connection")
+
+    def test_drop_right_after_a_long_idle_wait_does_not_blame_the_timeout(self):
+        # MPD restarts its connection_timeout when an idle ends, so the time spent in idle
+        # is no silence, even when the wait ended by timeout and noidle.
+        client = self.client()
+        client.sock = ScriptedSocket([socket.timeout("idle wait over"), b"OK\n"],
+                                     recv_after_s=0.1)
+        with mock.patch.object(ra, "TIMEOUT_HINT_S", 0.05):
+            self.assertFalse(client.wait_player(0.1))
+            with self.assertRaises(ConnectionError) as cm:
+                client.status()  # EOF
         self.assertEqual(str(cm.exception), "MPD closed the connection")
 
     def test_drop_while_idle_does_not_blame_the_timeout(self):
@@ -357,6 +411,9 @@ class RecordingFollower:
         self.ticks = 0
         self.stop_after = stop_after
 
+    def on_mpd_connected(self):
+        self.connects = getattr(self, "connects", 0) + 1
+
     def on_mpd_state(self, state, songid=None):
         self.states.append(state)
 
@@ -416,6 +473,21 @@ class RunLoopTest(unittest.TestCase):
                         should_stop=lambda: len(ctl.calls) >= 2 or len(sleeps) > 3)
         self.assertEqual(ctl.calls, ["ensure_playing", "ensure_playing"])
         self.assertEqual(sleeps, [1])
+
+    def test_unchanged_play_after_a_reconnect_restarts_the_renderer(self):
+        # MPD restarted and restored play with the same songid (ids restart at 0); the
+        # stream died with it, so the owned zone's renderer is told to play again.
+        ctl = RecordingController()
+        follower = ra.Follower(ctl, poll_seconds=60, clock=FakeClock(), start_gate_seconds=0)
+        mpd = FakeMpd([[("play", "1")], [("play", "1")]])
+        mpd.close_first = True
+        self.addCleanup(mpd.close)
+        sleeps = []
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            run_bounded(self, follower, mpd, sleep=sleeps.append,
+                        should_stop=lambda: len(ctl.calls) >= 2 or len(sleeps) > 3)
+        self.assertEqual(ctl.calls, ["ensure_playing", "ensure_playing(no wake)"])
+        self.assertEqual(mpd.connections, 2)
 
     def test_past_deadline_wait_is_clamped_positive(self):
         clock = FakeClock()
@@ -506,7 +578,9 @@ class RunLoopTest(unittest.TestCase):
                 time.sleep(0.5)  # blocked on the speaker
 
         follower.tick = slow_tick
-        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+        # Scaled down with the 0.5 s silence: the real bound (30 s) is far below MPD's 60 s.
+        with mock.patch.object(ra, "TIMEOUT_HINT_S", 0.4), \
+                self.assertLogs("raumfeld_adapter", "WARNING") as logs:
             run_bounded(self, follower, mpd, sleep=lambda s: None, should_stop=follower.done)
         self.assertEqual(mpd.connections, 2)
         message = [r.getMessage() for r in logs.records if "MPD" in r.getMessage()][0]

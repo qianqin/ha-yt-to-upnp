@@ -71,8 +71,8 @@ class ConfigTest(unittest.TestCase):
                            ("STUCK_SECONDS", "nan"), ("STUCK_SECONDS", "later"),
                            ("START_GATE_SECONDS", "-1"), ("START_GATE_SECONDS", "inf"),
                            ("START_GATE_SECONDS", "x"),
-                           # A gate past MPD's default connection_timeout (60 s) would get
-                           # the adapter dropped; a renderer stuck for minutes is long gone.
+                           # A gate past 60 s only leaves the phone standing still; a
+                           # renderer stuck for minutes is long gone.
                            ("START_GATE_SECONDS", "61"), ("STUCK_SECONDS", "301"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
@@ -362,6 +362,19 @@ class FollowerTest(unittest.TestCase):
         self.f.on_mpd_state("play")
         self.f.on_mpd_state("play")
         self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["ensure_playing(no wake)"] * 2)
+
+    def test_unchanged_play_within_one_connection_is_no_new_start(self):
+        self.f.on_mpd_state("play", "1")
+        self.f.on_mpd_state("play", "1")  # e.g. a seek
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+
+    def test_unchanged_play_after_a_reconnect_restarts_an_owned_zone(self):
+        # MPD restarted and restored play with the same songid (ids restart at 0): the
+        # stream died with MPD, so the renderer is told to play again (no wake).
+        self.f.on_mpd_state("play", "1")
+        self.f.on_mpd_connected()
+        self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing(no wake)"])
 
     def test_user_resume_wakes(self):
         self.f.on_mpd_state("play")
@@ -688,6 +701,39 @@ class StartGateTest(unittest.TestCase):
         self.f.on_mpd_state("stop", None)
         self.assertEqual(self.requests(), [])
         self.assertEqual(self.ctl.calls, [])
+
+    def test_play_reported_before_our_pause_lands_keeps_the_gate(self):
+        # The connection dropped before pause 1 went out; the reconnect's first status still
+        # plays, the same song or one the phone skipped to meanwhile. Our pause, still to go
+        # out, holds whichever song MPD plays.
+        for song in ("1", "2"):
+            with self.subTest(song=song):
+                self.setUp()
+                with self.assertLogs("raumfeld_adapter", "INFO"):
+                    self.f.on_mpd_state("play", "1")
+                self.f.requeue_mpd_requests(self.requests())
+                self.f.on_mpd_connected()
+                self.f.on_mpd_state("play", song)
+                self.assertEqual(self.ctl.calls, [])
+                self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+                self.f.on_mpd_state("pause", song)  # run() reports our pause 1
+                self.assertEqual(self.ctl.calls, ["ensure_playing"])
+                self.assertEqual(self.f._gate.song, song)
+
+    def test_unowned_play_after_a_reconnect_is_gated_once(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        self.ctl.fail = OSError("speaker unreachable")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")
+        self.released()  # the takeover failed; MPD plays, the retry is pending
+        self.f.on_mpd_connected()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")  # unchanged, but on a new connection
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        self.f.on_mpd_state("play", "1")  # unchanged on the same connection: no new gate
+        self.assertEqual(self.requests(), [])
 
     def test_song_change_in_an_owned_session_is_not_gated(self):
         self.held()
