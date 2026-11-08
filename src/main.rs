@@ -992,8 +992,11 @@ async fn start_preroll(
             return;
         }
     };
-    if !preroll.should_start(play_started, &status.state) {
-        tracing::debug!("[preroll] not started: pre-roll running or player busy ({})", status.state);
+    if !preroll.should_start(play_started, &status.state, tokio::time::Instant::now()) {
+        tracing::debug!(
+            "[preroll] not started: pre-roll running or cooling down, or player busy ({})",
+            status.state
+        );
         return;
     }
     if let Err(e) = preroll.start(mpd, silence_url).await {
