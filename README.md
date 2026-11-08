@@ -126,6 +126,8 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.99.1-bookworm bash -c \
    cargo build --release --target aarch64-unknown-linux-gnu"
 ```
 
+Before a release, run `scripts/release-check.sh`; see [docs/DEVOPS.md](docs/DEVOPS.md).
+
 ## Architecture
 
 | File | Lines | Purpose |

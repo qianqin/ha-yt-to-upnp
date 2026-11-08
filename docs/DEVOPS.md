@@ -45,6 +45,9 @@ the Docker volumes and containers it created plus any image it had to pull
 (images that were already present are left alone). Add `--with-ubuntu` to
 also run the optional Ubuntu variant.
 
+To abort during a container step, press Ctrl-C up to three times: the
+container keeps building until the `docker` CLI exits. Cleanup still runs.
+
 ### Local checks (what the script runs)
 
 For reference, the same checks by hand, from the repository root:
@@ -95,8 +98,11 @@ For reference, the same checks by hand, from the repository root:
 
    ```sh
    docker volume rm ytcast-linux-target
-   docker image rm rust:1.99.1-bookworm
    ```
+
+   Remove `rust:1.99.1-bookworm` (`docker image rm rust:1.99.1-bookworm`) only
+   if you pulled it for this run; the cross-compile in the README uses the same
+   image.
 
    Only if you ran the optional Ubuntu variant:
 
@@ -135,10 +141,10 @@ Run `scripts/release-check.sh` on the reverted tree, push only if it exits 0
 
 ### Target: Test
 
-Local build and test on the exact commit, natively on macOS and in a
-temporary Linux container, with the Docker resources removed afterwards:
-`scripts/release-check.sh` (steps 1, 2, and 4 of the local checks, plus
-cleanup).
+All local checks on the exact commit, with the Docker resources removed
+afterwards: `scripts/release-check.sh` (steps 1 to 4 of the local checks:
+macOS and Linux container build and tests, `cargo audit`, adapter tests,
+plus cleanup).
 
 ### Target: Production
 
