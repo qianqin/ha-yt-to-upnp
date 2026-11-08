@@ -8,8 +8,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   it to a new one only if it has none) and tells the zone's renderer to play
   `STREAM_URL` via UPnP AVTransport. **Waking waits for the room:** if the room
   was not `ACTIVE`, the adapter asks `getZones` every 0.5 s until it reports the
-  room `ACTIVE` (and in a zone, if it had one before), at most 10 s
-  (`WAKE_WAIT_S`), and only then finds the zone renderer afresh and sends
+  room `ACTIVE` (and in a zone, if it had one before), at most 10 s in all,
+  slow answers included (`WAKE_WAIT_S`), and only then finds the zone renderer afresh and sends
   `SetAVTransportURI`/`Play`. A speaker woken while it is still finishing its
   standby otherwise accepts those requests and drops them. A room not awake in
   time is taken over anyway, with a warning; the start gate's re-takeover (below)
@@ -21,18 +21,26 @@ Raumfeld room play the receiver's MPD stream automatically.
   httpd output keeps streaming silence while paused (`always_on`), so the speaker
   can connect. Then it wakes the room and starts the stream as usual, asks the
   zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`, and sends
-  `pause 0` as soon as it is. **Re-takeover:** if the renderer is not `PLAYING`
-  `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover returned, whatever it
-  reports (`STOPPED`, `TRANSITIONING`, another source, or no answer), the adapter
-  does the whole takeover again (wake, wait for the room, `SetAVTransportURI`,
-  `Play`; same UDN discovery, no volume), at most twice per gate
-  (`GATE_MAX_RETAKES`), and logs each one at INFO with the state that triggered
-  it. A renderer `TRANSITIONING` on the stream is set up afresh too; one that
-  plays it is left alone. Every takeover in the gate gets those 5 s to start
-  playing, so the gate may run past `START_GATE_SECONDS` (by default up to about
-  25 s with two re-takeovers on a speaker answering in 3 s; more on a slower
-  one), but never past 60 s, the highest `START_GATE_SECONDS`. If the renderer
-  still doesn't play by then, or the takeover fails, it sends `pause 0` anyway and
+  `pause 0` as soon as it is. **Re-takeover:** if the renderer has not loaded or
+  does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover returned
+  (`STOPPED`, `NO_MEDIA_PRESENT`, a URI not ours that does not play, the room
+  back in standby or out of its zone, or no answer), the adapter does the whole
+  takeover again (wake, wait for the room, `SetAVTransportURI`, `Play`; same UDN
+  discovery, no volume), at most twice per gate (`GATE_MAX_RETAKES`), and logs
+  each one at INFO with the state that triggered it. A re-takeover only starts
+  if it can still have its wake wait and its 5 s before the 60 s mark. Never
+  taken over again: a renderer `TRANSITIONING` on the stream (buffering): if it
+  is still `TRANSITIONING` 10 s after the takeover, it is restarted once
+  (`Stop`, `Play`, as for a stuck renderer, below), and if it still is when the
+  gate ends, the stuck-renderer handling carries on from there. Nor a renderer
+  that plays another source (someone started it during the gate, also if a
+  re-takeover finds it): the gate ends at once with a warning naming it, and the
+  next look at the room counts the speaker as taken away. Every takeover or
+  restart in the gate gets those 5 s to start playing, so the gate may run past
+  `START_GATE_SECONDS` (by default up to about 25 s with two re-takeovers on a
+  speaker answering in 3 s; more on a slower one), but never past 60 s, the
+  highest `START_GATE_SECONDS`. If the renderer still doesn't play by then, or
+  the takeover fails, it sends `pause 0` anyway and
   logs a warning naming the last renderer state and the room verdict (e.g.
   `renderer 'STOPPED', room 'not_playing'` or `room 'standby'`): playback is
   never blocked. A failed takeover is retried after 30 seconds without holding MPD
@@ -65,7 +73,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   two polls in a row. **Exception right after a start gate that ran out:** if
   every look at the room since then found the renderer stopped, it never started
   after the adapter's own takeover, so nobody stopped it; instead of yielding, the
-  adapter does one more takeover and logs it, then counts again. A renderer seen
+  adapter does one more takeover and logs it, then counts again (should another
+  source play by then, the speaker counts as taken away). A renderer seen
   playing or `TRANSITIONING` since, or any change in MPD (pause, stop, another
   song), drops that exception, so a user who stops the speaker later is still
   respected. If the speaker counts as taken away while MPD is playing or paused,
@@ -101,11 +110,12 @@ Raumfeld room play the receiver's MPD stream automatically.
   to wake (plus the usual SSDP and request time); a re-takeover is due 5 s after
   a takeover returned; the gate ends at `START_GATE_SECONDS` or 5 s after the
   last takeover returned, whichever is later, at most 60 s after it began. A
-  re-takeover is only started before that 60 s mark. So while the renderer
+  re-takeover only starts at least 15 s (wake wait plus its 5 s) before that
+  60 s mark, a restart at least 5 s before it. So while the renderer
   doesn't play, a gate set below about 15 s still lasts until both re-takeovers
   had their 5 s; a renderer that plays ends the gate at once, whatever the
   setting.
-- Apart from that restart it never stops the zone, and it never puts the room
+- Apart from these restarts it never stops the zone, and it never puts the room
   into standby itself; the Raumfeld's own auto power-off does that.
 - It never changes the Raumfeld's volume and sends no RenderingControl requests
   at all. Volume from the phone is MPD's software volume: the httpd output needs
