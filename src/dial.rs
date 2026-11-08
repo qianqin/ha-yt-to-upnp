@@ -35,10 +35,8 @@ pub struct DialState {
     pub port: u16,
     /// Credential transfer token from the casting session (YTM Premium auth).
     pub ctt: std::sync::RwLock<Option<String>>,
-    /// YouTube cookies for Premium auth (only sent with WEB_REMIX /player calls).
-    pub yt_cookies: Option<std::sync::Arc<crate::cookies::YtCookies>>,
-    /// Live YouTube Music session (full INNERTUBE_CONTEXT from page).
-    pub yt_session: Option<std::sync::Arc<crate::cookies::YtMusicSession>>,
+    /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
+    pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
     pub screen_id: String,
 }
@@ -276,9 +274,8 @@ async fn stream_audio(
     }
 
     let ctt = state.ctt.read().unwrap().clone();
-    let yt_cookies = state.yt_cookies.as_ref().map(|c| c.as_ref());
     let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
-    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_cookies, yt_session).await {
+    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session).await {
         Ok((info, rx)) => {
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
@@ -366,7 +363,6 @@ mod tests {
             local_ip: Ipv4Addr::new(192, 0, 2, 1),
             port: 8008,
             ctt: std::sync::RwLock::new(None),
-            yt_cookies: None,
             yt_session: None,
             screen_id: "test-screen".to_string(),
         })

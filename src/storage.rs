@@ -1,7 +1,6 @@
 //! Where persistent files live and how they are written.
 //!
-//! `YTCAST_DATA_DIR` moves config, the nsig cache and the default cookie file
-//! into one directory (e.g. `/data` in a container). When it is unset, the
+//! `YTCAST_DATA_DIR` moves config and the nsig cache into one directory (e.g. `/data` in a container). When it is unset, the
 //! historical per-user locations are used.
 //!
 //! Path resolution takes the env value as a parameter so it can be tested
@@ -48,20 +47,6 @@ pub fn nsig_cache_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
         Some(d) => Some(d.join("nsig-cache")),
         None => dirs::cache_dir().map(|d| d.join("ytcast")),
     }
-}
-
-/// Cookie file path: `YTM_COOKIES` wins, then `<data dir>/ytm-cookies.txt`,
-/// then `~/ytm-cookies.txt`.
-pub fn cookie_path(ytm_cookies: Option<&str>, data_dir: Option<&Path>) -> String {
-    if let Some(p) = ytm_cookies {
-        return p.to_string();
-    }
-    let base = match data_dir {
-        Some(d) => Some(d.to_path_buf()),
-        None => dirs::home_dir(),
-    };
-    base.map(|b| b.join("ytm-cookies.txt").to_string_lossy().to_string())
-        .unwrap_or_else(|| "ytm-cookies.txt".into())
 }
 
 /// Create `dir` and any missing parents; newly created directories are 0700.
@@ -264,28 +249,6 @@ mod tests {
         assert!(logs.contains(DATA_DIR_ENV), "{logs}");
 
         assert_eq!(capture_logs(|| warn_if_relative_data_dir(Path::new("/data"))), "");
-    }
-
-    #[test]
-    fn cookie_path_defaults_to_data_dir() {
-        assert_eq!(
-            PathBuf::from(cookie_path(None, Some(Path::new("/x")))),
-            Path::new("/x").join("ytm-cookies.txt")
-        );
-    }
-
-    #[test]
-    fn cookie_path_env_wins_over_data_dir() {
-        assert_eq!(cookie_path(Some("/y/c.txt"), Some(Path::new("/x"))), "/y/c.txt");
-        assert_eq!(cookie_path(Some("/y/c.txt"), None), "/y/c.txt");
-    }
-
-    #[test]
-    fn cookie_path_without_data_dir_is_home() {
-        let expected = dirs::home_dir()
-            .map(|h| h.join("ytm-cookies.txt").to_string_lossy().to_string())
-            .unwrap_or_else(|| "ytm-cookies.txt".into());
-        assert_eq!(cookie_path(None, None), expected);
     }
 
     #[test]

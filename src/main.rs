@@ -1,10 +1,10 @@
 mod config;
-mod cookies;
 mod dial;
 mod innertube;
 mod lounge;
 mod messages;
 mod mpd;
+mod music_session;
 mod nsig;
 mod sabr;
 mod ssdp;
@@ -102,55 +102,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(6600);
     let dial_port: u16 = 8008;
 
-    // 4. Load YouTube cookies (for Premium auth — bypasses PoToken requirement)
-    let cookie_path = storage::cookie_path(
-        std::env::var("YTM_COOKIES").ok().as_deref(),
-        storage::data_dir_env().as_deref(),
-    );
-
-    let yt_cookies = if std::path::Path::new(&cookie_path).exists() {
-        match cookies::load_cookie_file(&cookie_path) {
-            Ok(Some(c)) => {
-                tracing::info!("[init] Loaded cookies from {}", cookie_path);
-                Some(Arc::new(c))
-            }
-            Ok(None) => {
-                tracing::warn!("[init] Cookie file {} has no SAPISID", cookie_path);
-                None
-            }
-            Err(e) => {
-                tracing::warn!("[init] Failed to load cookies from {}: {}", cookie_path, e);
-                None
-            }
-        }
-    } else {
-        tracing::info!("[init] No cookie file at {}, running without Premium auth", cookie_path);
-        None
-    };
-
-    // 5. Create reqwest client (shared across innertube + lounge)
-    // NOTE: cookies are NOT loaded into the client — they're sent manually
-    // only on WEB_REMIX /player calls to avoid poisoning IOS/other requests.
+    // 4. Create reqwest client (shared across innertube + lounge). No cookie
+    // store: the only authentication is the ctt each cast hands over.
     let http_client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0")
         .build()?;
 
-    // 5b. Fetch live YouTube Music session (INNERTUBE_CONTEXT from page)
+    // 5. Fetch the anonymous YouTube Music session (INNERTUBE_CONTEXT from page)
     // This is critical: without the full 22+ field context from ytcfg,
-    // WEB_REMIX /player returns UNPLAYABLE. yt-dlp does the same thing.
-    let yt_session = if let Some(ref cookies) = yt_cookies {
-        match cookies::fetch_music_session(&http_client, cookies).await {
-            Some(session) => {
-                tracing::info!("[init] YouTube Music session extracted (logged_in={})", session.logged_in);
-                Some(Arc::new(session))
-            }
-            None => {
-                tracing::warn!("[init] Failed to extract YouTube Music session — WEB_REMIX may fail");
-                None
-            }
+    // WEB_REMIX /player returns UNPLAYABLE even with a ctt. yt-dlp does the same thing.
+    let yt_session = match music_session::fetch_music_session(&http_client).await {
+        Some(session) => {
+            tracing::info!("[init] YouTube Music session extracted (anonymous)");
+            Some(Arc::new(session))
         }
-    } else {
-        None
+        None => {
+            tracing::warn!("[init] No YouTube Music session — casts use the IOS client instead of WEB_REMIX + ctt");
+            None
+        }
     };
 
     // 6. Generate screen_ids on first run (one per theme)
@@ -231,7 +200,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ip,
         port: dial_port,
         ctt: std::sync::RwLock::new(None),
-        yt_cookies: yt_cookies.clone(),
         yt_session: yt_session.clone(),
         screen_id: config.screen_id.clone(),
     });
@@ -368,7 +336,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // - Idle events detect song endings instantly for auto-advance
     // - Position timer reports playback progress to YouTube every 3s (seekbar sync)
     let innertube_client = http_client;
-    let innertube_cookies = yt_cookies;
     let innertube_session = yt_session;
     let mut playlist = PlaylistState::default();
     let mut play_started = false;
@@ -423,7 +390,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &mut playlist,
                     &mut play_started,
                     &dial_state,
-                    innertube_cookies.as_ref().map(|c| c.as_ref()),
                     innertube_session.as_ref().map(|s| s.as_ref()),
                 ).await {
                     tracing::error!("[player] Error handling command: {}", e);
@@ -478,7 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                                 match play_video(
                                     &mut mpd_client, &innertube_client, &state_tx,
-                                    &mut playlist, &video_id, 0.0, innertube_cookies.as_ref().map(|c| c.as_ref()),
+                                    &mut playlist, &video_id, 0.0,
                                     innertube_session.as_ref().map(|s| s.as_ref()),
                                 ).await {
                                     Ok(true) => play_started = true,
@@ -569,8 +535,7 @@ async fn handle_command(
     playlist: &mut PlaylistState,
     play_started: &mut bool,
     dial_state: &Arc<dial::DialState>,
-    yt_cookies: Option<&cookies::YtCookies>,
-    yt_session: Option<&cookies::YtMusicSession>,
+    yt_session: Option<&music_session::YtMusicSession>,
 ) -> CmdResult {
     use lounge::PlayerCommand;
 
@@ -609,7 +574,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session).await?;
+            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_session).await?;
         }
 
         PlayerCommand::SetVideo {
@@ -633,7 +598,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session).await?;
+            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_session).await?;
         }
 
         PlayerCommand::Play => {
@@ -769,7 +734,7 @@ async fn handle_command(
                 tracing::info!("[player] Previous -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session).await?;
+                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_session).await?;
             } else {
                 tracing::info!("[player] Previous: already at start");
             }
@@ -782,7 +747,7 @@ async fn handle_command(
                 tracing::info!("[player] Next -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session).await?;
+                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_session).await?;
             } else {
                 tracing::info!("[player] Next: end of playlist");
                 *play_started = false;
@@ -836,8 +801,7 @@ async fn play_video(
     playlist: &mut PlaylistState,
     video_id: &str,
     start_position: f64,
-    yt_cookies: Option<&cookies::YtCookies>,
-    yt_session: Option<&cookies::YtMusicSession>,
+    yt_session: Option<&music_session::YtMusicSession>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Tell YouTube we're loading — app shows spinner immediately
     send_state(mpd, state_tx, playlist, messages::PlayerState::Loading).await?;
@@ -851,7 +815,6 @@ async fn play_video(
         } else {
             Some(playlist.list_id.as_str())
         },
-        yt_cookies,
         yt_session,
     )
     .await?;
@@ -1036,8 +999,8 @@ mod log_hygiene_tests {
 
 #[cfg(test)]
 mod no_stored_credentials_tests {
-    // The receiver never stores or uses its own credentials: it only uses what
-    // the cast client hands over (ctt) and the optional cookie file. Needles
+    // The receiver never stores or uses credentials of its own: the only
+    // authentication is the per-cast ctt the casting client hands over. Needles
     // are split with concat! so these tests do not match themselves.
 
     /// Non-test source of every `.rs` file under `src/`, by path.
@@ -1061,93 +1024,110 @@ mod no_stored_credentials_tests {
     }
 
     #[test]
-    fn no_oauth_module_or_credentials_file() {
+    fn no_oauth_or_cookie_modules_or_credentials_files() {
         for (path, src) in production_sources() {
-            assert_ne!(path.file_name().unwrap(), "oauth.rs");
+            let file = path.file_name().unwrap();
+            assert_ne!(file, "oauth.rs");
+            assert_ne!(file, concat!("cook", "ies.rs"));
             for needle in [concat!("mod ", "oauth"), concat!("ytcast-", "oauth"), concat!("OAuth", "State")] {
                 assert!(!src.contains(needle), "{} contains {needle}", path.display());
             }
         }
     }
 
-    /// Credential-header violations in `src`: any bearer or basic auth, and
-    /// any Authorization header (literal or reqwest constant) whose own call
-    /// does not take its value from the cookie SAPISIDHASH.
-    fn credential_header_violations(src: &str) -> Vec<String> {
+    fn is_ident_byte(b: Option<&u8>) -> bool {
+        b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    }
+
+    /// Stored-credential violations in `src`: bearer or basic auth, any
+    /// Authorization or Cookie request header (string literal in any case, or
+    /// the reqwest constant), a cookie jar, and the old cookie-file plumbing.
+    fn credential_violations(src: &str) -> Vec<String> {
         let mut found = Vec::new();
         // ASCII lowercasing keeps byte offsets aligned with `src`.
         let lower = src.to_ascii_lowercase();
-        for needle in [concat!("bear", "er"), concat!("basic", "_auth(")] {
+        for needle in [
+            concat!("bear", "er"),
+            concat!("basic", "_auth("),
+            concat!("ytm_", "cookies"),
+            concat!("ytm-", "cookies"),
+            concat!("load_cookie", "_file"),
+            concat!("sapi", "sid"),
+            concat!("cookie", "_store("),
+            concat!("cookie", "_provider("),
+        ] {
             if lower.contains(needle) {
                 found.push(format!("uses {needle}"));
             }
         }
-        let name = concat!("authori", "zation");
         let bytes = src.as_bytes();
-        for (i, _) in lower.match_indices(name) {
-            let end = i + name.len();
-            let constant = &src[i..end] == name.to_ascii_uppercase();
-            let literal = i > 0 && bytes[i - 1] == b'"' && bytes.get(end) == Some(&b'"');
-            if !(constant || literal) {
-                continue;
-            }
-            let call = header_call(src, i);
-            if !call.contains("full_sapisidhash(") {
-                found.push(format!("Authorization header not from SAPISIDHASH: {call}"));
+        for name in [concat!("authori", "zation"), concat!("coo", "kie")] {
+            for (i, _) in lower.match_indices(name) {
+                let end = i + name.len();
+                let constant = src[i..end] == name.to_ascii_uppercase()
+                    && !is_ident_byte(i.checked_sub(1).and_then(|p| bytes.get(p)))
+                    && !is_ident_byte(bytes.get(end));
+                let literal = i > 0
+                    && bytes[i - 1] == b'"'
+                    && matches!(bytes.get(end), Some(b'"') | Some(b':'));
+                if constant || literal {
+                    found.push(format!("{name} header: {}", line_at(src, i)));
+                }
             }
         }
         found
     }
 
-    /// From `start` to the `)` closing the call that contains it, or to the
-    /// end of the statement. Walks chars, so it never splits a UTF-8 char.
-    fn header_call(src: &str, start: usize) -> &str {
-        let mut depth = 0i32;
-        for (off, c) in src[start..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' if depth == 0 => return &src[start..start + off],
-                ')' => depth -= 1,
-                ';' if depth == 0 => return &src[start..start + off],
-                _ => {}
-            }
-        }
-        &src[start..]
+    /// The line containing byte offset `i` (a char boundary).
+    fn line_at(src: &str, i: usize) -> &str {
+        let start = src[..i].rfind('\n').map_or(0, |p| p + 1);
+        let end = src[i..].find('\n').map_or(src.len(), |p| i + p);
+        &src[start..end]
     }
 
     #[test]
-    fn no_bearer_authorization() {
+    fn no_stored_credential_headers_or_cookie_files() {
         for (path, src) in production_sources() {
-            let found = credential_header_violations(&src);
+            let found = credential_violations(&src);
             assert!(found.is_empty(), "{}: {found:?}", path.display());
         }
     }
 
     #[test]
-    fn credential_header_guard_catches_non_sapisidhash_auth() {
+    fn credential_guard_catches_stored_credentials() {
         for bad in [
             "req.bearer_auth(t);",
             "req.basic_auth(u, Some(p));",
             "req.header(reqwest::header::AUTHORIZATION, format!(\"tok {t}\"));",
-            "req.header(header::AUTHORIZATION, x).header(\"X\", full_sapisidhash(c, o, None));",
-            "req.header(\"Authorization\", x)\n.header(\"Authorization\", full_sapisidhash(c, o, None));",
+            "req.header(\"Authorization\", x);",
             "req.header(\"authorization\", x);",
             "req.header(\"Authorization\", x); // \u{2014}\u{2014}\u{2014}",
+            "req.header(header::COOKIE, c);",
+            "req.header(\"Cookie\", c);",
+            "req.header(\"COOKIE\", c);",
+            "let raw = \"Cookie: a=b\";",
+            "std::env::var(\"YTM_COOKIES\")",
+            "home.join(\"ytm-cookies.txt\")",
+            "cookies::load_cookie_file(p)",
+            "let sapisid = x; // \u{2014}",
+            "reqwest::Client::builder().cookie_store(true)",
         ] {
-            assert!(!credential_header_violations(bad).is_empty(), "not caught: {bad}");
+            assert!(!credential_violations(bad).is_empty(), "not caught: {bad}");
         }
     }
 
     #[test]
-    fn credential_header_guard_accepts_sapisidhash_and_multibyte_text() {
+    fn credential_guard_accepts_ctt_and_multibyte_text() {
         for good in [
-            "req.header(\"Authorization\", crate::cookies::full_sapisidhash(c, o, None));",
-            "req.header(header::AUTHORIZATION, full_sapisidhash(c, o, uid))",
-            // A non-ASCII char right after a header site must not panic.
-            "// auth \u{2014} see \"Authorization\"\u{2014}\u{2014}\nreq.header(\"Authorization\", full_sapisidhash(c, o, None));",
-            "/// Generate the full Authorization header \u{2014} like yt-dlp.",
+            "state.playback_cookie = Some(c.encode_to_vec());",
+            "let PLAYBACK_COOKIE_LEN = 3;",
+            "req.header(\"X-Goog-Visitor-Id\", vd);",
+            "req.header(reqwest::header::CONTENT_TYPE, \"application/json\");",
+            // Prose mentions are fine; only header sites count.
+            "/// Never sends an Authorization header \u{2014} only the ctt.",
+            "// no Cookie header \u{2014}\u{2014}\nlet x = \"\u{2014}\";",
         ] {
-            let found = credential_header_violations(good);
+            let found = credential_violations(good);
             assert!(found.is_empty(), "{good}: {found:?}");
         }
     }

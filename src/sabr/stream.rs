@@ -219,7 +219,7 @@ struct PlayerData {
 /// True only for https URLs on youtube.com / googlevideo.com or a subdomain.
 ///
 /// Streaming URLs come from server responses (player response, SABR
-/// redirects), so cookies and auth headers must never follow them blindly.
+/// redirects), so the ctt and PoToken must never follow them blindly.
 pub(crate) fn is_trusted_google_host(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -295,7 +295,7 @@ struct AdaptiveFormat {
 // ---------------------------------------------------------------------------
 
 /// Build a minimal InnerTube context from hardcoded client constants.
-/// Used when no YtMusicSession is available (IOS/ANDROID/WEB, or WEB_REMIX without cookies).
+/// Used for IOS/ANDROID/WEB, and for WEB_REMIX when no YtMusicSession is available.
 fn build_minimal_context(
     itclient: &InnerTubeClient,
     ctt: Option<&str>,
@@ -348,9 +348,24 @@ async fn innertube_player(
     ctt: Option<&str>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
-    yt_cookies: Option<&crate::cookies::YtCookies>,
-    yt_session: Option<&crate::cookies::YtMusicSession>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<PlayerData, SabrError> {
+    let req = player_request(http, video_id, itclient, ctt, visitor_data, po_token, yt_session)?;
+    let resp = http.execute(req).await.map_err(|e| e.without_url())?;
+    parse_player_data(video_id, resp).await
+}
+
+/// Build the InnerTube /player request. The cast's ctt (in `context.user`)
+/// is the only authentication; no stored credential is ever attached.
+fn player_request(
+    http: &reqwest::Client,
+    video_id: &str,
+    itclient: &InnerTubeClient,
+    ctt: Option<&str>,
+    visitor_data: Option<&str>,
+    po_token: Option<&str>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
+) -> Result<reqwest::Request, SabrError> {
     let is_web_remix = itclient.client_name == "WEB_REMIX";
 
     // --- Build context ---
@@ -359,20 +374,7 @@ async fn innertube_player(
     // returns UNPLAYABLE. yt-dlp always fetches the page first for this reason.
     let (context, sig_timestamp) = if is_web_remix {
         if let Some(session) = yt_session {
-            let mut ctx = session.innertube_context.clone();
-            // Merge ctt credentials into the existing user object
-            if let Some(token) = ctt {
-                if let Some(user) = ctx.get_mut("user").and_then(|u| u.as_object_mut()) {
-                    user.insert(
-                        "credentialTransferTokens".to_owned(),
-                        serde_json::json!([{
-                            "scope": "VIDEO",
-                            "token": token,
-                        }]),
-                    );
-                }
-            }
-            (ctx, session.signature_timestamp)
+            (session.player_context(ctt), session.signature_timestamp)
         } else {
             // No session — build minimal context (may fail with UNPLAYABLE)
             (build_minimal_context(itclient, ctt, visitor_data), None)
@@ -408,36 +410,25 @@ async fn innertube_player(
     }
 
     // --- URL ---
-    // Authenticated WEB_REMIX doesn't send API key (matches yt-dlp).
     let url = if is_web_remix {
-        if yt_cookies.is_some() {
-            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
-        } else {
-            "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
-        }
+        "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
     } else {
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
     };
     debug_assert!(is_trusted_google_host(url));
 
     // Client version from live session (changes frequently) or hardcoded constant.
-    let client_version = if let Some(session) = yt_session {
-        session.innertube_context.get("client")
-            .and_then(|c| c.get("clientVersion"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(itclient.client_version)
-    } else {
-        itclient.client_version
-    };
+    let client_version = yt_session
+        .and_then(|s| s.client_version())
+        .unwrap_or(itclient.client_version);
 
     tracing::info!(
-        "[sabr] innertube /player for {} using {} v{}{}{}{}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}{}",
         video_id,
         itclient.client_name,
         client_version,
         if ctt.is_some() { " +ctt" } else { "" },
         if po_token.is_some() { " +potoken" } else { "" },
-        if yt_cookies.is_some() { " +cookies" } else { "" },
         if yt_session.is_some() { " +session" } else { "" },
     );
 
@@ -456,40 +447,12 @@ async fn innertube_player(
 
             // Visitor data — prefer page's visitorData, fall back to generated
             if let Some(session) = yt_session {
-                if let Some(vd) = session.innertube_context.get("client")
-                    .and_then(|c| c.get("visitorData"))
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(vd) = session.visitor_data() {
                     req = req.header("X-Goog-Visitor-Id", vd);
                 }
             } else if let Some(vd) = visitor_data {
                 if !vd.is_empty() {
                     req = req.header("X-Goog-Visitor-Id", vd);
-                }
-            }
-
-            // Auth: cookie-based triple SAPISIDHASH
-            if let Some(c) = yt_cookies {
-                let user_sid = yt_session.and_then(|s| s.user_session_id.as_deref());
-                req = req
-                    .header("Cookie", &c.cookie_header)
-                    .header(
-                        "Authorization",
-                        crate::cookies::full_sapisidhash(c, "https://music.youtube.com", user_sid),
-                    )
-                    .header("X-Origin", "https://music.youtube.com");
-
-                // Session-specific headers from ytcfg
-                if let Some(session) = yt_session {
-                    if let Some(ref idx) = session.session_index {
-                        req = req.header("X-Goog-Authuser", idx.as_str());
-                    }
-                    if let Some(ref uid) = session.user_session_id {
-                        req = req.header("X-Goog-Pageid", uid.as_str());
-                    }
-                    if session.logged_in {
-                        req = req.header("X-Youtube-Bootstrap-Logged-In", "true");
-                    }
                 }
             }
         }
@@ -502,17 +465,14 @@ async fn innertube_player(
                     req = req.header("X-Goog-Visitor-Id", vd);
                 }
             }
-            if let Some(c) = yt_cookies {
-                req = req
-                    .header("Cookie", &c.cookie_header)
-                    .header("Authorization", crate::cookies::full_sapisidhash(c, "https://www.youtube.com", None))
-                    .header("X-Origin", "https://www.youtube.com");
-            }
         }
         _ => {}
     }
 
-    let resp = req.json(&body).send().await.map_err(|e| e.without_url())?;
+    Ok(req.json(&body).build().map_err(|e| e.without_url())?)
+}
+
+async fn parse_player_data(video_id: &str, resp: reqwest::Response) -> Result<PlayerData, SabrError> {
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -614,7 +574,7 @@ struct PlayerResult {
     client_config: &'static InnerTubeClient,
 }
 
-/// Call InnerTube /player using WEB_REMIX + ctt + cookies.
+/// Call InnerTube /player using WEB_REMIX + ctt (+ anonymous page session).
 ///
 /// WEB_REMIX SABR URLs have an `n` parameter (nsig challenge) that must be
 /// decoded via ytdlp-ejs before the CDN accepts them. The caller handles
@@ -625,19 +585,16 @@ async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
-    yt_cookies: Option<&crate::cookies::YtCookies>,
-    yt_session: Option<&crate::cookies::YtMusicSession>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<PlayerResult, SabrError> {
     let gvs = fetch_pot_token(http, Some(video_id)).await;
 
-    // --- Attempt 1: WEB_REMIX + ctt + cookies ---
+    // --- Attempt 1: WEB_REMIX + ctt ---
     // Requires nsig decoding of SABR URL (handled by caller).
-    if yt_session.is_some() {
-        tracing::info!("[sabr] WEB_REMIX /player (ctt={}, cookies={}, session=true)",
-            ctt.is_some(), yt_cookies.is_some());
+    if let Some(session) = web_remix_session(ctt, yt_session) {
+        tracing::info!("[sabr] WEB_REMIX /player (ctt=true, session=true)");
         match innertube_player(
-            http, video_id, &WEB_REMIX_CLIENT, ctt, None, None,
-            yt_cookies, yt_session,
+            http, video_id, &WEB_REMIX_CLIENT, ctt, None, None, Some(session),
         ).await {
             Ok(data) => {
                 tracing::info!("[sabr] WEB_REMIX /player OK");
@@ -652,9 +609,28 @@ async fn get_player_data(
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None).await?;
+    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None).await?;
     tracing::info!("[sabr] IOS /player OK");
     Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
+}
+
+/// The session to use for WEB_REMIX, or `None` (with the reason logged) when
+/// WEB_REMIX cannot work: it needs both the cast's ctt and the page session.
+fn web_remix_session<'a>(
+    ctt: Option<&str>,
+    yt_session: Option<&'a crate::music_session::YtMusicSession>,
+) -> Option<&'a crate::music_session::YtMusicSession> {
+    match (ctt, yt_session) {
+        (Some(_), Some(session)) => Some(session),
+        (None, _) => {
+            tracing::info!("[sabr] no ctt from the cast — skipping WEB_REMIX");
+            None
+        }
+        (Some(_), None) => {
+            tracing::warn!("[sabr] no YouTube Music session — skipping WEB_REMIX despite ctt");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +739,6 @@ struct SabrState {
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
     po_token: Option<Vec<u8>>,
-    cookie_header: Option<String>,
     done: bool,
 }
 
@@ -807,7 +782,6 @@ impl SabrState {
             ustreamer_config,
             client_config,
             po_token: None,
-            cookie_header: None,
             done: false,
         }
     }
@@ -1173,16 +1147,11 @@ async fn sabr_request_cycle(
     );
 
     // CDN headers: content-type, accept, accept-encoding.
-    // WEB_REMIX SABR URLs require cookies on CDN requests (403 without them).
-    let mut req = http
+    let req = http
         .post(&url)
         .header("Content-Type", "application/x-protobuf")
         .header("Accept", "application/vnd.yt-ump")
         .header("Accept-Encoding", "identity");
-
-    if let Some(ref cookies) = state.cookie_header {
-        req = req.header("Cookie", cookies);
-    }
 
     // Signed streaming URLs are credentials; reqwest errors would print them.
     let resp = req.body(encoded).send().await.map_err(|e| e.without_url())?;
@@ -1289,12 +1258,11 @@ async fn sabr_request_cycle(
 /// closes naturally.
 ///
 /// Requests go through `credential_client()` so that redirects cannot carry
-/// cookies or tokens off Google hosts.
+/// the ctt or tokens off Google hosts.
 pub async fn stream_audio(
     video_id: &str,
     ctt: Option<&str>,
-    yt_cookies: Option<&crate::cookies::YtCookies>,
-    yt_session: Option<&crate::cookies::YtMusicSession>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
@@ -1302,11 +1270,11 @@ pub async fn stream_audio(
     let client = credential_client();
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
-    let result = get_player_data(client, video_id, ctt, yt_cookies, yt_session).await?;
+    let result = get_player_data(client, video_id, ctt, yt_session).await?;
     let player = result.player;
     let client_config = result.client_config;
     // get_player_data already handled PoToken selection per attempt:
-    // - Attempt 1 (cookies): no PoToken
+    // - Attempt 1 (WEB_REMIX + ctt): no PoToken
     // - Attempt 2 (bgutil-pot): session-bound PoToken for SABR
     // - Attempt 3/fallback: no PoToken
     let gvs_po_token = result.gvs_token.map(|g| g.po_token);
@@ -1391,11 +1359,10 @@ pub async fn stream_audio(
     let ustreamer_config = player.ustreamer_config;
 
     let video_fmt_clone = video_fmt.clone();
-    let cookie_header = yt_cookies.map(|c| c.cookie_header.clone());
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, gvs_po_token, cookie_header, &tx,
+            ustreamer_config, client_config, gvs_po_token, &tx,
         ).await;
 
         match result {
@@ -1421,13 +1388,11 @@ async fn sabr_loop(
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
     po_token: Option<String>,
-    cookie_header: Option<String>,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
-    state.cookie_header = cookie_header;
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
     // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
@@ -1565,7 +1530,6 @@ mod tests {
     }
 
     const GOOD_URL: &str = "https://rr1---sn-abc.googlevideo.com/videoplayback?a=1";
-    const SECRET_COOKIE: &str = "SAPISID=secret-cookie-value";
     const SECRET_POTOKEN: &[u8] = b"secret-potoken-bytes";
 
     #[derive(Clone, Default)]
@@ -1710,7 +1674,6 @@ mod tests {
         let reached = spawn_recorder(listener);
 
         let mut state = test_state(&format!("http://{addr}/videoplayback"));
-        state.cookie_header = Some(SECRET_COOKIE.to_owned());
         state.po_token = Some(SECRET_POTOKEN.to_vec());
         let (tx, _rx) = mpsc::channel(1);
 
@@ -1721,7 +1684,6 @@ mod tests {
         assert!(result.is_err());
         let logs = logs.text();
         assert!(logs.contains("refusing untrusted streaming host 127.0.0.1"), "{logs}");
-        assert!(!logs.contains("secret-cookie-value"), "{logs}");
         assert!(!logs.contains("secret-potoken-bytes"), "{logs}");
     }
 
@@ -1787,7 +1749,6 @@ mod tests {
 
         let send = credential_client()
             .post(format!("http://{origin_addr}/videoplayback"))
-            .header("Cookie", SECRET_COOKIE)
             .body("secret-body")
             .send();
         let resp = within_2s("credential_client POST", send).await.unwrap();
@@ -1798,7 +1759,7 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
         let logs = logs.text();
         assert!(logs.contains("not following redirect to 127.0.0.1"), "{logs}");
-        assert!(!logs.contains("secret-cookie-value"), "{logs}");
+        assert!(!logs.contains("secret-body"), "{logs}");
     }
 
     // -- secret-free logs ------------------------------------------------------
@@ -1850,5 +1811,61 @@ mod tests {
         for pattern in forbidden {
             assert!(!src.contains(pattern), "log format still leaks: {pattern}");
         }
+    }
+
+    // -- stored-credential-free /player requests --------------------------------
+
+    fn body_json(req: &reqwest::Request) -> serde_json::Value {
+        serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn web_remix_player_body_carries_ctt_without_stored_credentials() {
+        let session = crate::music_session::test_fixtures::session();
+
+        let req = player_request(
+            credential_client(), "dQw4w9WgXcQ", &WEB_REMIX_CLIENT,
+            Some("cast-token"), None, None, Some(&session),
+        )
+        .unwrap();
+
+        assert!(is_trusted_google_host(req.url().as_str()));
+        assert_eq!(req.url().host_str(), Some("music.youtube.com"));
+        let body = body_json(&req);
+        assert_eq!(
+            body["context"]["user"]["credentialTransferTokens"],
+            serde_json::json!([{ "scope": "VIDEO", "token": "cast-token" }])
+        );
+        assert_eq!(body["context"]["client"]["clientVersion"], "1.20261102.01.00");
+        assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20391);
+        assert_eq!(req.headers()["x-goog-visitor-id"], "CgtWSVNJVE9SLUlE");
+        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn fallback_clients_send_no_stored_credentials() {
+        for client in [&IOS_CLIENT, &ANDROID_CLIENT, &WEB_CLIENT] {
+            let req = player_request(
+                credential_client(), "dQw4w9WgXcQ", client, None, Some("visitor"), None, None,
+            )
+            .unwrap();
+            assert!(body_json(&req)["context"].get("user").is_none(), "{}", client.client_name);
+            assert!(req.headers().get(reqwest::header::COOKIE).is_none());
+            assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        }
+    }
+
+    #[test]
+    fn web_remix_needs_ctt_and_session() {
+        let session = crate::music_session::test_fixtures::session();
+        assert!(web_remix_session(Some("t"), Some(&session)).is_some());
+
+        let (logs, _guard) = capture_logs();
+        assert!(web_remix_session(Some("t"), None).is_none());
+        assert!(web_remix_session(None, Some(&session)).is_none());
+        let logs = logs.text();
+        assert!(logs.contains("no YouTube Music session"), "{logs}");
+        assert!(logs.contains("no ctt from the cast"), "{logs}");
     }
 }

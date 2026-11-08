@@ -17,15 +17,14 @@ pub async fn resolve_stream(
     video_id: &str,
     ctt: Option<&str>,
     _playlist_id: Option<&str>,
-    yt_cookies: Option<&crate::cookies::YtCookies>,
-    yt_session: Option<&crate::cookies::YtMusicSession>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<Option<StreamInfo>> {
     let stream_url = format!("http://localhost:8008/stream/{}", video_id);
 
-    // When ctt or session is available, use WEB_REMIX (YouTube Music web client).
-    // WEB_REMIX is the only client that accepts credentialTransferTokens from cast sessions.
-    let (title, duration) = if ctt.is_some() || yt_session.is_some() {
-        match web_remix_player(client, video_id, ctt, yt_cookies, yt_session).await {
+    // WEB_REMIX is the only client that accepts the cast's credential
+    // transfer token; without one there is nothing to authenticate with.
+    let (title, duration) = if ctt.is_some() {
+        match web_remix_player(client, video_id, ctt, yt_session).await {
             Ok(td) => td,
             Err(e) => {
                 tracing::warn!("[innertube] WEB_REMIX failed: {}, trying IOS", e);
@@ -50,27 +49,33 @@ pub async fn resolve_stream(
     }))
 }
 
+const WEB_REMIX_FALLBACK_VERSION: &str = "1.20260114.03.00";
+
 async fn web_remix_player(
     client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
-    yt_cookies: Option<&crate::cookies::YtCookies>,
-    yt_session: Option<&crate::cookies::YtMusicSession>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<(String, u64)> {
-    // Build context: use full INNERTUBE_CONTEXT from session if available
+    let req = web_remix_request(client, video_id, ctt, yt_session)?;
+    let resp = client.execute(req).await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("/player HTTP {}", resp.status()).into());
+    }
+
+    parse_player_response(video_id, resp).await
+}
+
+/// WEB_REMIX /player request. The only authentication is the cast's ctt in
+/// `context.user`; the session supplies the anonymous page context.
+fn web_remix_request(
+    client: &reqwest::Client,
+    video_id: &str,
+    ctt: Option<&str>,
+    yt_session: Option<&crate::music_session::YtMusicSession>,
+) -> Result<reqwest::Request> {
     let body = if let Some(session) = yt_session {
-        let mut ctx = session.innertube_context.clone();
-        if let Some(token) = ctt {
-            if let Some(user) = ctx.get_mut("user").and_then(|u| u.as_object_mut()) {
-                user.insert(
-                    "credentialTransferTokens".to_owned(),
-                    serde_json::json!([{
-                        "scope": "VIDEO",
-                        "token": token,
-                    }]),
-                );
-            }
-        }
         let mut playback_ctx = serde_json::json!({
             "contentPlaybackContext": {
                 "html5Preference": "HTML5_PREF_WANTS",
@@ -81,7 +86,7 @@ async fn web_remix_player(
         }
         serde_json::json!({
             "videoId": video_id,
-            "context": ctx,
+            "context": session.player_context(ctt),
             "contentCheckOk": true,
             "racyCheckOk": true,
             "playbackContext": playback_ctx,
@@ -91,7 +96,7 @@ async fn web_remix_player(
         let mut context = serde_json::json!({
             "client": {
                 "clientName": "WEB_REMIX",
-                "clientVersion": "1.20260114.03.00",
+                "clientVersion": WEB_REMIX_FALLBACK_VERSION,
                 "hl": "en",
                 "gl": "US",
             }
@@ -112,15 +117,8 @@ async fn web_remix_player(
         })
     };
 
-    // Authenticated requests don't need API key (matches yt-dlp)
-    let url = if yt_cookies.is_some() {
-        "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
-    } else {
-        "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
-    };
-
     let mut req = client
-        .post(url)
+        .post("https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false")
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
         .header("Content-Type", "application/json")
         .header("Origin", "https://music.youtube.com")
@@ -128,53 +126,15 @@ async fn web_remix_player(
         .header("X-YouTube-Client-Name", "67")
         .header("X-YouTube-Client-Version",
             yt_session
-                .and_then(|s| s.innertube_context.get("client")
-                    .and_then(|c| c.get("clientVersion"))
-                    .and_then(|v| v.as_str()))
-                .unwrap_or("1.20260114.03.00")
+                .and_then(|s| s.client_version())
+                .unwrap_or(WEB_REMIX_FALLBACK_VERSION)
         );
 
-    // Visitor data from session
-    if let Some(session) = yt_session {
-        if let Some(vd) = session.innertube_context.get("client")
-            .and_then(|c| c.get("visitorData"))
-            .and_then(|v| v.as_str())
-        {
-            req = req.header("X-Goog-Visitor-Id", vd);
-        }
+    if let Some(vd) = yt_session.and_then(|s| s.visitor_data()) {
+        req = req.header("X-Goog-Visitor-Id", vd);
     }
 
-    // Auth: cookie-based triple SAPISIDHASH
-    if let Some(c) = yt_cookies {
-        let user_sid = yt_session.and_then(|s| s.user_session_id.as_deref());
-        req = req
-            .header("Cookie", &c.cookie_header)
-            .header(
-                "Authorization",
-                crate::cookies::full_sapisidhash(c, "https://music.youtube.com", user_sid),
-            )
-            .header("X-Origin", "https://music.youtube.com");
-
-        if let Some(session) = yt_session {
-            if let Some(ref idx) = session.session_index {
-                req = req.header("X-Goog-Authuser", idx.as_str());
-            }
-            if let Some(ref uid) = session.user_session_id {
-                req = req.header("X-Goog-Pageid", uid.as_str());
-            }
-            if session.logged_in {
-                req = req.header("X-Youtube-Bootstrap-Logged-In", "true");
-            }
-        }
-    }
-
-    let resp = req.json(&body).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("/player HTTP {}", resp.status()).into());
-    }
-
-    parse_player_response(video_id, resp).await
+    Ok(req.json(&body).build()?)
 }
 
 async fn ios_player(
@@ -238,4 +198,42 @@ async fn parse_player_response(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     Ok((title, duration))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_json(req: &reqwest::Request) -> serde_json::Value {
+        serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn web_remix_request_carries_ctt_and_no_stored_credentials() {
+        let session = crate::music_session::test_fixtures::session();
+        let client = reqwest::Client::new();
+
+        let req = web_remix_request(&client, "dQw4w9WgXcQ", Some("cast-token"), Some(&session)).unwrap();
+
+        let body = body_json(&req);
+        assert_eq!(
+            body["context"]["user"]["credentialTransferTokens"],
+            serde_json::json!([{ "scope": "VIDEO", "token": "cast-token" }])
+        );
+        assert_eq!(body["context"]["client"]["visitorData"], "CgtWSVNJVE9SLUlE");
+        assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20391);
+        assert_eq!(req.headers()["x-youtube-client-version"], "1.20261102.01.00");
+        assert_eq!(req.headers()["x-goog-visitor-id"], "CgtWSVNJVE9SLUlE");
+        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn web_remix_request_without_session_still_carries_ctt() {
+        let client = reqwest::Client::new();
+        let req = web_remix_request(&client, "dQw4w9WgXcQ", Some("cast-token"), None).unwrap();
+        assert_eq!(body_json(&req)["context"]["user"]["credentialTransferTokens"][0]["token"], "cast-token");
+        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
 }
