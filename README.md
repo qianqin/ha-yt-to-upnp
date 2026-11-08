@@ -139,10 +139,10 @@ Before a release, run `scripts/release-check.sh`; see [docs/DEVOPS.md](docs/DEVO
 | `music_session.rs` | ~620 | Anonymous YouTube Music session at startup: fetches the public music.youtube.com page for ytcfg context, visitor data, STS and the base.js player for nsig |
 | `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
 | `nsig.rs` | ~550 | n-parameter challenge decoder using the vendored yt-dlp/ejs solver (`src/vendor/`) in QuickJS |
-| `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
+| `mpd.rs` | ~810 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
-| `dial.rs` | ~680 | DIAL HTTP server on port 8008 + `/stream/:videoId` and `/silence` endpoints (loopback peers only) |
-| `preroll.rs` | ~300 | Silence pre-roll from DIAL launch to the first song |
+| `dial.rs` | ~770 | DIAL HTTP server on port 8008 + `/stream/:videoId` and `/silence` endpoints (loopback peers only) |
+| `preroll.rs` | ~420 | Silence pre-roll from DIAL launch to the first song |
 | `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
 | `storage.rs` | ~350 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
 | `sabr/stream.rs` | ~2000 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |

@@ -1495,22 +1495,23 @@ mod preroll_wiring_tests {
         server.await.unwrap()
     }
 
+    /// The whole script a pre-roll start would run. Refusal cases use it
+    /// too, so a wrong start is recorded instead of hitting a silent server.
+    fn start_script(status: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![("status", status), ("clear", "OK\n"), ("addid", "Id: 5\nOK\n"), ("play", "OK\n")]
+    }
+
     #[tokio::test]
     async fn launch_starts_the_silence_only_on_an_idle_player() {
         // A song between two tracks (stopped, but started) is not idle.
         let mut preroll = preroll::PreRoll::default();
-        assert_eq!(start(&mut preroll, true, vec![("status", STATUS_STOP)]).await, vec!["status"]);
+        assert_eq!(start(&mut preroll, true, start_script(STATUS_STOP)).await, vec!["status"]);
         assert!(!preroll.is_active());
 
-        assert_eq!(start(&mut preroll, false, vec![("status", STATUS_PLAY)]).await, vec!["status"]);
+        assert_eq!(start(&mut preroll, false, start_script(STATUS_PLAY)).await, vec!["status"]);
         assert!(!preroll.is_active());
 
-        let seen = start(
-            &mut preroll,
-            false,
-            vec![("status", STATUS_STOP), ("clear", "OK\n"), ("addid", "Id: 5\nOK\n"), ("play", "OK\n")],
-        )
-        .await;
+        let seen = start(&mut preroll, false, start_script(STATUS_STOP)).await;
         assert_eq!(seen, vec!["status", "clear", "addid \"http://localhost:8008/silence\"", "play"]);
         assert!(preroll.is_active());
     }
@@ -1538,7 +1539,7 @@ mod preroll_wiring_tests {
         assert!(!idle_plan(mpd_stopped, play_started, playlist.preroll.is_active()).check_song_end);
 
         // A further launch within the cooldown gets no silence.
-        assert_eq!(start(&mut playlist.preroll, false, vec![("status", STATUS_STOP)]).await, vec!["status"]);
+        assert_eq!(start(&mut playlist.preroll, false, start_script(STATUS_STOP)).await, vec!["status"]);
         assert!(!playlist.preroll.is_active());
     }
 }
