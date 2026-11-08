@@ -288,7 +288,7 @@ def _fetch(method, url, deadline_s, body=None, headers=None):
         parts = urlsplit(url)
         if parts.scheme != "http" or not parts.hostname:
             raise RaumfeldError("refusing non-http URL %r" % url)
-        status, location, data = _exchange(method, parts, body, headers or {}, deadline, url)
+        status, location, data = _exchange(method, url, body, headers or {}, deadline)
         if status in _REDIRECTS and method == "GET" and location:
             url = check_device_url(urljoin(url, location), host)
             continue
@@ -298,7 +298,8 @@ def _fetch(method, url, deadline_s, body=None, headers=None):
     raise RaumfeldError("too many redirects from %r" % url)
 
 
-def _exchange(method, parts, body, headers, deadline, url):
+def _exchange(method, url, body, headers, deadline):
+    parts = urlsplit(url)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise RaumfeldError("%r: request deadline exceeded" % url)
@@ -321,6 +322,7 @@ def _exchange(method, parts, body, headers, deadline, url):
     timer = threading.Timer(remaining, expire)
     timer.daemon = True
     timer.start()
+    resp = None
     try:
         conn.connect()
         sockets.append(conn.sock)
@@ -346,6 +348,8 @@ def _exchange(method, parts, body, headers, deadline, url):
         raise
     finally:
         timer.cancel()
+        if resp is not None:
+            resp.close()  # with Connection: close the response owns the socket
         conn.close()
 
 

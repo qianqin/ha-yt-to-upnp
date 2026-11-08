@@ -122,7 +122,7 @@ class HttpLimitsTest(unittest.TestCase):
         def trickle(conn):
             conn.recv(4096)
             conn.sendall(self.HEAD)
-            while True:
+            for _ in range(120):  # ~6 s, so a broken deadline fails the timing check, not CI
                 conn.sendall(b"a")
                 time.sleep(0.05)
 
@@ -145,6 +145,35 @@ class HttpLimitsTest(unittest.TestCase):
         with self.assertRaises(ra.RaumfeldError):
             ra.http_get("http://127.0.0.1:%d/x" % port, deadline_s=0.5)
         self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_redirect_loop_stops_after_max_redirects(self):
+        requests = []
+
+        def loop(conn):
+            requests.append(conn.recv(4096))
+            conn.sendall(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\n"
+                         b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+        port = raw_server(self, loop)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ra.RaumfeldError, "too many redirects"):
+            ra.http_get("http://127.0.0.1:%d/x" % port)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(requests), ra.MAX_REDIRECTS + 1)
+
+    def test_post_redirect_is_not_followed(self):
+        requests = []
+
+        def redirect(conn):
+            requests.append(conn.recv(65536))
+            conn.sendall(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\n"
+                         b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+        port = raw_server(self, redirect)
+        with self.assertRaisesRegex(ra.RaumfeldError, "HTTP 307"):
+            ra.soap_call("http://127.0.0.1:%d/ctrl" % port, "Stop", [])
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(requests[0].startswith(b"POST /ctrl "))
 
     def test_non_http_scheme_is_refused(self):
         with self.assertRaises(ra.RaumfeldError):
