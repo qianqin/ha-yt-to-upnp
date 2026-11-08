@@ -7,6 +7,7 @@ import unittest
 
 import raumfeld_adapter as ra
 from fakes import SPEAKER_UDN, FakeMpd
+from test_logic import FakeClock, RecordingController
 
 
 class MpdClientTest(unittest.TestCase):
@@ -30,6 +31,15 @@ class MpdClientTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(client.state(), "pause")
         self.assertEqual(mpd.commands, ["idle player", "noidle", "status"])
+
+    def test_non_positive_idle_timeout_is_rejected(self):
+        mpd = FakeMpd([["stop"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        with self.assertRaises(ValueError):
+            client.wait_player(0.0)
+        self.assertEqual(client.state(), "stop")
 
     def test_server_gone_raises_connection_error(self):
         mpd = FakeMpd([["play"]], close_after=True)
@@ -85,8 +95,63 @@ class RunLoopTest(unittest.TestCase):
             ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
                    sleep=sleeps.append, should_stop=follower.done)
         self.assertEqual(follower.states, ["stop", "play", "pause"])
-        self.assertEqual(follower.ticks, 1)
+        self.assertEqual(follower.ticks, 3)  # after each connect and each wake-up
         self.assertEqual(sleeps, [1])
+
+    def test_backoff_resets_after_successful_reconnect(self):
+        mpd = FakeMpd([["stop"], ["stop"], ["stop"]], close_after=True)
+        self.addCleanup(mpd.close)
+        follower = RecordingFollower(stop_after=3)
+        sleeps = []
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
+                   sleep=sleeps.append, should_stop=follower.done)
+        self.assertEqual(sleeps, [1, 1])
+
+    def test_deadline_passed_during_disconnect_releases_without_reconnect_loop(self):
+        clock = FakeClock()
+        ctl = RecordingController()
+        follower = ra.Follower(ctl, idle_seconds=300, clock=clock)
+        # Connection 1 reports stop then drops; connection 2 stays open in idle.
+        mpd = FakeMpd([["stop"], ["stop"]], close_after=False)
+        mpd.close_first = True
+        self.addCleanup(mpd.close)
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.now += 400  # the outage outlasts the idle timeout
+
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleep,
+                   should_stop=lambda: bool(ctl.calls) or len(sleeps) > 3)
+        self.assertEqual(ctl.calls, ["release"])
+        self.assertEqual(sleeps, [1])
+
+    def test_past_deadline_wait_is_clamped_positive(self):
+        clock = FakeClock()
+        ctl = RecordingController()
+        ctl.fail = OSError("speaker unreachable")
+        follower = ra.Follower(ctl, idle_seconds=300, clock=clock)
+        mpd = FakeMpd([["stop"]])
+        self.addCleanup(mpd.close)
+        follower.on_mpd_state("stop")
+        clock.now += 1000  # deadline already passed before MPD is even reached
+        ticks = []
+        real_tick = follower.tick
+
+        def tick():
+            ticks.append(1)
+            real_tick()  # release fails and re-arms ...
+            clock.now += 1000  # ... but the next deadline is already passed again
+
+        follower.tick = tick
+        sleeps = []
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=sleeps.append,
+                   should_stop=lambda: len(ticks) >= 3 or bool(sleeps))
+        self.assertEqual(sleeps, [])
+        self.assertEqual(mpd.commands.count("noidle"), 2)
 
     def test_unreachable_mpd_backs_off_exponentially(self):
         s = socket.socket()

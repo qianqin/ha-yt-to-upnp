@@ -83,6 +83,7 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(d(self.s("TRANSITIONING", STREAM_URL), STREAM_URL), ra.ALREADY_PLAYING)
         self.assertEqual(d(self.s("STOPPED", STREAM_URL), STREAM_URL), ra.TAKE_OVER)
         self.assertEqual(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL), ra.LINE_IN_ACTIVE)
+        self.assertEqual(d(self.s("TRANSITIONING", LINE_IN_URI), STREAM_URL), ra.LINE_IN_ACTIVE)
         self.assertEqual(d(self.s("STOPPED", LINE_IN_URI), STREAM_URL), ra.TAKE_OVER)
         self.assertEqual(d(self.s("PLAYING", "http://other.invalid/x"), STREAM_URL), ra.TAKE_OVER)
 
@@ -91,8 +92,11 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(d(None, STREAM_URL))
         self.assertTrue(d(self.s("PLAYING", STREAM_URL), STREAM_URL))
         self.assertTrue(d(self.s("TRANSITIONING", STREAM_URL), STREAM_URL))
-        self.assertFalse(d(self.s("STOPPED", STREAM_URL), STREAM_URL))
+        # A paused MPD stalls the stream; the renderer then often sits STOPPED/PAUSED on our URI.
+        self.assertTrue(d(self.s("STOPPED", STREAM_URL), STREAM_URL))
+        self.assertTrue(d(self.s("PAUSED_PLAYBACK", STREAM_URL), STREAM_URL))
         self.assertFalse(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL))
+        self.assertFalse(d(self.s("STOPPED", "http://other.invalid/x"), STREAM_URL))
 
 
 class MetadataTest(unittest.TestCase):
@@ -183,6 +187,27 @@ class FollowerTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             self.f.on_mpd_state("play")
         self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+
+    def test_failed_play_is_retried_from_tick_while_mpd_still_plays(self):
+        self.ctl.fail = OSError("speaker unreachable")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("play")
+        self.assertEqual(self.f.seconds_until_deadline(), ra.PLAY_RETRY_S)
+        self.clock.now += ra.PLAY_RETRY_S - 1
+        self.f.tick()
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.ctl.fail = None
+        self.clock.now += 1
+        self.f.tick()
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+        self.assertIsNone(self.f.seconds_until_deadline())
+
+    def test_play_retry_is_dropped_when_mpd_stops(self):
+        self.ctl.fail = OSError("speaker unreachable")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("play")
+        self.f.on_mpd_state("stop")
+        self.assertEqual(self.f.seconds_until_deadline(), 300)
 
     def test_failed_release_is_retried_after_another_idle_period(self):
         self.f.on_mpd_state("stop")

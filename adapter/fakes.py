@@ -224,6 +224,8 @@ class FakeMpd:
     def __init__(self, scripts, close_after=False):
         self.scripts = list(scripts)
         self.close_after = close_after
+        self.close_first = False  # drop the first connection at its first `idle player`
+        self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -244,9 +246,12 @@ class FakeMpd:
             except OSError:
                 return
             script = self.scripts.pop(0) if self.scripts else ["stop"]
-            threading.Thread(target=self._session, args=(conn, list(script)), daemon=True).start()
+            self.connections += 1
+            close = self.close_after or (self.close_first and self.connections == 1)
+            threading.Thread(target=self._session, args=(conn, list(script), close),
+                             daemon=True).start()
 
-    def _session(self, conn, states):
+    def _session(self, conn, states, close_after):
         f = conn.makefile("rwb", buffering=0)
         try:
             f.write(b"OK MPD 0.23.5\n")
@@ -264,7 +269,7 @@ class FakeMpd:
                     if states:
                         state = states.pop(0)
                         f.write(b"changed: player\nOK\n")
-                    elif self.close_after:
+                    elif close_after:
                         return
                     else:
                         idling = True

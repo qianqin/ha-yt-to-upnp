@@ -117,24 +117,23 @@ def is_line_in(uri):
     return "Line In" in unquote(unquote(uri))
 
 
-def _plays_stream(status, stream_url):
-    return status is not None and status.transport_state in _PLAYING_STATES \
-        and status.current_uri == stream_url
-
-
 def decide_play(status, stream_url):
     """MPD started playing. `status` is None when the room is not active or has no zone."""
-    if _plays_stream(status, stream_url):
+    if status is None or status.transport_state not in _PLAYING_STATES:
+        return TAKE_OVER
+    if status.current_uri == stream_url:
         return ALREADY_PLAYING
     # The line-in is used by another player (e.g. a Chromecast Audio); never fight it.
-    if status is not None and status.transport_state == "PLAYING" and is_line_in(status.current_uri):
+    if is_line_in(status.current_uri):
         return LINE_IN_ACTIVE
     return TAKE_OVER
 
 
 def decide_release(status, stream_url):
-    """MPD has been idle long enough: only release the room if it still plays our stream."""
-    return _plays_stream(status, stream_url)
+    """MPD has been idle long enough: release the room if our stream is still loaded.
+    The transport state doesn't matter: a paused MPD stalls the stream and the renderer
+    then often sits STOPPED or PAUSED on our URI."""
+    return status is not None and status.current_uri == stream_url
 
 
 def build_didl(stream_url, mime):
@@ -359,6 +358,8 @@ class MpdClient:
 
     def wait_player(self, timeout):
         """Block until the player changes or `timeout` seconds pass (None = forever)."""
+        if timeout is not None and timeout <= 0:
+            raise ValueError("idle timeout must be positive or None, got %r" % timeout)
         self._send("idle player")
         self.sock.settimeout(timeout)
         try:
@@ -400,42 +401,53 @@ class MpdClient:
 _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
 
 
+# Delay before re-trying a failed takeover while MPD keeps playing.
+PLAY_RETRY_S = 30
+# Shortest idle wait: a zero timeout would turn the MPD socket non-blocking.
+MIN_WAIT_S = 0.1
+
+_PLAY = "ensure_playing"
+_RELEASE = "release"
+
+
 class Follower:
-    """Turns the MPD player state stream into Controller actions with an idle timer."""
+    """Turns the MPD player state stream into Controller actions. At most one action is
+    pending at a time: the idle release, or the retry of a failed takeover."""
 
     def __init__(self, controller, idle_seconds, clock=time.monotonic):
         self.controller = controller
         self.idle_seconds = idle_seconds
         self.clock = clock
+        self.pending = None
         self.deadline = None
 
     def on_mpd_state(self, state):
         if state == "play":
-            self.deadline = None
-            self._guard(self.controller.ensure_playing)
-        elif self.deadline is None:
-            self.deadline = self.clock() + self.idle_seconds
+            self._attempt(_PLAY)
+        elif self.pending != _RELEASE:
+            self._schedule(_RELEASE)
 
     def seconds_until_deadline(self):
-        if self.deadline is None:
+        if self.pending is None:
             return None
         return max(0.0, self.deadline - self.clock())
 
     def tick(self):
-        if self.deadline is None or self.clock() < self.deadline:
-            return
-        self.deadline = None
-        if not self._guard(self.controller.release):
-            # Don't leave the room on a dead stream forever: try again later.
-            self.deadline = self.clock() + self.idle_seconds
+        if self.pending is not None and self.clock() >= self.deadline:
+            self._attempt(self.pending)
 
-    def _guard(self, action):
+    def _attempt(self, action):
+        self.pending = None
         try:
-            action()
-            return True
+            getattr(self.controller, action)()
         except _ERRORS as e:
-            log.warning("%s failed: %s: %s", action.__name__, type(e).__name__, e)
-            return False
+            log.warning("%s failed: %s: %s", action, type(e).__name__, e)
+            # Don't give up: neither a missed takeover nor a room left on a dead stream.
+            self._schedule(action)
+
+    def _schedule(self, action):
+        self.pending = action
+        self.deadline = self.clock() + (PLAY_RETRY_S if action == _PLAY else self.idle_seconds)
 
 
 def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
@@ -451,8 +463,11 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
         backoff = 1
         try:
             follower.on_mpd_state(mpd.state())
+            # Tick right away too: a deadline may have passed while MPD was unreachable.
+            follower.tick()
             while not should_stop():
-                mpd.wait_player(follower.seconds_until_deadline())
+                wait = follower.seconds_until_deadline()
+                mpd.wait_player(None if wait is None else max(wait, MIN_WAIT_S))
                 follower.on_mpd_state(mpd.state())
                 follower.tick()
         except (OSError, MpdError) as e:

@@ -10,10 +10,13 @@ Raumfeld room play the receiver's MPD stream automatically.
 - If the zone already plays the stream, it does nothing. If the zone is playing
   the Raumfeld **line-in** (e.g. another cast device), it does not take over.
 - When MPD is stopped or paused for `IDLE_MINUTES`, it stops the zone and puts
-  the room into manual standby, but only if the zone still plays our stream.
+  the room into manual standby, but only if the zone still holds our stream
+  (playing, paused or stopped). Anything else, e.g. line-in, is left alone.
 - It never changes the volume and sends no RenderingControl requests at all.
-- Network and device errors are logged; the adapter retries on the next MPD
-  event and reconnects to MPD with backoff.
+- Network and device errors are logged, never fatal. A failed takeover is
+  retried on the next MPD event or after 30 seconds while MPD keeps playing; a
+  failed release is retried after another `IDLE_MINUTES`. Lost MPD connections
+  are re-established with backoff.
 
 ## Configuration (environment)
 

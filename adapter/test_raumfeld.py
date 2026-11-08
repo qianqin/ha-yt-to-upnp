@@ -97,6 +97,15 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.rf.api_calls(), ["getZones", "enterManualStandby"])
         self.assertEqual(self.rf.power, "MANUAL_STANDBY")
 
+    def test_release_stops_a_stopped_zone_still_holding_our_stream(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "STOPPED"
+        self.rf.current_uri = STREAM_URL
+        self.ctl.release()
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo", "Stop"])
+        self.assertEqual(self.rf.api_calls(), ["getZones", "enterManualStandby"])
+        self.assertEqual(self.rf.power, "MANUAL_STANDBY")
+
     def test_release_leaves_other_playback_alone(self):
         self.rf.power = "ACTIVE"
         self.rf.transport_state = "PLAYING"
