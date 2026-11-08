@@ -28,12 +28,12 @@ Raumfeld room play the receiver's MPD stream automatically.
 | --- | --- | --- |
 | `RAUMFELD_ROOM_UDN` | required | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
 | `RAUMFELD_SPEAKER_UDN` | required | UDN of the speaker device that hosts the Raumfeld API |
-| `STREAM_URL` | required | MPD httpd stream, e.g. `http://<receiver-host>:8000/stream.mp3` |
+| `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `IDLE_MINUTES` | `5` | How long MPD must be stopped/paused before the room is released |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
 Missing or invalid settings make the adapter exit with status 2 and a message
 naming the variable.

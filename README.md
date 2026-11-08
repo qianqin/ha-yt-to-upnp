@@ -20,8 +20,8 @@ ytcast-open (single Rust binary)
     | SABR protocol - YouTube's native streaming, built-in via sabr-rs
     v
 MPD (Music Player Daemon)
-    | ALSA output
-    v
+    | ALSA output                  (or: httpd output -> stream URL
+    v                               -> optional Raumfeld adapter -> Raumfeld speaker)
 speakers
 ```
 
@@ -70,7 +70,7 @@ The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions 
 - Network access to YouTube servers
 - **Optional: [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs)** for PoToken generation (prevents CDN throttle after 60s). Uses [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) internally. Runs as HTTP server on port 4416. ~66MB RAM due to embedded V8 JS engine for BotGuard challenges — can be hosted on a separate machine/VPS to save RAM on the Pi.
 
-No Node.js, no Python, no yt-dlp.
+No Node.js, no Python, no yt-dlp. (The optional [Raumfeld adapter](adapter/README.md) is a separate Python 3 sidecar.)
 
 ## Usage
 
@@ -91,6 +91,17 @@ export YTCAST_DATA_DIR=/data
 ```
 
 Open YouTube Music on your phone, tap Cast, and select your device.
+
+### Optional: play on a Teufel Raumfeld speaker
+
+Instead of a local sound card, MPD can serve the audio as an HTTP stream (`httpd` output) and the [Raumfeld adapter](adapter/README.md) - a small Python 3 sidecar, standard library only - makes a Raumfeld room play that stream automatically whenever MPD plays. It finds the speaker by UPnP UDN via SSDP, wakes the room, and after `IDLE_MINUTES` of stop/pause stops the zone and puts the room back into standby. It never changes the volume and does not take over an actively playing line-in. See [`adapter/mpd.conf.example`](adapter/mpd.conf.example) for the MPD side.
+
+```bash
+RAUMFELD_ROOM_UDN=uuid:00000000-0000-0000-0000-000000000001 \
+RAUMFELD_SPEAKER_UDN=uuid:00000000-0000-0000-0000-000000000002 \
+STREAM_URL=http://<receiver-host>:8000/stream.mp3 \
+python3 -m adapter
+```
 
 The receiver never logs in and stores no credentials of its own: authentication comes from the casting client, which sends a per-video credential transfer token (ctt) with each track. WEB_REMIX is used only when a cast supplies a ctt and the YouTube Music session loaded; otherwise the anonymous IOS client is used. At startup the public music.youtube.com page is fetched anonymously for the session context (visitor data, signature timestamp, nsig player); that one request carries a fixed consent cookie `SOCS=CAI` ("reject all") so EU visitors are not redirected to the consent page - it holds no account data and is not authentication. Requests carrying the ctt or the session fetch only follow redirects to Google hosts. Cookie files are no longer supported: `YTM_COOKIES` and `ytm-cookies.txt` are ignored, so delete any old `ytm-cookies.txt`.
 
@@ -131,6 +142,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `sabr/stream.rs` | ~1830 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
+| `adapter/raumfeld_adapter.py` | ~620 | Optional Python sidecar (not part of the binary): follows MPD and plays its httpd stream on a Raumfeld room via SSDP/UPnP AVTransport, standby after idle. See [adapter/README.md](adapter/README.md) |
 
 Single-threaded tokio runtime. Two MPD TCP connections (command + idle). One long-poll HTTP connection to YouTube Lounge API. SABR requests run per-track in a spawned task.
 
