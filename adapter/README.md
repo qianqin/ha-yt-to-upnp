@@ -13,6 +13,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   the room into manual standby, but only if the zone still holds our stream
   (playing, paused or stopped). Anything else, e.g. line-in, is left alone.
 - It never changes the volume and sends no RenderingControl requests at all.
+- Devices are untrusted: it only fetches plain `http://` URLs on the host that
+  answered SSDP (redirects included), caps replies at 256 KiB and 10 s, refuses
+  XML with DOCTYPE/ENTITY, and accepts only `uuid:<letters, digits, dashes>` UDNs.
 - Network and device errors are logged, never fatal. A failed takeover is
   retried on the next MPD event or after 30 seconds while MPD keeps playing; a
   failed release is retried after another `IDLE_MINUTES`. Lost MPD connections

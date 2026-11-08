@@ -1,6 +1,7 @@
 """Pure logic: config, line-in detection, decisions, DIDL/SOAP building, idle timer."""
 
 import io
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr
@@ -48,7 +49,11 @@ class ConfigTest(unittest.TestCase):
     def test_invalid_values(self):
         for key, value in [("MPD_PORT", "x"), ("MPD_PORT", "70000"), ("IDLE_MINUTES", "-1"),
                            ("IDLE_MINUTES", "soon"), ("STREAM_METADATA", "maybe"),
-                           ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD")]:
+                           ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
+                           ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
+                           ("RAUMFELD_SPEAKER_UDN", "speaker"),
+                           ("RAUMFELD_SPEAKER_UDN", "uuid:" + "a" * 65),
+                           ("RAUMFELD_ROOM_UDN", "uuid:abc\nST: ssdp:all")]:
             with self.subTest(key=key, value=value), self.assertRaises(ra.ConfigError):
                 ra.Config.from_env(dict(REQUIRED, **{key: value}))
 
@@ -97,6 +102,51 @@ class DecisionTest(unittest.TestCase):
         self.assertTrue(d(self.s("PAUSED_PLAYBACK", STREAM_URL), STREAM_URL))
         self.assertFalse(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL))
         self.assertFalse(d(self.s("STOPPED", "http://other.invalid/x"), STREAM_URL))
+
+
+ZONES = (b"<?xml version='1.0'?><zoneConfig><zones>"
+         b"<zone udn='uuid:00000000-0000-0000-0000-0000000000b1'>"
+         b"<room udn='uuid:00000000-0000-0000-0000-0000000000c1' powerState='ACTIVE'/></zone>"
+         b"<zone udn=\"uuid:00000000-0000-0000-0000-0000000000b2\">"
+         b"<room udn=\"%s\" powerState=\"MANUAL_STANDBY\"><renderer udn='x'/></room></zone>"
+         b"</zones></zoneConfig>" % ROOM_UDN.encode())
+
+
+class ParsingTest(unittest.TestCase):
+    def test_zone_and_power_of_room(self):
+        self.assertEqual(ra.zone_of_room(ZONES, ROOM_UDN), "uuid:00000000-0000-0000-0000-0000000000b2")
+        self.assertEqual(ra.room_power_state(ZONES, ROOM_UDN), "MANUAL_STANDBY")
+
+    def test_room_udn_prefix_does_not_match(self):
+        self.assertIsNone(ra.zone_of_room(ZONES, ROOM_UDN[:-1]))
+        self.assertIsNone(ra.room_power_state(ZONES, ROOM_UDN[:-1]))
+
+    def test_invalid_zone_udn_is_rejected(self):
+        bad = ZONES.replace(b"uuid:00000000-0000-0000-0000-0000000000b2", b"uuid:x\r\nST: ssdp:all")
+        with self.assertRaises(ra.RaumfeldError):
+            ra.zone_of_room(bad, ROOM_UDN)
+
+    def test_doctype_and_entities_are_refused(self):
+        for doc in (b"<!DOCTYPE z [<!ENTITY a 'b'>]><zoneConfig>&a;</zoneConfig>",
+                    b"<?xml version='1.0'?><!ENTITY a 'b'><zoneConfig/>"):
+            with self.subTest(doc=doc), self.assertRaises(ra.RaumfeldError):
+                ra.zone_of_room(doc, ROOM_UDN)
+        with self.assertRaises(ra.RaumfeldError):
+            ra.avtransport_control_url(b"<!DOCTYPE root><root/>", "http://127.0.0.1/d.xml")
+
+    def test_unclosed_tags_fail_fast(self):
+        started = time.monotonic()
+        with self.assertRaises(ra.RaumfeldError):
+            ra.zone_of_room(b"<zoneConfig>" + b"<zone udn='uuid:a'" * 50000, ROOM_UDN)
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_device_url_check(self):
+        ok = "http://127.0.0.1:49152/desc.xml"
+        self.assertEqual(ra.check_device_url(ok, "127.0.0.1"), ok)
+        for url in ("file:///dev/zero", "ftp://127.0.0.1/x", "https://127.0.0.1/x",
+                    "http:///x", "http://127.0.0.2:49152/desc.xml", "http://evil.invalid/x"):
+            with self.subTest(url=url), self.assertRaises(ra.RaumfeldError):
+                ra.check_device_url(url, "127.0.0.1")
 
 
 class MetadataTest(unittest.TestCase):

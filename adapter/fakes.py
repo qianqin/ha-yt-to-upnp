@@ -39,6 +39,8 @@ class FakeRaumfeld:
         self.transport_state = "STOPPED"
         self.current_uri = ""
         self.fail_paths = set()  # substrings of paths that answer 500
+        self.control_url = "AVTransport/ctrl"  # as advertised in the device description
+        self.redirect_base = HOST_PREFIX  # where the API's 307 points
         self.lock = threading.Lock()
         self._pending_new_zone = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -96,8 +98,8 @@ class FakeRaumfeld:
             "<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1"
             "</serviceType><controlURL>/RenderingControl/ctrl</controlURL></service>"
             "<service><serviceType>%s</serviceType>"
-            "<controlURL>AVTransport/ctrl</controlURL></service>"
-            "</serviceList></device></root>" % (self.zone_udn, AVT_NS)
+            "<controlURL>%s</controlURL></service>"
+            "</serviceList></device></root>" % (self.zone_udn, AVT_NS, self.control_url)
         )
 
     def _api(self, name, query):
@@ -171,7 +173,7 @@ class FakeRaumfeld:
                         return self._send(200, fake.device_xml())
                     if not url.path.startswith(HOST_PREFIX):
                         # The real host redirects /<api> to /<uuid>/<api>.
-                        return self._send(307, "", [("Location", HOST_PREFIX + self.path)])
+                        return self._send(307, "", [("Location", fake.redirect_base + self.path)])
                     name = url.path.rsplit("/", 1)[-1]
                     return self._send(200, fake._api(name, parse_qs(url.query)))
 
@@ -202,6 +204,7 @@ class FakeDiscovery:
         self.raumfeld = raumfeld
         self.searches = []
         self.speaker_present = True
+        self.zone_location = None  # override the zone renderer's LOCATION
 
     def __call__(self, st):
         from raumfeld_adapter import DeviceNotFound
@@ -210,7 +213,7 @@ class FakeDiscovery:
         if st == SPEAKER_UDN and self.speaker_present:
             return "127.0.0.1", self.raumfeld.base + "/speaker.xml"
         if st == self.raumfeld.zone_udn:
-            return "127.0.0.1", self.raumfeld.base + "/zone.xml"
+            return "127.0.0.1", self.zone_location or self.raumfeld.base + "/zone.xml"
         raise DeviceNotFound(st)
 
 

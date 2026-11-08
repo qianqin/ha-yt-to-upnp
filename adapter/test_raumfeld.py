@@ -1,5 +1,6 @@
 """Feature: Raumfeld follows the cast -- Controller against a fake Raumfeld host."""
 
+import os
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -136,6 +137,28 @@ class ControllerTest(unittest.TestCase):
         self.rf.fail_paths.clear()
         self.ctl.ensure_playing()  # next attempt works
         self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_zone_location_must_be_http_on_the_ssdp_sender(self):
+        self.rf.power = "ACTIVE"
+        # A small local file and a refused port keep a regression from hanging the suite.
+        for location in ("file://" + os.path.abspath(__file__), "http://[::1]:%d/zone.xml" % self.rf.port):
+            self.discover.zone_location = location
+            with self.subTest(location=location), self.assertRaises(ra.RaumfeldError):
+                self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
+
+    def test_control_url_must_point_at_the_same_host(self):
+        self.rf.power = "ACTIVE"
+        self.rf.control_url = "http://[::1]:%d/AVTransport/ctrl" % self.rf.port
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
+
+    def test_api_redirect_to_another_host_is_refused(self):
+        self.rf.redirect_base = "http://[::1]:%d%s" % (self.rf.port, "/x")
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.ensure_playing()
+        self.assertEqual(len(self.rf.requests), 1)
 
     def test_rediscovers_on_every_action(self):
         self.ctl.ensure_playing()

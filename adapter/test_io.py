@@ -1,5 +1,6 @@
 """I/O edges: MPD client and main loop against a fake MPD server, SSDP against a local responder."""
 
+import os
 import socket
 import threading
 import time
@@ -63,6 +64,77 @@ class MpdClientTest(unittest.TestCase):
         threading.Thread(target=answer, daemon=True).start()
         with self.assertRaises(ra.MpdError):
             ra.MpdClient("127.0.0.1", srv.getsockname()[1])
+
+
+def raw_server(test, handler):
+    """One-shot TCP server on 127.0.0.1 running handler(conn) for each connection."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    test.addCleanup(srv.close)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=_handle, args=(conn,), daemon=True).start()
+
+    def _handle(conn):
+        try:
+            handler(conn)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+class MpdLimitsTest(unittest.TestCase):
+    def test_overlong_line_is_rejected(self):
+        port = raw_server(self, lambda conn: conn.sendall(b"OK MPD " + b"x" * 70000))
+        with self.assertRaises(ra.MpdError):
+            ra.MpdClient("127.0.0.1", port)
+
+
+class HttpLimitsTest(unittest.TestCase):
+    HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nConnection: close\r\n\r\n"
+
+    def test_small_body_is_returned(self):
+        port = raw_server(self, lambda conn: (conn.recv(4096), conn.sendall(self.HEAD + b"<a/>")))
+        self.assertEqual(ra.http_get("http://127.0.0.1:%d/x" % port), b"<a/>")
+
+    def test_endless_body_is_cut_at_max_body(self):
+        def endless(conn):
+            conn.recv(4096)
+            conn.sendall(self.HEAD)
+            for _ in range(64):  # 4 MiB: far past MAX_BODY, but bounded if the cap regresses
+                conn.sendall(b"a" * 65536)
+
+        port = raw_server(self, endless)
+        with self.assertRaises(ra.RaumfeldError):
+            ra.http_get("http://127.0.0.1:%d/x" % port)
+
+    def test_slow_body_hits_total_deadline(self):
+        def trickle(conn):
+            conn.recv(4096)
+            conn.sendall(self.HEAD)
+            while True:
+                conn.sendall(b"a")
+                time.sleep(0.05)
+
+        port = raw_server(self, trickle)
+        started = time.monotonic()
+        with self.assertRaises(ra.RaumfeldError):
+            ra.http_get("http://127.0.0.1:%d/x" % port, deadline_s=0.5)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_non_http_scheme_is_refused(self):
+        with self.assertRaises(ra.RaumfeldError):
+            ra.http_get("file://" + os.path.abspath(__file__))
 
 
 class RecordingFollower:
@@ -214,11 +286,17 @@ class SsdpTest(unittest.TestCase):
         ra.ssdp_discover(SPEAKER_UDN, timeout=4, addr=addr)
         self.assertEqual(len(self.received), 2)
 
+    def test_accepts_bare_newline_replies(self):
+        reply = self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml").replace("\r\n", "\n")
+        addr = self.responder([reply])
+        self.assertEqual(ra.ssdp_discover(SPEAKER_UDN, timeout=3, addr=addr),
+                         ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
+
     def test_not_found_times_out(self):
         addr = self.responder([])
         started = time.monotonic()
         with self.assertRaises(ra.DeviceNotFound):
-            ra.ssdp_discover(SPEAKER_UDN, timeout=1.2, addr=addr)
+            ra.ssdp_discover(SPEAKER_UDN, timeout=1.5, addr=addr)
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(len(self.received), 2)
 

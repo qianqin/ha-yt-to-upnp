@@ -18,14 +18,17 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import namedtuple
 from html import escape as _escape
-from urllib.parse import quote, unquote, urljoin
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 log = logging.getLogger("raumfeld_adapter")
 
 SSDP_ADDR = ("239.255.255.250", 1900)
 RAUMFELD_API_PORT = 47365
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
-HTTP_TIMEOUT_S = 10
+HTTP_TIMEOUT_S = 10  # total wall-clock budget per HTTP request, not per read
+MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a few KiB
+MPD_MAX_LINE = 64 * 1024
+UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
 STREAM_TITLE = "YouTube Music cast"
 
 
@@ -39,7 +42,7 @@ class RaumfeldError(Exception):
 
 class DeviceNotFound(RaumfeldError):
     def __init__(self, udn):
-        super().__init__("no SSDP answer for %s" % udn)
+        super().__init__("no SSDP answer for %r" % udn)
 
 
 class MpdError(Exception):
@@ -85,6 +88,11 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
         log_level = env.get("LOG_LEVEL", "INFO").strip().upper()
         if log_level not in _LOG_LEVELS:
             raise ConfigError("LOG_LEVEL must be one of " + ", ".join(_LOG_LEVELS))
+
+        for key in ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN"):
+            if not UDN_RE.fullmatch(env[key].strip()):
+                raise ConfigError("%s must look like uuid:<letters, digits, dashes>, got %r"
+                                  % (key, env[key]))
 
         return cls(
             room_udn=env["RAUMFELD_ROOM_UDN"].strip(),
@@ -161,35 +169,53 @@ def soap_envelope(action, args):
     )
 
 
-_ZONE_RE = re.compile(r"<zone\s[^>]*?udn=(['\"])(.*?)\1[^>]*>(.*?)</zone>", re.S)
-_TAG_RE = re.compile(r"<[^>]*>")
-_ATTR_RE = r"\b%s=(['\"])(.*?)\1"
-
-
 def zone_of_room(zones_xml, room_udn):
-    for match in _ZONE_RE.finditer(zones_xml):
-        if room_udn in match.group(3):
-            return match.group(2)
+    """UDN of the zone that contains the room (getZones reply), or None."""
+    for zone in _elements(_parse_xml(zones_xml), "zone"):
+        if any(room.get("udn") == room_udn for room in _elements(zone, "room")):
+            udn = zone.get("udn", "")
+            # The zone UDN goes into an SSDP M-SEARCH; refuse anything that isn't a plain UDN.
+            if not UDN_RE.fullmatch(udn):
+                raise RaumfeldError("invalid zone UDN %r" % udn)
+            return udn
     return None
 
 
 def room_power_state(zones_xml, room_udn):
-    for tag in _TAG_RE.findall(zones_xml):
-        udn = re.search(_ATTR_RE % "udn", tag)
-        power = re.search(_ATTR_RE % "powerState", tag)
-        if udn and power and udn.group(2) == room_udn:
-            return power.group(2)
+    for room in _elements(_parse_xml(zones_xml), "room"):
+        if room.get("udn") == room_udn:
+            return room.get("powerState")
     return None
 
 
+def check_device_url(url, host):
+    """Only fetch plain http from the device that answered SSDP: no file://, no other hosts."""
+    parts = urlsplit(url)
+    if parts.scheme != "http" or not parts.hostname or parts.hostname != host:
+        raise RaumfeldError("refusing URL %r: must be http on %r" % (url, host))
+    return url
+
+
+def _parse_xml(data):
+    # Devices are untrusted: no DTDs, so no entity expansion tricks.
+    if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+        raise RaumfeldError("refusing XML with DOCTYPE/ENTITY")
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError as e:
+        raise RaumfeldError("malformed XML: %s" % e) from None
+
+
+def _elements(root, name):
+    return [el for el in root.iter() if _local(el.tag) == name]
+
+
 def avtransport_control_url(description_xml, location):
-    for el in ET.fromstring(description_xml).iter():
-        if _local(el.tag) != "service":
-            continue
+    for el in _elements(_parse_xml(description_xml), "service"):
         fields = {_local(child.tag): (child.text or "").strip() for child in el}
         if fields.get("serviceType") == AVTRANSPORT and fields.get("controlURL"):
             return urljoin(location, fields["controlURL"])
-    raise RaumfeldError("no AVTransport service in device description at " + location)
+    raise RaumfeldError("no AVTransport service in device description at %r" % location)
 
 
 def _local(tag):
@@ -228,17 +254,51 @@ def ssdp_discover(st, timeout=6.0, addr=SSDP_ADDR):
 
 def _parse_headers(text):
     headers = {}
-    for line in text.split("\r\n")[1:]:
+    for line in text.splitlines()[1:]:
         name, sep, value = line.partition(":")
         if sep:
             headers[name.strip().lower()] = value.strip()
     return headers
 
 
-def http_get(url):
-    # urllib follows the Raumfeld host's 307 to /<uuid>/<path> for GET.
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_S) as resp:
-        return resp.read().decode("utf-8", "replace")
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    # The Raumfeld host answers 307 to /<uuid>/<path>; follow that, but never off the host.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            check_device_url(newurl, urlsplit(req.full_url).hostname)
+        except RaumfeldError:
+            fp.close()
+            raise
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# http only, no proxies from the environment, no file:/ftp: handlers.
+_OPENER = urllib.request.OpenerDirector()
+for _handler in (urllib.request.HTTPHandler(), _SameHostRedirect(),
+                 urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
+    _OPENER.add_handler(_handler)
+
+
+def _fetch(request, deadline_s):
+    parts = urlsplit(request.full_url)
+    if parts.scheme != "http" or not parts.hostname:
+        raise RaumfeldError("refusing non-http URL %r" % request.full_url)
+    deadline = time.monotonic() + deadline_s
+    body = b""
+    with _OPENER.open(request, timeout=deadline_s) as resp:
+        while True:
+            if time.monotonic() > deadline:
+                raise RaumfeldError("%r took longer than %ss" % (request.full_url, deadline_s))
+            chunk = resp.read1(min(65536, MAX_BODY + 1 - len(body)))
+            if not chunk:
+                return body
+            body += chunk
+            if len(body) > MAX_BODY:
+                raise RaumfeldError("response from %r exceeds %d bytes" % (request.full_url, MAX_BODY))
+
+
+def http_get(url, deadline_s=HTTP_TIMEOUT_S):
+    return _fetch(urllib.request.Request(url), deadline_s)
 
 
 def soap_call(control_url, action, args):
@@ -249,8 +309,7 @@ def soap_call(control_url, action, args):
                  "SOAPACTION": '"%s#%s"' % (AVTRANSPORT, action)},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as resp:
-        root = ET.fromstring(resp.read())
+    root = _parse_xml(_fetch(request, HTTP_TIMEOUT_S))
     return {_local(el.tag): (el.text or "") for el in root.iter()}
 
 
@@ -275,10 +334,10 @@ class Controller:
         room = self._inspect()
         decision = decide_play(room.status, self.config.stream_url)
         if decision == ALREADY_PLAYING:
-            log.debug("zone %s already plays the stream", room.zone)
+            log.debug("zone %r already plays the stream", room.zone)
             return
         if decision == LINE_IN_ACTIVE:
-            log.info("zone %s is playing line-in; not taking over", room.zone)
+            log.info("zone %r is playing line-in; not taking over", room.zone)
             return
 
         room_param = quote(self.config.room_udn, safe="")
@@ -290,7 +349,7 @@ class Controller:
         soap_call(control, "SetAVTransportURI",
                   [("CurrentURI", self.config.stream_url), ("CurrentURIMetaData", metadata)])
         soap_call(control, "Play", [("Speed", "1")])
-        log.info("zone %s now plays %s", zone, self.config.stream_url)
+        log.info("zone %r now plays %s", zone, self.config.stream_url)
 
     def release(self):
         room = self._inspect()
@@ -299,7 +358,7 @@ class Controller:
             return
         soap_call(room.control, "Stop", [])
         http_get(room.api + "enterManualStandby?roomUDN=" + quote(self.config.room_udn, safe=""))
-        log.info("stopped zone %s and put the room into standby", room.zone)
+        log.info("stopped zone %r and put the room into standby", room.zone)
 
     def _inspect(self):
         host, _location = self.discover(self.config.speaker_udn)
@@ -326,8 +385,9 @@ class Controller:
         raise RaumfeldError("room did not appear in a zone after connectRoomToZone")
 
     def _control_url(self, zone):
-        _host, location = self.discover(zone)
-        return avtransport_control_url(http_get(location), location)
+        host, location = self.discover(zone)
+        check_device_url(location, host)
+        return check_device_url(avtransport_control_url(http_get(location), location), host)
 
 
 # --------------------------------------------------------------------------- MPD
@@ -387,6 +447,8 @@ class MpdClient:
     def _readline(self):
         # Own buffer instead of makefile(): a recv timeout must not lose buffered data.
         while b"\n" not in self.buf:
+            if len(self.buf) > MPD_MAX_LINE:
+                raise MpdError("MPD line longer than %d bytes" % MPD_MAX_LINE)
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise ConnectionError("MPD closed the connection")
