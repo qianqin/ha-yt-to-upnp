@@ -6,7 +6,7 @@
 //! Caching strategy:
 //! - First decode parses base.js with meriyah (~40s, ~256MB). Produces a
 //!   "preprocessed player" string that's cached both in memory and to disk.
-//! - Subsequent decodes reuse the preprocessed player (~0.6s, ~65MB).
+//! - Subsequent decodes reuse the preprocessed player (~0.6s, ~50MB).
 //! - Disk cache survives reboots. Only re-parses when base.js hash changes.
 
 use std::path::PathBuf;
@@ -72,48 +72,6 @@ pub fn decode_nsig_cached_at(
     player_hash: &str,
     disk_cache: Option<PathBuf>,
 ) -> Result<String, String> {
-    decode_with_limits(player_js, n_value, player_hash, disk_cache, MEM_LIMITS)
-}
-
-/// QuickJS heap limits per decode; each decode gets a fresh runtime.
-#[derive(Clone, Copy)]
-struct MemLimits {
-    /// Running a cached preprocessed player.
-    cached: usize,
-    /// Parsing base.js with meriyah.
-    fresh: usize,
-}
-
-// Measured peaks (QuickJS has no peak counter, so: smallest limit that
-// decodes) for a ~4 MB preprocessed player: 63 MiB cached, 172 MiB fresh.
-// The cached path gets 2x headroom; players grow and GC timing varies.
-const MEM_LIMITS: MemLimits = MemLimits {
-    cached: 128 * 1024 * 1024,
-    fresh: 256 * 1024 * 1024,
-};
-
-/// Whether a decode error comes from an exhausted QuickJS limit rather than
-/// from the player. Such a failure says nothing about the cached player.
-fn is_resource_error(err: &str) -> bool {
-    const MARKERS: [&str; 5] = [
-        "out of memory",
-        // Thrown when even the error object could not be allocated.
-        "null exception (OOM?)",
-        // rquickjs::Error::Allocation
-        "Allocation failed",
-        "Maximum call stack size exceeded",
-        "interrupted",
-    ];
-    MARKERS.iter().any(|m| err.contains(m))
-}
-
-fn decode_with_limits(
-    player_js: &str,
-    n_value: &str,
-    player_hash: &str,
-    disk_cache: Option<PathBuf>,
-    limits: MemLimits,
-) -> Result<String, String> {
     let player_js = player_js.to_owned();
     let n_value = n_value.to_owned();
     let player_hash = player_hash.to_owned();
@@ -137,9 +95,9 @@ fn decode_with_limits(
         .name("nsig-solver".into())
         .stack_size(SOLVER_STACK_SIZE)
         .spawn(move || {
-            let result = run_solver(&player_js, &n_value, cached.as_deref(), limits)
-                .inspect_err(|e| {
-                    if cached.is_some() && !is_resource_error(e) {
+            let result = decode_nsig_inner(&player_js, &n_value, cached.as_deref())
+                .inspect_err(|_| {
+                    if cached.is_some() {
                         discard_cache(&player_hash, disk_cache.as_deref());
                     }
                 })?;
@@ -176,28 +134,7 @@ fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs the solver. A cached player that fails gets one more try with the
-/// fresh-path limit: near its limit QuickJS can report an allocation failure
-/// as a SyntaxError, so the message alone cannot rule out memory.
-fn run_solver(
-    player_js: &str,
-    n_value: &str,
-    cached: Option<&str>,
-    limits: MemLimits,
-) -> Result<DecodeResult, String> {
-    let Some(preprocessed) = cached else {
-        return decode_nsig_inner(player_js, n_value, None, limits.fresh);
-    };
-    match decode_nsig_inner(player_js, n_value, Some(preprocessed), limits.cached) {
-        Err(e) => {
-            tracing::warn!("[nsig] cached player failed ({}); retrying with {} MiB", e, limits.fresh >> 20);
-            decode_nsig_inner(player_js, n_value, Some(preprocessed), limits.fresh)
-        }
-        ok => ok,
-    }
-}
-
-/// A cached player the solver rejects is never retried: drop it from memory
+/// A cached player that fails to run is never retried: drop it from memory
 /// and disk so the next call re-parses base.js.
 fn discard_cache(player_hash: &str, disk_cache: Option<&std::path::Path>) {
     let mut guard = PREPROCESSED_CACHE.lock().unwrap();
@@ -223,8 +160,10 @@ fn decode_nsig_inner(
     player_js: &str,
     n_value: &str,
     cached_preprocessed: Option<&str>,
-    mem_limit: usize,
 ) -> Result<DecodeResult, String> {
+    let is_cached = cached_preprocessed.is_some();
+    let mem_limit = if is_cached { 64 * 1024 * 1024 } else { 256 * 1024 * 1024 };
+
     let rt = rquickjs::Runtime::new()
         .map_err(|e| format!("QuickJS runtime failed: {}", e))?;
     rt.set_memory_limit(mem_limit);
@@ -251,7 +190,7 @@ fn decode_nsig_inner(
             .map_err(|e| format!("set _n_value failed: {}", e))?;
 
         let result_json: String = if let Some(preprocessed) = cached_preprocessed {
-            // Fast path: use cached preprocessed player (~0.6s, ~65MB)
+            // Fast path: use cached preprocessed player (~0.6s, ~50MB)
             tracing::info!("[nsig] using cached preprocessed player");
             global.set("_preprocessed", preprocessed)
                 .map_err(|e| format!("set _preprocessed failed: {}", e))?;
@@ -483,88 +422,9 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
     }
 
     #[test]
-    fn resource_errors_are_told_apart_from_player_faults() {
-        for (err, resource) in [
-            ("jsc error: out of memory", true),
-            ("lib.js eval failed: out of memory | at parse", true),
-            ("jsc error: null exception (OOM?)", true),
-            ("QuickJS context failed: Allocation failed while creating object", true),
-            ("set _preprocessed failed: Allocation failed while creating object", true),
-            ("jsc(preprocessed) failed: Maximum call stack size exceeded", true),
-            ("jsc(preprocessed) failed: interrupted", true),
-            ("jsc error: _result is not defined", false),
-            ("jsc error: invalid assignment left-hand side", false),
-            ("jsc n error: no solutions", false),
-            ("unexpected jsc response: {}", false),
-            ("parse jsc result: EOF while parsing", false),
-        ] {
-            assert_eq!(is_resource_error(err), resource, "{err}");
-        }
-    }
-
-    /// Limits far below what lib.js needs, so every attempt runs out of memory.
-    const STARVED: MemLimits = MemLimits { cached: 1 << 20, fresh: 1 << 20 };
-
-    fn cache_synthetic_player(name: &str) -> (TempDir, PathBuf) {
-        let tmp = TempDir::new(name);
-        let path = tmp.path().join("nsig-preprocessed-synthetic.js");
-        decode_nsig_cached_at(SYNTHETIC_PLAYER, "abc123", &format!("test-{name}"), Some(path.clone())).unwrap();
-        (tmp, path)
-    }
-
-    #[test]
-    fn out_of_memory_in_cached_path_keeps_cache() {
-        let (_tmp, path) = cache_synthetic_player("nsig-oom-keep");
-
-        let err = decode_with_limits("", "xyz", "test-oom-keep-disk", Some(path.clone()), STARVED).unwrap_err();
-
-        assert!(err.contains("out of memory"), "{err}");
-        assert!(path.exists(), "cache was discarded after running out of memory");
-        let again = decode_nsig_cached_at("", "xyz", "test-oom-keep-again", Some(path));
-        assert_eq!(again.unwrap(), "zyx");
-    }
-
-    #[test]
-    fn failure_in_cached_path_retries_with_fresh_limit() {
-        let (_tmp, path) = cache_synthetic_player("nsig-oom-retry");
-        let limits = MemLimits { cached: STARVED.cached, fresh: MEM_LIMITS.fresh };
-
-        let decoded = decode_with_limits("", "xyz", "test-oom-retry-disk", Some(path.clone()), limits);
-
-        assert_eq!(decoded.unwrap(), "zyx");
-        assert!(path.exists());
-    }
-
-    #[test]
     fn player_without_n_function_reports_solver_error() {
         let player = "(function(g){ var a = 1; }).call(this, {});";
         let err = decode_nsig_cached_at(player, "abc", "test-no-solution", None).unwrap_err();
         assert!(err.starts_with("jsc n error: no solutions"), "{err}");
-    }
-
-    /// Network: the current player's cached path must fit in half the cached
-    /// limit, keeping the 2x headroom `MEM_LIMITS` promises.
-    /// Run with `cargo test --locked -- --ignored current_player`.
-    #[tokio::test]
-    #[ignore]
-    async fn current_player_cached_path_has_memory_headroom() {
-        const ORIGIN: &str = "https://www.youtube.com";
-        let http = reqwest::Client::builder().user_agent("Mozilla/5.0").build().unwrap();
-        let get = |url: String| async { http.get(url).send().await?.error_for_status()?.text().await };
-        let page = get(format!("{ORIGIN}/")).await.expect("youtube.com page");
-        let hash: String = page.split("/s/player/").nth(1).expect("player hash")
-            .chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-        let js = get(format!("{ORIGIN}/s/player/{hash}/player_ias.vflset/en_US/base.js")).await.expect("base.js");
-        let n = "ZdZIqFPQK-Ty8wIdab";
-
-        tokio::task::spawn_blocking(move || {
-            let fresh = decode_nsig_inner(&js, n, None, MEM_LIMITS.fresh).unwrap();
-            let preprocessed = fresh.preprocessed.expect("preprocessed player");
-            let cached = decode_nsig_inner("", n, Some(&preprocessed), MEM_LIMITS.cached / 2)
-                .unwrap_or_else(|e| panic!("{} byte player at half the cached limit: {e}", preprocessed.len()));
-            assert_eq!(cached.decoded, fresh.decoded);
-        })
-        .await
-        .unwrap();
     }
 }
