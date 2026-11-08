@@ -128,18 +128,23 @@ class ParsingTest(unittest.TestCase):
 
     def test_doctype_and_entities_are_refused(self):
         for doc in (b"<!DOCTYPE z [<!ENTITY a 'b'>]><zoneConfig>&a;</zoneConfig>",
-                    b"<?xml version='1.0'?><!ENTITY a 'b'><zoneConfig/>"):
-            with self.subTest(doc=doc), self.assertRaises(ra.RaumfeldError):
+                    b"<!DOCTYPE zoneConfig><zoneConfig/>"):  # bare DOCTYPE, no entity
+            with self.subTest(doc=doc), self.assertRaisesRegex(ra.RaumfeldError, "DOCTYPE/ENTITY"):
                 ra.zone_of_room(doc, ROOM_UDN)
-        with self.assertRaises(ra.RaumfeldError):
+        with self.assertRaisesRegex(ra.RaumfeldError, "DOCTYPE/ENTITY"):
             ra.avtransport_control_url(b"<!DOCTYPE root><root/>", "http://127.0.0.1/d.xml")
+
+    def test_entity_outside_a_doctype_is_malformed(self):
+        with self.assertRaisesRegex(ra.RaumfeldError, "malformed XML"):
+            ra.zone_of_room(b"<?xml version='1.0'?><!ENTITY a 'b'><zoneConfig/>", ROOM_UDN)
 
     def test_doctype_in_utf16_is_refused(self):
         doc = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE z [<!ENTITY a "bbb">]>'
                '<zoneConfig><zones><zone udn="uuid:a"><room udn="%s"/>&a;</zone></zones>'
                '</zoneConfig>' % ROOM_UDN)
+        # UTF-16 always contains NUL bytes for ASCII markup, so the NUL check stops it first.
         for codec in ("utf-16", "utf-16-le"):
-            with self.subTest(codec=codec), self.assertRaises(ra.RaumfeldError):
+            with self.subTest(codec=codec), self.assertRaisesRegex(ra.RaumfeldError, "NUL bytes"):
                 ra.zone_of_room(doc.encode(codec), ROOM_UDN)
 
     def test_utf16_without_doctype_is_refused_by_the_nul_check(self):
@@ -150,7 +155,7 @@ class ParsingTest(unittest.TestCase):
 
     def test_doctype_is_refused_by_the_parser_not_a_byte_scan(self):
         # The parser, not a byte pattern, enforces the rule: a tab after DOCTYPE still counts.
-        with self.assertRaises(ra.RaumfeldError):
+        with self.assertRaisesRegex(ra.RaumfeldError, "DOCTYPE/ENTITY"):
             ra.zone_of_room(b"<?xml version='1.0'?>\n<!DOCTYPE\tz [<!ENTITY a 'b'>]><z>&a;</z>",
                             ROOM_UDN)
 
