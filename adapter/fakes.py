@@ -232,6 +232,7 @@ class FakeMpd:
         self.close_first = False  # drop the first connection at its first `idle player`
         self.message_subscribers = True
         self.stop_on_message = False  # a receiver that ends its session on `release`
+        self.drop_on_first_pause = False  # lose the connection on the first `pause 1`
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -240,11 +241,18 @@ class FakeMpd:
         self.sock.listen(5)
         self.port = self.sock.getsockname()[1]
         self._stop = False
+        self._conns = []
         threading.Thread(target=self._serve, daemon=True).start()
 
     def close(self):
+        """Also hangs up open sessions, so a client blocked in `idle` wakes up."""
         self._stop = True
         self.sock.close()
+        for conn in list(self._conns):
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _serve(self):
         while not self._stop:
@@ -254,6 +262,7 @@ class FakeMpd:
                 return
             script = self.scripts.pop(0) if self.scripts else ["stop"]
             self.connections += 1
+            self._conns.append(conn)
             close = self.close_after or (self.close_first and self.connections == 1)
             threading.Thread(target=self._session, args=(conn, list(script), close),
                              daemon=True).start()
@@ -273,6 +282,9 @@ class FakeMpd:
                 self.commands.append(cmd)
                 if cmd == "status":
                     f.write(("volume: -1\nrepeat: 0\nstate: %s\nOK\n" % state).encode())
+                elif cmd == "pause 1" and self.drop_on_first_pause:
+                    self.drop_on_first_pause = False
+                    return
                 elif cmd == "pause 1":
                     state, paused_by_client = "pause", True
                     f.write(b"OK\n")

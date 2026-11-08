@@ -35,6 +35,8 @@ MPD_MAX_LINE = 64 * 1024
 UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
 STREAM_TITLE = "YouTube Music cast"
 # MPD client-to-client channel the receiver subscribes to; "release" ends its cast session.
+# Fixed constants; should they ever become configurable, validate them against
+# _MPD_TOKEN in Config.from_env so a bad value fails at startup, not at the first yield.
 CAST_CHANNEL = "ytcast"
 CAST_RELEASE_MESSAGE = "release"
 
@@ -82,8 +84,9 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             poll_seconds = float(env.get("SPEAKER_POLL_SECONDS", "5"))
         except ValueError:
             raise ConfigError("SPEAKER_POLL_SECONDS must be a number") from None
-        if not (math.isfinite(poll_seconds) and poll_seconds > 0):
-            raise ConfigError("SPEAKER_POLL_SECONDS must be greater than 0")
+        # Below 1 s the adapter would hammer the speaker's API and SSDP.
+        if not (math.isfinite(poll_seconds) and poll_seconds >= 1):
+            raise ConfigError("SPEAKER_POLL_SECONDS must be at least 1")
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -423,7 +426,8 @@ class Controller:
             return decision
 
         room_param = quote(self.config.room_udn, safe="")
-        http_get(room.api + "leaveStandby?roomUDN=" + room_param)
+        if wake:
+            http_get(room.api + "leaveStandby?roomUDN=" + room_param)
         zone = room.zone or self._connect_zone(room.api, room_param)
         control = room.control or self._zone_control(zone, reuse=False)
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
@@ -632,7 +636,8 @@ class Follower:
                 if state == "play":
                     # A song change that raced our pause: keep the phone paused.
                     log.info("speaker was taken away; pausing MPD again")
-                    self._requests.append(PAUSE_PLAYER)
+                    if PAUSE_PLAYER not in self._requests:
+                        self._requests.append(PAUSE_PLAYER)
                 return
             # MPD left the pause on the user's behalf: resumed, or the session ended.
             self.yielded = False
@@ -640,8 +645,10 @@ class Follower:
             # Only a user resume may wake a zone we own; a song change must not.
             self.wake = previous == "pause" or not self.owned
             self._attempt(_PLAY)
-        elif state == "pause" and self.owned:
-            # The Raumfeld's auto power-off may end a pause; that must end the cast too.
+        elif self.owned:
+            # Keep watching a paused or stopped zone: the Raumfeld's auto power-off may end
+            # a pause (that ends the cast), and after a stop it tells us the room is no
+            # longer ours, so the next cast may wake it.
             self._schedule(_POLL)
         else:
             self.pending = None
@@ -649,6 +656,10 @@ class Follower:
     def take_mpd_requests(self):
         requests, self._requests = self._requests, []
         return requests
+
+    def requeue_mpd_requests(self, requests):
+        """Put back requests run() could not serve (lost connection), ahead of newer ones."""
+        self._requests = list(requests) + [r for r in self._requests if r not in requests]
 
     def seconds_until_deadline(self):
         if self.pending is None:
@@ -682,6 +693,12 @@ class Follower:
 
     def _poll(self):
         verdict = self.controller.check()
+        if verdict in TAKEN_AWAY and self.mpd_state == "stop":
+            # No cast to end; just let go, so the next cast wakes the room as usual.
+            log.info("%s while MPD is stopped; the next cast takes the room again",
+                     _REASONS[verdict])
+            self.owned = False
+            return
         if verdict in TAKEN_AWAY:
             return self._yield(verdict)
         if verdict == NOT_PLAYING and self.mpd_state == "play":
@@ -708,20 +725,31 @@ class Follower:
 
 
 def _serve_requests(follower, mpd):
-    for request in follower.take_mpd_requests():
-        if request == PAUSE_PLAYER:
-            mpd.pause()
-            # Note the pause before the message goes out: a receiver that ends the session
-            # right away would otherwise fold our pause and its stop into one MPD event.
-            follower.on_mpd_state(mpd.state())
-            continue
+    requests = follower.take_mpd_requests()
+    for i, request in enumerate(requests):
         try:
-            mpd.send_message(CAST_CHANNEL, CAST_RELEASE_MESSAGE)
-            log.info("asked the receiver to end the cast (%s %s)", CAST_CHANNEL, CAST_RELEASE_MESSAGE)
-        except MpdError as e:
-            # e.g. an older receiver that doesn't subscribe: MPD answers "nobody is subscribed".
-            log.warning("could not send %r on MPD channel %r: %s",
-                        CAST_RELEASE_MESSAGE, CAST_CHANNEL, e)
+            if request == PAUSE_PLAYER:
+                mpd.pause()
+                # Note the pause before the message goes out: a receiver that ends the
+                # session right away would otherwise fold our pause and its stop into one
+                # MPD event.
+                follower.on_mpd_state(mpd.state())
+            else:
+                _send_release(mpd)
+        except BaseException:
+            # The connection is gone; what is left must still go out after the reconnect.
+            follower.requeue_mpd_requests(requests[i:])
+            raise
+
+
+def _send_release(mpd):
+    try:
+        mpd.send_message(CAST_CHANNEL, CAST_RELEASE_MESSAGE)
+        log.info("asked the receiver to end the cast (%s %s)", CAST_CHANNEL, CAST_RELEASE_MESSAGE)
+    except MpdError as e:
+        # e.g. an older receiver that doesn't subscribe: MPD answers "nobody is subscribed".
+        log.warning("could not send %r on MPD channel %r: %s",
+                    CAST_RELEASE_MESSAGE, CAST_CHANNEL, e)
 
 
 def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):

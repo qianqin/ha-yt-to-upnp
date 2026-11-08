@@ -96,7 +96,7 @@ Open YouTube Music on your phone, tap Cast, and select your device.
 
 ### Optional: play on a Teufel Raumfeld speaker
 
-Instead of a local sound card, MPD can serve the audio as an HTTP stream (`httpd` output) and the [Raumfeld adapter](adapter/README.md) - a small Python 3 sidecar, standard library only - makes a Raumfeld room play that stream automatically whenever MPD plays. It finds the speaker by UPnP UDN via SSDP, wakes the room, and after `IDLE_MINUTES` of stop/pause stops the zone and puts the room back into standby. It never changes the volume and does not take over an actively playing line-in. See [`adapter/mpd.conf.example`](adapter/mpd.conf.example) for the MPD side.
+Instead of a local sound card, MPD can serve the audio as an HTTP stream (`httpd` output) and the [Raumfeld adapter](adapter/README.md) - a small Python 3 sidecar, standard library only - makes a Raumfeld room play that stream automatically whenever MPD plays. It finds the speaker by UPnP UDN via SSDP and wakes the room. It never puts the room into standby itself; the Raumfeld's own auto power-off does that. The speaker's own controls win: if the room is switched off (button or auto power-off) or to another source such as line-in during a cast, the adapter pauses MPD and sends `sendmessage ytcast release` on MPD's client-to-client channel, which tells the receiver to end the cast. It then leaves the room alone until the user resumes from the phone. If another source is already playing when a cast starts, it ends the cast the same way instead of taking over. It never changes the volume. See [`adapter/mpd.conf.example`](adapter/mpd.conf.example) for the MPD side.
 
 ```bash
 RAUMFELD_ROOM_UDN=uuid:00000000-0000-0000-0000-000000000001 \
@@ -146,7 +146,7 @@ Before a release, run `scripts/release-check.sh`; see [docs/DEVOPS.md](docs/DEVO
 | `sabr/stream.rs` | ~2000 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
-| `adapter/raumfeld_adapter.py` | ~620 | Optional Python sidecar (not part of the binary): follows MPD and plays its httpd stream on a Raumfeld room via SSDP/UPnP AVTransport, standby after idle. See [adapter/README.md](adapter/README.md) |
+| `adapter/raumfeld_adapter.py` | ~810 | Optional Python sidecar (not part of the binary): follows MPD and plays its httpd stream on a Raumfeld room via SSDP/UPnP AVTransport, and ends the cast when the speaker is switched off or to another source. See [adapter/README.md](adapter/README.md) |
 
 Single-threaded tokio runtime. Two MPD TCP connections (command + idle). One long-poll HTTP connection to YouTube Lounge API. SABR requests run per-track in a spawned task.
 

@@ -5,6 +5,7 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr
+from unittest import mock
 
 import raumfeld_adapter as ra
 from fakes import LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL
@@ -50,6 +51,7 @@ class ConfigTest(unittest.TestCase):
     def test_invalid_values(self):
         for key, value in [("MPD_PORT", "x"), ("MPD_PORT", "70000"),
                            ("SPEAKER_POLL_SECONDS", "0"), ("SPEAKER_POLL_SECONDS", "-1"),
+                           ("SPEAKER_POLL_SECONDS", "0.5"),
                            ("SPEAKER_POLL_SECONDS", "soon"), ("SPEAKER_POLL_SECONDS", "nan"), ("STREAM_METADATA", "maybe"),
                            ("STREAM_URL", "ftp://x/y"), ("LOG_LEVEL", "LOUD"),
                            ("RAUMFELD_ROOM_UDN", "uuid:x\r\nX-Injected: 1"),
@@ -62,6 +64,22 @@ class ConfigTest(unittest.TestCase):
     def test_idle_minutes_is_no_longer_a_setting(self):
         c = ra.Config.from_env(dict(REQUIRED, IDLE_MINUTES="soon"))  # ignored, not validated
         self.assertFalse(hasattr(c, "idle_seconds"))
+
+    def test_main_warns_that_idle_minutes_is_ignored(self):
+        with mock.patch.object(ra, "run") as run, \
+                mock.patch.object(ra.logging, "basicConfig"), \
+                self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            code = ra.main(env=dict(REQUIRED, IDLE_MINUTES="5"))
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertTrue(any(r.levelname == "WARNING" and "IDLE_MINUTES" in r.getMessage()
+                            for r in logs.records), logs.output)
+
+    def test_main_does_not_warn_without_idle_minutes(self):
+        with mock.patch.object(ra, "run"), mock.patch.object(ra.logging, "basicConfig"), \
+                self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            ra.main(env=dict(REQUIRED))
+        self.assertFalse(any("IDLE_MINUTES" in m for m in logs.output), logs.output)
 
     def test_main_exits_nonzero_with_clear_message(self):
         err = io.StringIO()
@@ -265,15 +283,33 @@ class FollowerTest(unittest.TestCase):
         self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
         self.assertEqual(self.f.seconds_until_deadline(), 5)
 
-    def test_owned_zone_is_polled_while_paused_and_not_while_stopped(self):
+    def test_owned_zone_is_polled_while_paused_and_stopped(self):
         self.f.on_mpd_state("play")
         self.f.on_mpd_state("pause")
         self.advance(5)
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
         self.f.on_mpd_state("stop")
+        self.advance(5)
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "check", "check"])
+
+    def test_taken_away_while_stopped_just_lets_go(self):
+        self.f.on_mpd_state("play")
+        self.f.on_mpd_state("stop")
+        self.ctl.verdict = ra.STANDBY
+        self.advance(5)
+        self.assertEqual(self.f.take_mpd_requests(), [])  # no pause, no release
         self.assertIsNone(self.f.seconds_until_deadline())
-        self.advance(60)
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "check"])
+        self.f.on_mpd_state("play")  # the next cast may wake the room
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "check", "ensure_playing"])
+
+    def test_unserved_requests_are_requeued_first(self):
+        self.f.on_mpd_state("play")
+        self.ctl.verdict = ra.STANDBY
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        requests = self.f.take_mpd_requests()
+        self.f.on_mpd_state("play")  # after a reconnect: a re-pause is queued
+        self.f.requeue_mpd_requests(requests)
+        self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
 
     def test_pause_without_an_owned_zone_does_not_poll(self):
         self.f.on_mpd_state("pause")

@@ -5,6 +5,7 @@ adapter stays away until the user resumes from the phone.
 Real Follower + Controller against the fake Raumfeld host; MPD events are fed by hand.
 """
 
+import threading
 import time
 import unittest
 
@@ -249,16 +250,68 @@ class SpeakerYieldTest(unittest.TestCase):
         self.mpd("play")  # coalesced track change
         self.nothing_requested()
 
-    def test_polling_stops_when_mpd_stops(self):
+    def test_polling_while_stopped_ends_when_the_room_is_gone(self):
         self.cast_is_playing()
-        self.poll()
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
         self.mpd("stop")
+        self.rf.transport_state = "STOPPED"
+        for _ in range(ra.STOPPED_GRACE_POLLS + 3):
+            self.poll()  # a stopped renderer is expected while MPD is stopped
+        self.nothing_requested()
+        self.rf.power = "AUTOMATIC_STANDBY"
+        self.poll()
         self.rf.requests.clear()
         for _ in range(3):
             self.poll()
         self.assertEqual(self.rf.requests, [])
         self.assertIsNone(self.follower.seconds_until_deadline())
+        self.nothing_requested()
+
+    # -- after a normal session end (receiver stopped MPD)
+
+    def test_session_end_then_auto_power_off_then_new_cast_wakes_and_plays(self):
+        self.cast_is_playing()
+        self.mpd("stop")  # the phone disconnected: the receiver stops and clears MPD
+        self.poll()
+        self.rf.power = "AUTOMATIC_STANDBY"  # minutes later
+        self.rf.transport_state = "STOPPED"
+        self.poll()
+        self.nothing_requested()  # no pause, no release: there is no cast to end
+        self.mpd("play")  # a new cast
+        self.assertIn("leaveStandby", self.rf.api_calls())
+        self.assertEqual(self.rf.power, "ACTIVE")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.nothing_requested()
+
+    def test_song_change_gap_does_not_wake_and_playback_continues(self):
+        self.cast_is_playing()
+        self.rf.transport_state = "STOPPED"
+        self.mpd("stop", "play")  # within one poll interval, room still ACTIVE
+        self.assertNotIn("leaveStandby", self.rf.api_calls())
+        self.assertEqual(self.rf.soap_actions()[-1], "Play")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.nothing_requested()
+
+    def test_session_end_then_line_in_then_new_cast_ends_the_cast(self):
+        self.cast_is_playing()
+        self.mpd("stop")
+        self.rf.current_uri = LINE_IN_URI  # the user switches to the karaoke machine
+        self.poll()
+        self.nothing_requested()
+        self.mpd("play")  # a new cast while line-in plays: busy speaker
+        self.assertFalse(self.taken_over())
+        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        self.released_while_playing()
+
+    def test_session_end_then_idle_line_in_then_new_cast_takes_over(self):
+        self.cast_is_playing()
+        self.mpd("stop")
+        self.rf.current_uri = LINE_IN_URI
+        self.rf.transport_state = "STOPPED"
+        self.poll()
+        self.mpd("play")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.nothing_requested()
 
     def test_no_polling_while_yielded(self):
         self.cast_is_playing()
@@ -290,16 +343,29 @@ class SpeakerYieldTest(unittest.TestCase):
 class SpeakerYieldRunTest(unittest.TestCase):
     """End to end through run(): the adapter talks to MPD over its own connection."""
 
-    def run_until(self, mpd, rf, follower, mutate, done):
-        deadline = time.monotonic() + 5
+    def run_until(self, mpd, rf, follower, mutate, done, limit_s=5):
+        """run() until done(); a regression that leaves it blocked in MPD `idle` fails the
+        test after limit_s instead of hanging the suite."""
+        deadline = time.monotonic() + limit_s
+        given_up = threading.Event()
 
         def should_stop():
             with rf.lock:
                 mutate()
-            return done() or time.monotonic() > deadline
+            return given_up.is_set() or done() or time.monotonic() > deadline
 
-        ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port), sleep=lambda s: None,
-               should_stop=should_stop)
+        def target():
+            ra.run(follower, lambda: ra.MpdClient("127.0.0.1", mpd.port),
+                   sleep=lambda s: time.sleep(0.05), should_stop=should_stop)
+
+        runner = threading.Thread(target=target, daemon=True)
+        runner.start()
+        runner.join(limit_s)
+        if runner.is_alive():
+            given_up.set()
+            mpd.close()  # wakes run() out of `idle`; it then sees should_stop
+            runner.join(2)
+            self.fail("run() still blocked after %ss; MPD commands: %r" % (limit_s, mpd.commands))
 
     def setUp(self):
         self.rf = FakeRaumfeld()
@@ -346,6 +412,19 @@ class SpeakerYieldRunTest(unittest.TestCase):
                            lambda: self.follower.mpd_state == "stop")
         self.assertEqual(self.follower.mpd_state, "stop")
         self.assertFalse(self.follower.yielded)  # a new cast session may take over again
+
+    def test_release_survives_a_connection_lost_on_pause(self):
+        mpd = FakeMpd([["play"], ["play"]])
+        mpd.drop_on_first_pause = True
+        self.addCleanup(mpd.close)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.run_until(mpd, self.rf, self.follower, self.standby_once_playing,
+                           lambda: "sendmessage ytcast release" in mpd.commands
+                           and self.follower.mpd_state == "pause")
+        self.assertEqual(mpd.connections, 2)
+        self.assertEqual(mpd.commands.count("sendmessage ytcast release"), 1)
+        cmds = [c for c in mpd.commands if c not in ("status", "idle player", "noidle")]
+        self.assertEqual(cmds, ["pause 1", "pause 1", "sendmessage ytcast release"])
 
     def test_track_changes_send_nothing_to_mpd(self):
         mpd = FakeMpd([["play", "stop", "play", "play"]])
