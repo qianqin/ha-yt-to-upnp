@@ -130,9 +130,9 @@ class ControllerTest(unittest.TestCase):
             self.ctl.ensure_playing()
         self.assertEqual(self.rf.requests, [])
 
-    def test_http_error_raises_os_error(self):
+    def test_http_error_raises(self):
         self.rf.fail_paths.add("leaveStandby")
-        with self.assertRaises(OSError):
+        with self.assertRaises(ra.RaumfeldError):
             self.ctl.ensure_playing()
         self.rf.fail_paths.clear()
         self.ctl.ensure_playing()  # next attempt works

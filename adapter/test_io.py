@@ -132,6 +132,20 @@ class HttpLimitsTest(unittest.TestCase):
             ra.http_get("http://127.0.0.1:%d/x" % port, deadline_s=0.5)
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_slow_headers_hit_total_deadline(self):
+        def slow_headers(conn):
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            for i in range(20):  # bounded, so a regression fails instead of hanging
+                time.sleep(0.3)
+                conn.sendall(b"X-Slow-%d: 1\r\n" % i)
+
+        port = raw_server(self, slow_headers)
+        started = time.monotonic()
+        with self.assertRaises(ra.RaumfeldError):
+            ra.http_get("http://127.0.0.1:%d/x" % port, deadline_s=0.5)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_non_http_scheme_is_refused(self):
         with self.assertRaises(ra.RaumfeldError):
             ra.http_get("file://" + os.path.abspath(__file__))

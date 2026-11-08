@@ -14,8 +14,9 @@ import re
 import socket
 import sys
 import time
-import urllib.request
+import threading
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from collections import namedtuple
 from html import escape as _escape
 from urllib.parse import quote, unquote, urljoin, urlsplit
@@ -25,7 +26,7 @@ log = logging.getLogger("raumfeld_adapter")
 SSDP_ADDR = ("239.255.255.250", 1900)
 RAUMFELD_API_PORT = 47365
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
-HTTP_TIMEOUT_S = 10  # total wall-clock budget per HTTP request, not per read
+HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and redirects
 MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a few KiB
 MPD_MAX_LINE = 64 * 1024
 UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
@@ -197,13 +198,23 @@ def check_device_url(url, host):
 
 
 def _parse_xml(data):
-    # Devices are untrusted: no DTDs, so no entity expansion tricks.
-    if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
-        raise RaumfeldError("refusing XML with DOCTYPE/ENTITY")
+    # Devices are untrusted: no DTDs, so no entity expansion tricks. A byte scan can't
+    # enforce that (expat decodes UTF-16 itself), so a pyexpat pass refuses any DOCTYPE or
+    # ENTITY declaration before ElementTree, whose C parser has no such hooks, builds the tree.
+    if b"\x00" in data:
+        raise RaumfeldError("refusing XML containing NUL bytes (UTF-16/32 or binary)")
+    scanner = xml.parsers.expat.ParserCreate()
+    scanner.StartDoctypeDeclHandler = _refuse_dtd
+    scanner.EntityDeclHandler = _refuse_dtd
     try:
+        scanner.Parse(data, True)
         return ET.fromstring(data)
-    except ET.ParseError as e:
+    except (xml.parsers.expat.ExpatError, ET.ParseError) as e:
         raise RaumfeldError("malformed XML: %s" % e) from None
+
+
+def _refuse_dtd(*_args):
+    raise RaumfeldError("refusing XML with DOCTYPE/ENTITY")
 
 
 def _elements(root, name):
@@ -261,55 +272,92 @@ def _parse_headers(text):
     return headers
 
 
-class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
-    # The Raumfeld host answers 307 to /<uuid>/<path>; follow that, but never off the host.
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            check_device_url(newurl, urlsplit(req.full_url).hostname)
-        except RaumfeldError:
-            fp.close()
-            raise
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+_REDIRECTS = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 3
 
 
-# http only, no proxies from the environment, no file:/ftp: handlers.
-_OPENER = urllib.request.OpenerDirector()
-for _handler in (urllib.request.HTTPHandler(), _SameHostRedirect(),
-                 urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
-    _OPENER.add_handler(_handler)
+def _fetch(method, url, deadline_s, body=None, headers=None):
+    """One HTTP exchange, redirects included, hard-limited to deadline_s in total.
 
-
-def _fetch(request, deadline_s):
-    parts = urlsplit(request.full_url)
-    if parts.scheme != "http" or not parts.hostname:
-        raise RaumfeldError("refusing non-http URL %r" % request.full_url)
+    Only plain http; GET redirects are followed (the Raumfeld host answers 307 to
+    /<uuid>/<path>) but never off the original host. Bodies above MAX_BODY are refused.
+    """
     deadline = time.monotonic() + deadline_s
-    body = b""
-    with _OPENER.open(request, timeout=deadline_s) as resp:
+    host = urlsplit(url).hostname
+    for _ in range(MAX_REDIRECTS + 1):
+        parts = urlsplit(url)
+        if parts.scheme != "http" or not parts.hostname:
+            raise RaumfeldError("refusing non-http URL %r" % url)
+        status, location, data = _exchange(method, parts, body, headers or {}, deadline, url)
+        if status in _REDIRECTS and method == "GET" and location:
+            url = check_device_url(urljoin(url, location), host)
+            continue
+        if not 200 <= status < 300:
+            raise RaumfeldError("HTTP %d from %r" % (status, url))
+        return data
+    raise RaumfeldError("too many redirects from %r" % url)
+
+
+def _exchange(method, parts, body, headers, deadline, url):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RaumfeldError("%r: request deadline exceeded" % url)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=remaining)
+    expired = threading.Event()
+    # http.client drops conn.sock after a "Connection: close" response while the body is
+    # still read from it, so keep our own reference for the timer.
+    sockets = []
+
+    def expire():
+        # Socket timeouts only bound single reads; shutting the socket down bounds the
+        # whole exchange, including a device that trickles headers or body bytes.
+        expired.set()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    timer = threading.Timer(remaining, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.connect()
+        sockets.append(conn.sock)
+        if expired.is_set():
+            raise socket.timeout("deadline passed while connecting")
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = b""
         while True:
-            if time.monotonic() > deadline:
-                raise RaumfeldError("%r took longer than %ss" % (request.full_url, deadline_s))
-            chunk = resp.read1(min(65536, MAX_BODY + 1 - len(body)))
+            chunk = resp.read1(min(65536, MAX_BODY + 1 - len(data)))
             if not chunk:
-                return body
-            body += chunk
-            if len(body) > MAX_BODY:
-                raise RaumfeldError("response from %r exceeds %d bytes" % (request.full_url, MAX_BODY))
+                break
+            data += chunk
+            if len(data) > MAX_BODY:
+                raise RaumfeldError("response from %r exceeds %d bytes" % (url, MAX_BODY))
+        if expired.is_set():
+            raise socket.timeout("deadline passed while reading")
+        return resp.status, resp.getheader("Location"), data
+    except (OSError, http.client.HTTPException):
+        if expired.is_set():
+            raise RaumfeldError("%r took longer than the request deadline" % url) from None
+        raise
+    finally:
+        timer.cancel()
+        conn.close()
 
 
 def http_get(url, deadline_s=HTTP_TIMEOUT_S):
-    return _fetch(urllib.request.Request(url), deadline_s)
+    return _fetch("GET", url, deadline_s)
 
 
 def soap_call(control_url, action, args):
-    request = urllib.request.Request(
-        control_url,
-        data=soap_envelope(action, [("InstanceID", "0")] + list(args)).encode("utf-8"),
-        headers={"Content-Type": 'text/xml; charset="utf-8"',
-                 "SOAPACTION": '"%s#%s"' % (AVTRANSPORT, action)},
-        method="POST",
-    )
-    root = _parse_xml(_fetch(request, HTTP_TIMEOUT_S))
+    body = soap_envelope(action, [("InstanceID", "0")] + list(args)).encode("utf-8")
+    headers = {"Content-Type": 'text/xml; charset="utf-8"',
+               "SOAPACTION": '"%s#%s"' % (AVTRANSPORT, action)}
+    root = _parse_xml(_fetch("POST", control_url, HTTP_TIMEOUT_S, body, headers))
     return {_local(el.tag): (el.text or "") for el in root.iter()}
 
 
@@ -506,7 +554,8 @@ class Follower:
         try:
             getattr(self.controller, action)()
         except _ERRORS as e:
-            log.warning("%s failed: %s: %s", action, type(e).__name__, e)
+            # %r: the message may carry device-supplied text (e.g. an HTTP reason phrase).
+            log.warning("%s failed: %r", action, e)
             # Don't give up: neither a missed takeover nor a room left on a dead stream.
             self._schedule(action)
 

@@ -134,6 +134,28 @@ class ParsingTest(unittest.TestCase):
         with self.assertRaises(ra.RaumfeldError):
             ra.avtransport_control_url(b"<!DOCTYPE root><root/>", "http://127.0.0.1/d.xml")
 
+    def test_doctype_in_utf16_is_refused(self):
+        doc = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE z [<!ENTITY a "bbb">]>'
+               '<zoneConfig><zones><zone udn="uuid:a"><room udn="%s"/>&a;</zone></zones>'
+               '</zoneConfig>' % ROOM_UDN)
+        for codec in ("utf-16", "utf-16-le"):
+            with self.subTest(codec=codec), self.assertRaises(ra.RaumfeldError):
+                ra.zone_of_room(doc.encode(codec), ROOM_UDN)
+
+    def test_doctype_is_refused_by_the_parser_not_a_byte_scan(self):
+        # The parser, not a byte pattern, enforces the rule: a tab after DOCTYPE still counts.
+        with self.assertRaises(ra.RaumfeldError):
+            ra.zone_of_room(b"<?xml version='1.0'?>\n<!DOCTYPE\tz [<!ENTITY a 'b'>]><z>&a;</z>",
+                            ROOM_UDN)
+
+    def test_utf8_device_description_still_parses(self):
+        desc = ("<?xml version='1.0' encoding='utf-8'?><root xmlns='urn:schemas-upnp-org:device-1-0'>"
+                "<device><friendlyName>Räum</friendlyName><serviceList><service>"
+                "<serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>"
+                "<controlURL>/ctrl</controlURL></service></serviceList></device></root>").encode()
+        self.assertEqual(ra.avtransport_control_url(desc, "http://127.0.0.1:1/d.xml"),
+                         "http://127.0.0.1:1/ctrl")
+
     def test_unclosed_tags_fail_fast(self):
         started = time.monotonic()
         with self.assertRaises(ra.RaumfeldError):
@@ -258,6 +280,13 @@ class FollowerTest(unittest.TestCase):
             self.f.on_mpd_state("play")
         self.f.on_mpd_state("stop")
         self.assertEqual(self.f.seconds_until_deadline(), 300)
+
+    def test_device_supplied_error_text_is_logged_escaped(self):
+        self.ctl.fail = ra.RaumfeldError("HTTP 500 Boom\n2026-01-01 INFO forged line")
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+            self.f.on_mpd_state("play")
+        self.assertNotIn("\n", logs.records[0].getMessage())
+        self.assertIn("\\n", logs.records[0].getMessage())
 
     def test_failed_release_is_retried_after_another_idle_period(self):
         self.f.on_mpd_state("stop")
