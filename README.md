@@ -107,7 +107,7 @@ python3 -m adapter
 
 The receiver never logs in and stores no credentials of its own: authentication comes from the casting client, which sends a per-video credential transfer token (ctt) with each track. WEB_REMIX is used only when a cast supplies a ctt and the YouTube Music session loaded; otherwise the anonymous IOS client is used. At startup the public music.youtube.com page is fetched anonymously for the session context (visitor data, signature timestamp, nsig player); that one request carries a fixed consent cookie `SOCS=CAI` ("reject all") so EU visitors are not redirected to the consent page - it holds no account data and is not authentication. Requests carrying the ctt or the session fetch only follow redirects to Google hosts. Cookie files are no longer supported: `YTM_COOKIES` and `ytm-cookies.txt` are ignored, so delete any old `ytm-cookies.txt`.
 
-With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again. nsig cache filenames include the ejs solver version; files from older versions are unused and can be deleted. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If the config or an nsig cache file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
+With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again; running out of memory or stack does not discard it (the decode is retried once with a larger QuickJS limit). nsig cache filenames include the ejs solver version; files from older versions are unused and can be deleted. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If the config or an nsig cache file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
 
 ## Building
 
@@ -135,7 +135,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
 | `music_session.rs` | ~620 | Anonymous YouTube Music session at startup: fetches the public music.youtube.com page for ytcfg context, visitor data, STS and the base.js player for nsig |
 | `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
-| `nsig.rs` | ~430 | n-parameter challenge decoder using the vendored yt-dlp/ejs solver (`src/vendor/`) in QuickJS |
+| `nsig.rs` | ~550 | n-parameter challenge decoder using the vendored yt-dlp/ejs solver (`src/vendor/`) in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
 | `dial.rs` | ~550 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
@@ -155,7 +155,7 @@ RSS = Resident Set Size (actual physical RAM used by the process).
 | Component | RAM (RSS) |
 |-----------|-----------|
 | ytcast-open idle | ~12.8MB |
-| ytcast-open during SABR streaming | ~41MB (55MB peak during nsig decode, settles back) |
+| ytcast-open during SABR streaming | ~41MB (~65MB peak during nsig decode with a cached player, settles back; the first decode of a new player briefly peaks around 170MB, QuickJS limit 256MB) |
 | bgutil-pot (PoToken sidecar, optional) | ~66MB |
 | MPD | ~10MB |
 | **Total system (without bgutil-pot)** | **~55-65MB** |
