@@ -1,0 +1,3 @@
+# The repo root ignores test_*.py (ad-hoc debug scripts); the adapter unit tests are real and tracked.
+!test_*.py
+__pycache__/

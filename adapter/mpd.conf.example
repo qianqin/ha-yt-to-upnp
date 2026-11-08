@@ -1,0 +1,31 @@
+# Minimal MPD configuration for the receiver + Raumfeld adapter.
+# The receiver plays into MPD; MPD re-serves the audio as an HTTP stream that
+# the Raumfeld zone renderer fetches. Paths are placeholders.
+
+music_directory     "/path/to/music"
+db_file             "/path/to/mpd/database"
+state_file          "/path/to/mpd/state"
+bind_to_address     "localhost"
+port                "6600"
+
+audio_output {
+    type        "httpd"
+    name        "Raumfeld stream"
+    encoder     "lame"          # MP3 -> STREAM_URL=http://<receiver-host>:8000/stream.mp3, STREAM_MIME=audio/mpeg
+    port        "8000"
+    bitrate     "320"           # use either bitrate or quality, not both
+#   quality     "5.0"
+    format      "44100:16:2"
+    always_on   "yes"           # keep the stream open between tracks so the speaker doesn't drop it
+    tags        "yes"
+}
+
+# Lossless variant (use instead of the block above; set STREAM_MIME=audio/flac):
+# audio_output {
+#     type        "httpd"
+#     name        "Raumfeld stream (FLAC)"
+#     encoder     "flac"
+#     port        "8000"
+#     format      "44100:16:2"
+#     always_on   "yes"
+# }

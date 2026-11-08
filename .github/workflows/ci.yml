@@ -35,6 +35,10 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # Raumfeld adapter: stdlib-only Python, tested with the runner's python3.
+      - name: Test Raumfeld adapter
+        run: python3 -m unittest discover -s adapter -v
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
 
