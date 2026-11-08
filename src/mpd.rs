@@ -55,6 +55,97 @@ pub struct MpdStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Idle events + client-to-client messages
+// ---------------------------------------------------------------------------
+
+/// MPD client-to-client channel on which the speaker adapter talks to us.
+pub const RELEASE_CHANNEL: &str = "ytcast";
+/// Sent by the adapter when the speaker went to standby or another source:
+/// the cast has to end.
+pub const RELEASE_MESSAGE: &str = "release";
+/// `message` wakes the idle connection when the adapter posts to a channel
+/// this connection subscribed to.
+pub const IDLE_COMMAND: &str = "idle player message";
+
+pub fn subscribe_command(channel: &str) -> String {
+    format!("subscribe {channel}")
+}
+
+/// Subsystems reported by an `idle` response (`changed: <subsystem>`).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct IdleChanges {
+    pub player: bool,
+    pub message: bool,
+}
+
+pub fn parse_idle_changes(lines: &[String]) -> IdleChanges {
+    let mut changes = IdleChanges::default();
+    for line in lines {
+        match line.strip_prefix("changed: ") {
+            Some("player") => changes.player = true,
+            Some("message") => changes.message = true,
+            _ => {}
+        }
+    }
+    changes
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelMessage {
+    pub channel: String,
+    pub message: String,
+}
+
+/// Parse a `readmessages` response: `channel: X` / `message: Y` pairs.
+pub fn parse_channel_messages(lines: &[String]) -> Vec<ChannelMessage> {
+    let mut out = Vec::new();
+    let mut channel: Option<String> = None;
+    for line in lines {
+        if let Some(c) = line.strip_prefix("channel: ") {
+            channel = Some(c.to_owned());
+        } else if let Some(m) = line.strip_prefix("message: ") {
+            if let Some(c) = channel.take() {
+                out.push(ChannelMessage { channel: c, message: m.to_owned() });
+            }
+        }
+    }
+    out
+}
+
+/// True if the adapter asked us to release the speaker. Anything else on
+/// any channel is logged and ignored.
+pub fn contains_release(messages: &[ChannelMessage]) -> bool {
+    let mut release = false;
+    for m in messages {
+        if m.channel == RELEASE_CHANNEL && m.message == RELEASE_MESSAGE {
+            release = true;
+        } else {
+            tracing::debug!("[MPD idle] ignoring message {:?} on channel {:?}", m.message, m.channel);
+        }
+    }
+    release
+}
+
+/// What the idle connection observed in one wake-up.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct IdleEvent {
+    /// Player state changed (song end, play/pause/stop).
+    pub player: bool,
+    /// The adapter sent `release` on the `ytcast` channel.
+    pub release: bool,
+}
+
+impl IdleEvent {
+    /// Combine queued events so draining the channel never drops a release.
+    pub fn merge(self, other: IdleEvent) -> IdleEvent {
+        IdleEvent {
+            player: self.player || other.player,
+            release: self.release || other.release,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Real MPD client (production)
 // ---------------------------------------------------------------------------
 
@@ -294,18 +385,35 @@ mod real {
                 )));
             }
 
-            Ok(Self { reader, writer })
+            let mut client = Self { reader, writer };
+            // Subscriptions are per connection, so every (re)connect subscribes.
+            client.command(&subscribe_command(RELEASE_CHANNEL)).await?;
+            Ok(client)
         }
 
-        /// Block until MPD's player subsystem changes (song ends, play/pause/stop).
+        /// Block until the player changes (song ends, play/pause/stop) or the
+        /// adapter posts on our channel.
         ///
-        /// Sends MPD's `idle player` command which blocks server-side until a
-        /// player event occurs. Returns immediately when the state changes.
-        /// This gives instant song-end detection — no polling delay.
-        pub async fn wait_player_change(&mut self) -> Result<()> {
-            self.writer.write_all(b"idle player\n").await?;
+        /// `idle player message` blocks server-side, which gives instant
+        /// song-end detection without polling. Pending channel messages are
+        /// read on this same connection, which is free again once idle returns.
+        pub async fn wait_event(&mut self) -> Result<IdleEvent> {
+            let changes = parse_idle_changes(&self.command(IDLE_COMMAND).await?);
+            let release = if changes.message {
+                contains_release(&parse_channel_messages(&self.command("readmessages").await?))
+            } else {
+                false
+            };
+            Ok(IdleEvent { player: changes.player, release })
+        }
+
+        /// Send one command and collect its response lines up to `OK`.
+        async fn command(&mut self, cmd: &str) -> Result<Vec<String>> {
+            self.writer.write_all(cmd.as_bytes()).await?;
+            self.writer.write_all(b"\n").await?;
             self.writer.flush().await?;
 
+            let mut lines = Vec::new();
             loop {
                 let mut line = String::new();
                 let n = self.reader.read_line(&mut line).await?;
@@ -314,12 +422,12 @@ mod real {
                 }
                 let trimmed = line.trim_end();
                 if trimmed == "OK" {
-                    return Ok(());
+                    return Ok(lines);
                 }
                 if trimmed.starts_with("ACK ") {
                     return Err(MpdError::Ack(trimmed.to_owned()));
                 }
-                // "changed: player" — consume and wait for the terminating OK
+                lines.push(trimmed.to_owned());
             }
         }
     }
@@ -409,7 +517,7 @@ mod mock {
             Ok(Self)
         }
 
-        pub async fn wait_player_change(&mut self) -> Result<()> {
+        pub async fn wait_event(&mut self) -> Result<IdleEvent> {
             // Mock: never fires — no real MPD to generate events
             std::future::pending().await
         }
@@ -418,3 +526,152 @@ mod mock {
 
 #[cfg(feature = "mock-mpd")]
 pub use mock::{MpdClient, MpdIdleClient};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn idle_command_listens_for_player_and_messages() {
+        assert_eq!(IDLE_COMMAND, "idle player message");
+        assert_eq!(subscribe_command(RELEASE_CHANNEL), "subscribe ytcast");
+    }
+
+    #[test]
+    fn idle_changes_are_parsed_per_subsystem() {
+        assert_eq!(parse_idle_changes(&lines("changed: player")), IdleChanges { player: true, message: false });
+        assert_eq!(parse_idle_changes(&lines("changed: message")), IdleChanges { player: false, message: true });
+        assert_eq!(
+            parse_idle_changes(&lines("changed: player\nchanged: message")),
+            IdleChanges { player: true, message: true }
+        );
+        assert_eq!(parse_idle_changes(&[]), IdleChanges::default());
+    }
+
+    #[test]
+    fn readmessages_response_is_parsed_into_channel_messages() {
+        let msgs = parse_channel_messages(&lines(
+            "channel: ytcast\nmessage: release\nchannel: other\nmessage: hello world",
+        ));
+        assert_eq!(
+            msgs,
+            vec![
+                ChannelMessage { channel: "ytcast".into(), message: "release".into() },
+                ChannelMessage { channel: "other".into(), message: "hello world".into() },
+            ]
+        );
+        assert!(parse_channel_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_release_on_the_ytcast_channel_counts_as_release() {
+        let msg = |c: &str, m: &str| ChannelMessage { channel: c.into(), message: m.into() };
+        assert!(contains_release(&[msg("ytcast", "release")]));
+        assert!(contains_release(&[msg("ytcast", "bogus"), msg("ytcast", "release")]));
+        assert!(!contains_release(&[msg("ytcast", "bogus")]));
+        assert!(!contains_release(&[msg("other", "release")]));
+        assert!(!contains_release(&[]));
+    }
+
+    #[test]
+    fn idle_events_merge_without_losing_a_release() {
+        let a = IdleEvent { player: true, release: false };
+        let b = IdleEvent { player: false, release: true };
+        assert_eq!(a.merge(b), IdleEvent { player: true, release: true });
+    }
+
+    #[cfg(not(feature = "mock-mpd"))]
+    mod idle_client {
+        use super::super::*;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        /// Scripted in-process MPD: for each expected command, reply with the
+        /// given response. Returns the commands it actually received.
+        async fn fake_mpd(script: Vec<(&'static str, &'static str)>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (rd, mut wr) = tokio::io::split(stream);
+                let mut rd = BufReader::new(rd);
+                wr.write_all(b"OK MPD 0.23.5\n").await.unwrap();
+                let mut seen = Vec::new();
+                for (_expected, reply) in script {
+                    let mut line = String::new();
+                    if rd.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    seen.push(line.trim_end().to_owned());
+                    wr.write_all(reply.as_bytes()).await.unwrap();
+                }
+                seen
+            });
+            (port, handle)
+        }
+
+        #[tokio::test]
+        async fn connect_subscribes_and_release_message_is_reported() {
+            let (port, server) = fake_mpd(vec![
+                ("subscribe ytcast", "OK\n"),
+                ("idle player message", "changed: message\nOK\n"),
+                ("readmessages", "channel: ytcast\nmessage: release\nOK\n"),
+            ])
+            .await;
+
+            let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
+            let event = idle.wait_event().await.unwrap();
+            assert_eq!(event, IdleEvent { player: false, release: true });
+
+            drop(idle);
+            assert_eq!(
+                server.await.unwrap(),
+                vec!["subscribe ytcast", "idle player message", "readmessages"]
+            );
+        }
+
+        #[tokio::test]
+        async fn player_change_alone_does_not_read_messages() {
+            let (port, server) = fake_mpd(vec![
+                ("subscribe ytcast", "OK\n"),
+                ("idle player message", "changed: player\nOK\n"),
+            ])
+            .await;
+
+            let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
+            let event = idle.wait_event().await.unwrap();
+            assert_eq!(event, IdleEvent { player: true, release: false });
+
+            drop(idle);
+            assert_eq!(server.await.unwrap(), vec!["subscribe ytcast", "idle player message"]);
+        }
+
+        #[tokio::test]
+        async fn unknown_messages_are_ignored() {
+            let (port, _server) = fake_mpd(vec![
+                ("subscribe ytcast", "OK\n"),
+                ("idle player message", "changed: message\nOK\n"),
+                ("readmessages", "channel: ytcast\nmessage: something-else\nOK\n"),
+            ])
+            .await;
+
+            let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
+            let event = idle.wait_event().await.unwrap();
+            assert_eq!(event, IdleEvent::default());
+        }
+
+        #[tokio::test]
+        async fn subscribe_failure_fails_connect() {
+            let (port, _server) = fake_mpd(vec![(
+                "subscribe ytcast",
+                "ACK [5@0] {subscribe} unknown command \"subscribe\"\n",
+            )])
+            .await;
+            assert!(MpdIdleClient::connect("127.0.0.1", port).await.is_err());
+        }
+    }
+}

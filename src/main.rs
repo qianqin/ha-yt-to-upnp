@@ -291,9 +291,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 13. MPD idle listener — real-time player state change detection
     //
-    // Uses MPD's `idle player` command for instant notification when a song
-    // ends, just like the Node.js mpd2 library's event system. No polling.
-    let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<()>(8);
+    // Uses MPD's `idle player message` command for instant notification when a
+    // song ends, just like the Node.js mpd2 library's event system. No polling.
+    // `message` carries the speaker adapter's `release` on channel `ytcast`.
+    let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<mpd::IdleEvent>(8);
     let idle_mpd_host = mpd_host.clone();
     let idle_mpd_port = mpd_port;
     let idle_shutdown = shutdown_rx.clone();
@@ -302,9 +303,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if *idle_shutdown.borrow() {
                 break;
             }
-            match mpd_idle.wait_player_change().await {
-                Ok(()) => {
-                    if idle_tx.send(()).await.is_err() {
+            match mpd_idle.wait_event().await {
+                Ok(event) if event == mpd::IdleEvent::default() => {}
+                Ok(event) => {
+                    if idle_tx.send(event).await.is_err() {
                         break;
                     }
                 }
@@ -397,12 +399,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // MPD player state changed — instant song-end detection
-            Some(()) = idle_rx.recv() => {
-                // Drain any extra queued events (e.g. from clear+add+play sequence)
-                while idle_rx.try_recv().is_ok() {}
+            // MPD idle wake-up — instant song-end detection, or the speaker
+            // adapter releasing us (standby / other source)
+            Some(event) = idle_rx.recv() => {
+                // Merge extra queued events (e.g. from clear+add+play sequence)
+                let mut event = event;
+                while let Ok(more) = idle_rx.try_recv() {
+                    event = event.merge(more);
+                }
+                let plan = idle_plan(event, play_started);
 
-                if play_started {
+                if plan.release {
+                    if !release_applies(has_remote, &playlist) {
+                        tracing::debug!("[player] release from adapter ignored: no active cast");
+                        continue;
+                    }
+                    tracing::info!("[player] released by speaker (adapter) — ending cast session");
+                    has_remote = false;
+                    let end_msgs = release_cast(&mut playlist, &mut play_started);
+                    *dial_state.ctt.write().unwrap() = None;
+                    dial_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = mpd_client.stop().await {
+                        tracing::warn!("[player] release: mpd stop failed: {e}");
+                    }
+                    if let Err(e) = mpd_client.clear().await {
+                        tracing::warn!("[player] release: mpd clear failed: {e}");
+                    }
+                    for msg in end_msgs {
+                        state_tx.send(msg).await.ok();
+                    }
+                    continue;
+                }
+
+                if plan.check_song_end {
                     if let Ok(status) = mpd_client.status().await {
                         if status.state == "stop" {
                             play_started = false;
@@ -815,6 +844,46 @@ fn stop_action(stream_failure: Option<String>, playlist: &PlaylistState) -> Stop
     }
 }
 
+/// What the player loop does with one (merged) idle wake-up.
+#[derive(Debug, PartialEq)]
+struct IdlePlan {
+    release: bool,
+    check_song_end: bool,
+}
+
+/// A release wins over a player change seen in the same wake-up: the speaker
+/// is gone, so a stop must never be read as a song end and auto-advance.
+fn idle_plan(event: mpd::IdleEvent, play_started: bool) -> IdlePlan {
+    IdlePlan {
+        release: event.release,
+        check_song_end: event.player && play_started && !event.release,
+    }
+}
+
+/// The adapter may release on every speaker standby, also with nobody casting.
+fn release_applies(has_remote: bool, playlist: &PlaylistState) -> bool {
+    has_remote || !playlist.video_ids.is_empty()
+}
+
+/// Forget the cast and build the messages that end it on the sender.
+///
+/// `play_started` is cleared first so the MPD stop that follows is not
+/// treated as a song end. `loungeScreenDisconnected` is what
+/// yt-cast-receiver sends to drop its senders while keeping the screen's
+/// Lounge session bound (Session.end() and
+/// YouTubeApp#checkAndSwitchActiveSession; Message.LoungeScreenDisconnected:
+/// "Notifies senders that their Cast session with the receiver has ended").
+/// The empty `nowPlaying` before it clears the phone's mini-player, as
+/// yt-cast-receiver's player reset does.
+fn release_cast(playlist: &mut PlaylistState, play_started: &mut bool) -> Vec<messages::OutgoingMessage> {
+    *play_started = false;
+    *playlist = PlaylistState::default();
+    vec![
+        messages::OutgoingMessage::new("nowPlaying"),
+        messages::OutgoingMessage::new("loungeScreenDisconnected"),
+    ]
+}
+
 /// Unstarted (-1) at position 0: unlike Stopped (0) at the full duration,
 /// the app does not read it as "track ended" and advance the queue.
 fn stream_failed_message(playlist: &PlaylistState) -> messages::OutgoingMessage {
@@ -1037,6 +1106,48 @@ mod stop_tests {
             current_duration: 200,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn release_wins_over_song_end_in_the_same_wake_up() {
+        let both = mpd::IdleEvent { player: true, release: true };
+        assert_eq!(idle_plan(both, true), IdlePlan { release: true, check_song_end: false });
+    }
+
+    #[test]
+    fn player_change_checks_song_end_only_while_playing() {
+        let player = mpd::IdleEvent { player: true, release: false };
+        assert_eq!(idle_plan(player, true), IdlePlan { release: false, check_song_end: true });
+        assert_eq!(idle_plan(player, false), IdlePlan { release: false, check_song_end: false });
+    }
+
+    #[test]
+    fn release_ends_the_cast_and_leaves_nothing_to_advance() {
+        let mut pl = playlist(3, 0);
+        pl.list_id = "PL1".into();
+        let mut play_started = true;
+
+        let msgs = release_cast(&mut pl, &mut play_started);
+
+        // The MPD stop that follows must not look like a song end.
+        assert!(!play_started);
+        assert!(pl.video_ids.is_empty());
+        assert_eq!(pl.current_index, 0);
+        assert!(pl.list_id.is_empty());
+        assert!(!idle_plan(mpd::IdleEvent { player: true, release: false }, play_started).check_song_end);
+        // Fresh state for the next cast: NowPlaying will be sent again.
+        assert_eq!(pl.last_state, messages::PlayerState::Idle);
+
+        let cmds: Vec<&str> = msgs.iter().map(|m| m.command.as_str()).collect();
+        assert_eq!(cmds, vec!["nowPlaying", "loungeScreenDisconnected"]);
+        assert!(msgs.iter().all(|m| m.args.is_empty()));
+    }
+
+    #[test]
+    fn release_applies_only_while_a_cast_is_active() {
+        assert!(release_applies(true, &PlaylistState::default()));
+        assert!(release_applies(false, &playlist(1, 0)));
+        assert!(!release_applies(false, &PlaylistState::default()));
     }
 
     #[test]
