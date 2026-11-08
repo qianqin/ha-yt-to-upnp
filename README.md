@@ -55,6 +55,7 @@ The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions 
 
 - Cast from YouTube Music or YouTube (phone, tablet, browser)
 - Play, pause, seek, skip, previous, volume - all controlled from phone
+- Speaker wakes early: from the DIAL launch until the first song, an idle MPD plays silence (pre-roll), so an `httpd` stream and the Raumfeld adapter already wake and connect the speaker while the phone is still loading the song. The song then replaces the silence without MPD stopping in between (`addid`, `playid`, `deleteid`). The silence is never reported to the phone and is no song end; a song that is playing or paused is never interrupted, and repeated launches neither stack nor restart it. It stops (MPD `stop` + `clear`) after 60 s without a song, on a speaker release, a stop from the phone or a disconnect
 - Auto-advance to next track when a song finishes (MPD idle events, not polling); a track whose audio stream fails is reported to the phone as not started and does not advance the queue
 - Playlist support with queue updates mid-session
 - Phone UI stays fully synced (seekbar, album art, controls)
@@ -67,7 +68,7 @@ The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions 
 
 ## Requirements
 
-- **MPD** (Music Player Daemon) running on the same host - audio is served to MPD via `http://localhost:8008/stream/...`, which only answers loopback connections
+- **MPD** (Music Player Daemon) running on the same host - audio is served to MPD via `http://localhost:8008/stream/...` (and the pre-roll silence via `http://localhost:8008/silence`), which only answer loopback connections
 - **Linux** (tested on Raspberry Pi Zero 2W with Debian trixie/aarch64)
 - Network access to YouTube servers
 - **Optional: [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs)** for PoToken generation (prevents CDN throttle after 60s). Uses [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) internally. Runs as HTTP server on port 4416. ~66MB RAM due to embedded V8 JS engine for BotGuard challenges — can be hosted on a separate machine/VPS to save RAM on the Pi.
@@ -96,7 +97,7 @@ Open YouTube Music on your phone, tap Cast, and select your device.
 
 ### Optional: play on a Teufel Raumfeld speaker
 
-Instead of a local sound card, MPD can serve the audio as an HTTP stream (`httpd` output) and the [Raumfeld adapter](adapter/README.md) - a small Python 3 sidecar, standard library only - makes a Raumfeld room play that stream automatically whenever MPD plays. It finds the speaker by UPnP UDN via SSDP and wakes the room. It never puts the room into standby itself; the Raumfeld's own auto power-off does that. At a takeover it holds MPD at the start of the song (`pause 1`, at most `START_GATE_SECONDS`) until the speaker plays the stream, so the first seconds are not lost. A zone renderer that hangs in `TRANSITIONING` while MPD plays is restarted with `Stop`, `Play` (at most 3 times per episode, with backoff). The speaker's own controls win: if the room is switched off (button or auto power-off) or to another source such as line-in during a cast, the adapter pauses MPD and sends `sendmessage ytcast release` on MPD's client-to-client channel, which tells the receiver to end the cast. It then leaves the room alone until the user resumes from the phone. An explicit cast wins at takeover: a new cast or a user resume takes the room over from line-in or any other source, even one reporting playing (line-in stays selected after Home Assistant switches it there and reports playing without audio). It never changes the volume. See [`adapter/mpd.conf.example`](adapter/mpd.conf.example) for the MPD side.
+Instead of a local sound card, MPD can serve the audio as an HTTP stream (`httpd` output) and the [Raumfeld adapter](adapter/README.md) - a small Python 3 sidecar, standard library only - makes a Raumfeld room play that stream automatically whenever MPD plays. It finds the speaker by UPnP UDN via SSDP and wakes the room. It never puts the room into standby itself; the Raumfeld's own auto power-off does that. At a takeover it holds MPD at the start of the song (`pause 1`, at most `START_GATE_SECONDS`) until the speaker plays the stream, so the first seconds are not lost. The receiver's pre-roll silence (see Features) starts that takeover at the DIAL launch, about 2 s before the song is ready; MPD's `httpd` output serves nothing while MPD is stopped with an empty queue. A zone renderer that hangs in `TRANSITIONING` while MPD plays is restarted with `Stop`, `Play` (at most 3 times per episode, with backoff). The speaker's own controls win: if the room is switched off (button or auto power-off) or to another source such as line-in during a cast, the adapter pauses MPD and sends `sendmessage ytcast release` on MPD's client-to-client channel, which tells the receiver to end the cast. It then leaves the room alone until the user resumes from the phone. An explicit cast wins at takeover: a new cast or a user resume takes the room over from line-in or any other source, even one reporting playing (line-in stays selected after Home Assistant switches it there and reports playing without audio). It never changes the volume. See [`adapter/mpd.conf.example`](adapter/mpd.conf.example) for the MPD side.
 
 ```bash
 RAUMFELD_ROOM_UDN=uuid:00000000-0000-0000-0000-000000000001 \
@@ -140,7 +141,8 @@ Before a release, run `scripts/release-check.sh`; see [docs/DEVOPS.md](docs/DEVO
 | `nsig.rs` | ~550 | n-parameter challenge decoder using the vendored yt-dlp/ejs solver (`src/vendor/`) in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
-| `dial.rs` | ~550 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
+| `dial.rs` | ~680 | DIAL HTTP server on port 8008 + `/stream/:videoId` and `/silence` endpoints (loopback peers only) |
+| `preroll.rs` | ~300 | Silence pre-roll from DIAL launch to the first song |
 | `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
 | `storage.rs` | ~350 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
 | `sabr/stream.rs` | ~2000 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
