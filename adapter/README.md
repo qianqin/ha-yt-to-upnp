@@ -7,8 +7,12 @@ Raumfeld room play the receiver's MPD stream automatically.
   wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
   it to a new one only if it has none) and tells the zone's renderer to play
   `STREAM_URL` via UPnP AVTransport.
-- If the zone already plays the stream, it does nothing. If the zone is playing
-  the Raumfeld **line-in** (e.g. another cast device), it does not take over.
+- If the zone already plays the stream, it does nothing. If the zone is actively
+  playing anything else, e.g. the Raumfeld **line-in** (a Chromecast Audio or a
+  karaoke machine) or another stream, it never takes over: the speaker is busy,
+  which counts as *taken away* (see below), so the cast ends instead of MPD
+  playing into nothing. That also holds for a new cast and for a user resume.
+  Another source that sits stopped or paused is taken over as usual.
 - **The speaker's own controls win.** While the adapter owns the zone and MPD
   plays or is paused, it looks at the room every `SPEAKER_POLL_SECONDS` (one
   `getZones` plus `GetTransportInfo`/`GetMediaInfo`, reusing the last SSDP
@@ -26,6 +30,7 @@ Raumfeld room play the receiver's MPD stream automatically.
      room again; if one slips in, MPD is paused again. Only a user resume from
      the phone (MPD pause -> play) lets it take the room back, waking it as
      usual; a new session (MPD pause -> stop, then play) takes over as usual too.
+     If another source still plays at that moment, the cast ends again.
 - A song change on a zone the adapter owns never wakes the room: if the room
   was switched off or to another source in the meantime, that counts as taken
   away right away.

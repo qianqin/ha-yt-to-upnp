@@ -174,7 +174,7 @@ class SpeakerYieldTest(unittest.TestCase):
         self.poll()
         self.released_while_playing()
 
-    def test_user_resume_while_line_in_still_plays_does_not_take_over(self):
+    def test_user_resume_after_a_line_in_yield_while_line_in_still_plays_ends_the_cast(self):
         self.cast_is_playing()
         self.rf.current_uri = LINE_IN_URI
         self.poll()
@@ -182,6 +182,32 @@ class SpeakerYieldTest(unittest.TestCase):
         self.mpd("pause", "play")
         self.assertFalse(self.taken_over())
         self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        self.released_while_playing()  # MPD does not play into nothing
+        self.rf.requests.clear()
+        self.poll()
+        self.assertEqual(self.rf.requests, [])  # yielded: no polling
+
+    def test_new_cast_while_line_in_plays_ends_the_cast(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "PLAYING"
+        self.rf.current_uri = LINE_IN_URI  # the karaoke machine is on
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.mpd("play")
+        self.assertFalse(self.taken_over())
+        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        self.released_while_playing()
+        self.assertTrue(any("line-in" in m for m in logs.output), logs.output)
+        self.mpd("stop", "play")  # a song change does not retry
+        self.assertFalse(self.taken_over())
+        self.repaused()
+
+    def test_new_cast_while_line_in_is_idle_takes_over(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "STOPPED"
+        self.rf.current_uri = LINE_IN_URI
+        self.mpd("play")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
         self.nothing_requested()
 
     def test_new_cast_session_after_release_takes_over_again(self):

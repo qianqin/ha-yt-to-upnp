@@ -120,7 +120,6 @@ ZoneStatus = namedtuple("ZoneStatus", "transport_state current_uri")
 
 TAKE_OVER = "take_over"
 ALREADY_PLAYING = "already_playing"
-LINE_IN_ACTIVE = "line_in_active"
 
 _PLAYING_STATES = ("PLAYING", "TRANSITIONING")
 
@@ -147,10 +146,9 @@ def decide_play(status, stream_url):
         return TAKE_OVER
     if status.current_uri == stream_url:
         return ALREADY_PLAYING
-    # The line-in is used by another player (e.g. a Chromecast Audio); never fight it.
-    if is_line_in(status.current_uri):
-        return LINE_IN_ACTIVE
-    return TAKE_OVER
+    # Someone else plays on the speaker (line-in from a Chromecast Audio or karaoke
+    # machine, another stream): never fight it; the cast ends instead.
+    return OTHER_SOURCE
 
 
 def judge_speaker(power, zone, status, stream_url):
@@ -419,8 +417,9 @@ class Controller:
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
             return decision
-        if decision == LINE_IN_ACTIVE:
-            log.info("zone %r is playing line-in; not taking over", room.zone)
+        if decision == OTHER_SOURCE:
+            source = "line-in" if is_line_in(room.status.current_uri) else "another source"
+            log.info("zone %r is playing %s; not taking over", room.zone, source)
             return decision
 
         room_param = quote(self.config.room_udn, safe="")
@@ -677,8 +676,6 @@ class Follower:
         decision = self.controller.ensure_playing(wake=self.wake)
         if decision in TAKEN_AWAY:
             self._yield(decision)
-        elif decision == LINE_IN_ACTIVE:
-            self.owned = False  # not ours; look again on the next song
         else:
             self.owned = True
             self._schedule(_POLL)

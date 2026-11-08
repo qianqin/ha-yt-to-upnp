@@ -93,10 +93,13 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(d(self.s("PLAYING", STREAM_URL), STREAM_URL), ra.ALREADY_PLAYING)
         self.assertEqual(d(self.s("TRANSITIONING", STREAM_URL), STREAM_URL), ra.ALREADY_PLAYING)
         self.assertEqual(d(self.s("STOPPED", STREAM_URL), STREAM_URL), ra.TAKE_OVER)
-        self.assertEqual(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL), ra.LINE_IN_ACTIVE)
-        self.assertEqual(d(self.s("TRANSITIONING", LINE_IN_URI), STREAM_URL), ra.LINE_IN_ACTIVE)
+        # Anything else actively playing is someone else's: never taken over.
+        self.assertEqual(d(self.s("PLAYING", LINE_IN_URI), STREAM_URL), ra.OTHER_SOURCE)
+        self.assertEqual(d(self.s("TRANSITIONING", LINE_IN_URI), STREAM_URL), ra.OTHER_SOURCE)
         self.assertEqual(d(self.s("STOPPED", LINE_IN_URI), STREAM_URL), ra.TAKE_OVER)
-        self.assertEqual(d(self.s("PLAYING", "http://other.invalid/x"), STREAM_URL), ra.TAKE_OVER)
+        self.assertEqual(d(self.s("PLAYING", "http://other.invalid/x"), STREAM_URL), ra.OTHER_SOURCE)
+        self.assertEqual(d(self.s("STOPPED", "http://other.invalid/x"), STREAM_URL), ra.TAKE_OVER)
+        self.assertEqual(d(self.s("PAUSED_PLAYBACK", LINE_IN_URI), STREAM_URL), ra.TAKE_OVER)
 
     def test_speaker_verdicts(self):
         j = ra.judge_speaker
@@ -289,13 +292,15 @@ class FollowerTest(unittest.TestCase):
         self.f.on_mpd_state("play")
         self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
 
-    def test_line_in_on_takeover_is_left_alone_and_not_polled(self):
-        self.ctl.decision = ra.LINE_IN_ACTIVE
-        self.f.on_mpd_state("play")
+    def test_busy_speaker_on_takeover_ends_the_cast(self):
+        self.ctl.decision = ra.OTHER_SOURCE
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play")
         self.assertIsNone(self.f.seconds_until_deadline())
-        self.assertEqual(self.f.take_mpd_requests(), [])
-        self.f.on_mpd_state("play")  # next track: look again, waking is still allowed
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+        self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.f.on_mpd_state("play")  # a song change: only paused again, no takeover
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.assertEqual(self.f.take_mpd_requests(), [ra.PAUSE_PLAYER])
 
     def test_taken_away_on_track_change_pauses_and_releases(self):
         self.f.on_mpd_state("play")

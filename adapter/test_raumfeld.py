@@ -88,11 +88,19 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.rf.api_calls(), ["getZones"])
         self.assertEqual(self.rf.current_uri, LINE_IN_URI)
 
+    def test_other_stream_actively_playing_is_not_taken_over(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "PLAYING"
+        self.rf.current_uri = "http://radio.invalid/live.mp3"
+        self.assertEqual(self.ctl.ensure_playing(), ra.OTHER_SOURCE)
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
+        self.assertEqual(self.rf.api_calls(), ["getZones"])
+
     def test_takeover_reports_its_decision(self):
         self.assertEqual(self.ctl.ensure_playing(), ra.TAKE_OVER)
         self.assertEqual(self.ctl.ensure_playing(), ra.ALREADY_PLAYING)
         self.rf.current_uri = LINE_IN_URI
-        self.assertEqual(self.ctl.ensure_playing(), ra.LINE_IN_ACTIVE)
+        self.assertEqual(self.ctl.ensure_playing(), ra.OTHER_SOURCE)
 
     def test_without_wake_a_room_in_standby_is_left_off(self):
         self.assertEqual(self.ctl.ensure_playing(wake=False), ra.STANDBY)
