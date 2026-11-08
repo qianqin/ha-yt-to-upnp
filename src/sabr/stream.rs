@@ -633,11 +633,18 @@ fn replace_n_param(url: &str, decoded_n: &str) -> String {
 // Audio format selection
 // ---------------------------------------------------------------------------
 
+/// YouTube Music Premium audio (774: Opus ~256k, 141: AAC 256k). A ctt
+/// /player response lists them when the casting account has Premium, but the
+/// SABR session (anonymous visitor + ctt) is not entitled to them: requesting
+/// one gets only RELOAD_PLAYER_RESPONSE back, never media.
+const PREMIUM_ONLY_AUDIO_ITAGS: [i32; 2] = [774, 141];
+
 /// Choose the best audio format, preferring Opus/WebM at the highest bitrate.
 fn choose_audio_format(formats: &[AdaptiveFormat]) -> Option<&AdaptiveFormat> {
     formats
         .iter()
         .filter(|f| f.mime_type.starts_with("audio/"))
+        .filter(|f| !PREMIUM_ONLY_AUDIO_ITAGS.contains(&f.itag))
         .max_by_key(|f| {
             let codec_priority: u64 = if f.mime_type.contains("opus") {
                 1_000_000_000
@@ -1063,17 +1070,61 @@ fn handle_context_sending_policy(state: &mut SabrState, data: &[u8]) -> Result<(
     Ok(())
 }
 
-fn handle_stream_protection(data: &[u8]) -> Result<(), SabrError> {
+/// Status 1 only says the session is not (yet) asking for attestation; it says
+/// nothing about format entitlement, so the log just states the facts.
+fn handle_stream_protection(data: &[u8], po_token_sent: bool) -> Result<(), SabrError> {
     let sps = vs::StreamProtectionStatus::decode(data)?;
     let status = sps.status.unwrap_or(0);
+    let sent = if po_token_sent { "PoToken sent" } else { "no PoToken sent" };
     match status {
-        0 => tracing::info!("[sabr] stream_protection_status=0 (no protection)"),
-        1 => tracing::info!("[sabr] stream_protection_status=1 (OK — Premium/PoToken accepted!)"),
-        2 => tracing::warn!("[sabr] stream_protection_status=2 (GRACE PERIOD — ~60s then throttle)"),
-        3 => tracing::error!("[sabr] stream_protection_status=3 (HARD BLOCK — no more media)"),
-        n => tracing::warn!("[sabr] stream_protection_status={} (unknown)", n),
+        0 => tracing::info!("[sabr] stream_protection_status=0 (no protection, {})", sent),
+        1 => tracing::info!("[sabr] stream_protection_status=1 (OK, {})", sent),
+        2 => tracing::warn!("[sabr] stream_protection_status=2 (attestation pending, {} — ~60s then throttle)", sent),
+        3 => tracing::error!("[sabr] stream_protection_status=3 (attestation required, {} — no more media)", sent),
+        n => tracing::warn!("[sabr] stream_protection_status={} (unknown, {})", n, sent),
     }
     Ok(())
+}
+
+/// The server wants a fresh /player response before it serves anything (it
+/// answers this way e.g. for a format the session may not stream). Reloading
+/// is not implemented, and repeating the same request only gets the same
+/// answer, so the stream ends.
+#[derive(Debug)]
+struct ReloadRequested;
+
+impl std::fmt::Display for ReloadRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server requested a player response reload (RELOAD_PLAYER_RESPONSE); no media will follow")
+    }
+}
+
+impl std::error::Error for ReloadRequested {}
+
+/// Transport and transient errors are retried; a reload request is final.
+fn is_retryable(e: &SabrError) -> bool {
+    !e.is::<ReloadRequested>()
+}
+
+/// Apply one UMP part to the stream state. Returns audio bytes to forward.
+fn handle_part(state: &mut SabrState, part: &ump::UmpPart) -> Result<Option<Bytes>, SabrError> {
+    match part.part_type {
+        ump::FORMAT_INITIALIZATION_METADATA => handle_format_init_metadata(state, &part.data)?,
+        ump::MEDIA_HEADER => handle_media_header(state, &part.data)?,
+        ump::MEDIA => return Ok(handle_media(state, &part.data)),
+        ump::MEDIA_END => handle_media_end(state, &part.data),
+        ump::NEXT_REQUEST_POLICY => handle_next_request_policy(state, &part.data)?,
+        ump::SABR_REDIRECT => handle_sabr_redirect(state, &part.data)?,
+        ump::SABR_ERROR => handle_sabr_error(&part.data)?,
+        ump::RELOAD_PLAYER_RESPONSE => return Err(ReloadRequested.into()),
+        ump::SABR_CONTEXT_UPDATE => handle_context_update(state, &part.data)?,
+        ump::STREAM_PROTECTION_STATUS => {
+            handle_stream_protection(&part.data, state.po_token.is_some())?
+        }
+        ump::SABR_CONTEXT_SENDING_POLICY => handle_context_sending_policy(state, &part.data)?,
+        other => tracing::debug!("[sabr] unhandled UMP type={}, {} bytes", other, part.data.len()),
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,47 +1187,10 @@ async fn sabr_request_cycle(
         parser.push(&chunk);
 
         while let Some(part) = parser.next_part() {
-            match part.part_type {
-                ump::FORMAT_INITIALIZATION_METADATA => {
-                    handle_format_init_metadata(state, &part.data)?;
-                }
-                ump::MEDIA_HEADER => {
-                    handle_media_header(state, &part.data)?;
-                }
-                ump::MEDIA => {
-                    if let Some(audio_bytes) = handle_media(state, &part.data) {
-                        if tx.send(audio_bytes).await.is_err() {
-                            tracing::info!("[sabr] receiver dropped, stopping");
-                            return Ok(false);
-                        }
-                    }
-                }
-                ump::MEDIA_END => {
-                    handle_media_end(state, &part.data);
-                }
-                ump::NEXT_REQUEST_POLICY => {
-                    handle_next_request_policy(state, &part.data)?;
-                }
-                ump::SABR_REDIRECT => {
-                    handle_sabr_redirect(state, &part.data)?;
-                }
-                ump::SABR_ERROR => {
-                    handle_sabr_error(&part.data)?;
-                }
-                ump::SABR_CONTEXT_UPDATE => {
-                    handle_context_update(state, &part.data)?;
-                }
-                ump::STREAM_PROTECTION_STATUS => {
-                    handle_stream_protection(&part.data)?;
-                }
-                ump::SABR_CONTEXT_SENDING_POLICY => {
-                    handle_context_sending_policy(state, &part.data)?;
-                }
-                other => {
-                    tracing::debug!(
-                        "[sabr] unhandled UMP type={}, {} bytes",
-                        other, part.data.len(),
-                    );
+            if let Some(audio_bytes) = handle_part(state, &part)? {
+                if tx.send(audio_bytes).await.is_err() {
+                    tracing::info!("[sabr] receiver dropped, stopping");
+                    return Ok(false);
                 }
             }
         }
@@ -1401,6 +1415,7 @@ async fn sabr_loop(
                     break;
                 }
             }
+            Err(e) if !is_retryable(&e) => return Err(e),
             Err(e) => {
                 consecutive_errors += 1;
                 if consecutive_errors > MAX_RETRIES {
@@ -1793,5 +1808,102 @@ mod tests {
             assert!(req.headers().get(reqwest::header::COOKIE).is_none());
             assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
         }
+    }
+
+    // -- format selection and server control parts ------------------------------
+
+    fn audio(itag: i32, mime: &str, bitrate: u64) -> AdaptiveFormat {
+        AdaptiveFormat {
+            itag,
+            last_modified: 1,
+            xtags: None,
+            mime_type: mime.to_owned(),
+            bitrate,
+        }
+    }
+
+    const OPUS: &str = "audio/webm; codecs=\"opus\"";
+    const AAC: &str = "audio/mp4; codecs=\"mp4a.40.2\"";
+
+    #[test]
+    fn audio_selection_skips_premium_only_formats() {
+        // A ctt /player response lists the cast account's Premium formats
+        // (774, 141), but the SABR session does not serve them.
+        let formats = [
+            audio(774, OPUS, 272_644),
+            audio(141, AAC, 262_000),
+            audio(140, AAC, 134_111),
+            audio(251, OPUS, 146_272),
+            audio(250, OPUS, 73_493),
+        ];
+        assert_eq!(choose_audio_format(&formats).map(|f| f.itag), Some(251));
+    }
+
+    #[test]
+    fn audio_selection_with_only_premium_formats_finds_none() {
+        let formats = [audio(774, OPUS, 272_644), audio(141, AAC, 262_000)];
+        assert!(choose_audio_format(&formats).is_none());
+    }
+
+    fn part(part_type: u32, data: Vec<u8>) -> ump::UmpPart {
+        ump::UmpPart { part_type, data }
+    }
+
+    #[test]
+    fn reload_player_response_ends_the_stream_without_retry() {
+        let mut state = test_state(GOOD_URL);
+        // ReloadPlaybackContext { reload_playback_params { token: "tok" } }
+        let data = vec![0x0a, 0x05, 0x0a, 0x03, b't', b'o', b'k'];
+
+        let err = handle_part(&mut state, &part(ump::RELOAD_PLAYER_RESPONSE, data)).unwrap_err();
+
+        assert!(!is_retryable(&err));
+        assert!(err.to_string().contains("reload"), "{err}");
+        assert!(!err.to_string().contains("tok"), "{err}");
+    }
+
+    #[test]
+    fn transport_errors_stay_retryable() {
+        let err: SabrError = "connection reset".into();
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn media_part_for_audio_is_returned_for_sending() {
+        let mut state = test_state(GOOD_URL);
+        state.header_map.insert(
+            3,
+            HeaderInfo {
+                itag: 251,
+                is_init_seg: false,
+                sequence_number: 1,
+                start_ms: 0,
+                duration_ms: 10_000,
+                is_audio: true,
+            },
+        );
+
+        let out = handle_part(&mut state, &part(ump::MEDIA, vec![3, 0xaa, 0xbb])).unwrap();
+
+        assert_eq!(out.as_deref(), Some(&[0xaa, 0xbb][..]));
+    }
+
+    fn protection(status: i32) -> Vec<u8> {
+        vs::StreamProtectionStatus { status: Some(status), ..Default::default() }.encode_to_vec()
+    }
+
+    #[test]
+    fn protection_status_log_says_whether_a_potoken_was_sent() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = test_state(GOOD_URL);
+
+        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
+        state.po_token = Some(b"pot".to_vec());
+        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
+
+        let logs = logs.text();
+        assert!(logs.contains("stream_protection_status=1 (OK, no PoToken sent)"), "{logs}");
+        assert!(logs.contains("stream_protection_status=1 (OK, PoToken sent)"), "{logs}");
+        assert!(!logs.contains("Premium"), "{logs}");
     }
 }

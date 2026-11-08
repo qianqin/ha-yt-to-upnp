@@ -41,7 +41,7 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 
 **Under the hood:**
 1. InnerTube `/player` call using WEB_REMIX client + credential transfer token (ctt) from the cast session for authenticated access. When casting from YouTube Music, the phone sends a per-video ctt automatically — no setup needed. Without a ctt (or if the anonymous YouTube Music session failed to load) it uses the IOS client, with ANDROID as a further fallback (some tracks may be restricted without authentication)
-2. Picks the highest-bitrate Opus audio format
+2. Picks the highest-bitrate Opus audio format, skipping YouTube Music Premium-only formats (774, 141): a ctt can list them, but the SABR session does not serve them
 3. Opens a SABR session with YouTube's CDN using protobuf requests
 4. Parses UMP (Universal Media Protocol) binary response frames
 5. Extracts and streams audio segments as chunked HTTP to MPD
