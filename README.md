@@ -53,14 +53,14 @@ The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions 
 
 - Cast from YouTube Music or YouTube (phone, tablet, browser)
 - Play, pause, seek, skip, previous, volume - all controlled from phone
-- Auto-advance to next track when a song finishes (MPD idle events, not polling)
+- Auto-advance to next track when a song finishes (MPD idle events, not polling); a track whose audio stream fails is reported to the phone as not started and does not advance the queue
 - Playlist support with queue updates mid-session
 - Phone UI stays fully synced (seekbar, album art, controls)
 - Graceful disconnect (stops playback when phone disconnects)
 - Best-quality Opus audio (itag 251, up to ~160kbps, 48kHz stereo)
 - Authenticated streaming via cast session credential transfer tokens (WEB_REMIX + ctt)
 - Full YouTube Music session context (fetches live ytcfg anonymously from music.youtube.com for WEB_REMIX /player)
-- n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver in QuickJS
+- n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver (0.8.0) in QuickJS. When YouTube changes its player and streams start failing, an outdated solver is the usual cause - see [src/vendor/README.md](src/vendor/README.md) to update it
 - Dual Lounge sessions (YouTube + YouTube Music themes) for broad compatibility
 
 ## Requirements
@@ -105,7 +105,7 @@ python3 -m adapter
 
 The receiver never logs in and stores no credentials of its own: authentication comes from the casting client, which sends a per-video credential transfer token (ctt) with each track. WEB_REMIX is used only when a cast supplies a ctt and the YouTube Music session loaded; otherwise the anonymous IOS client is used. At startup the public music.youtube.com page is fetched anonymously for the session context (visitor data, signature timestamp, nsig player); that one request carries a fixed consent cookie `SOCS=CAI` ("reject all") so EU visitors are not redirected to the consent page - it holds no account data and is not authentication. Requests carrying the ctt or the session fetch only follow redirects to Google hosts. Cookie files are no longer supported: `YTM_COOKIES` and `ytm-cookies.txt` are ignored, so delete any old `ytm-cookies.txt`.
 
-With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If the config or an nsig cache file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
+With `YTCAST_DATA_DIR` set, `ytcast-lite.json` (config) and `nsig-cache/` live under it; otherwise they go to `~/.config/` and `~/.cache/ytcast/` (OS equivalents elsewhere). Config and nsig cache files are written atomically with mode 0600 and created directories with 0700; a cached nsig player that fails to run is discarded and fetched again. nsig cache filenames include the ejs solver version; files from older versions are unused and can be deleted. Use an absolute path for `YTCAST_DATA_DIR` (an empty value counts as unset; a relative path works but logs a warning). If the config or an nsig cache file is readable by group/others, a warning is logged - fix it with `chmod 600 <file>`.
 
 ## Building
 
@@ -128,18 +128,18 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.rs` | ~1190 | Entry point, player command loop, MPD idle events, auto-advance |
-| `lounge.rs` | ~1230 | YouTube Lounge API - session management, streaming long-poll, command parsing (session tokens and pairing codes are kept out of logs) |
+| `main.rs` | ~1280 | Entry point, player command loop, MPD idle events, auto-advance |
+| `lounge.rs` | ~1200 | YouTube Lounge API - session management, streaming long-poll, command parsing (session tokens and pairing codes are kept out of logs) |
 | `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `music_session.rs` | ~600 | Anonymous YouTube Music session at startup: fetches the public music.youtube.com page for ytcfg context, visitor data, STS and the base.js player for nsig |
+| `music_session.rs` | ~620 | Anonymous YouTube Music session at startup: fetches the public music.youtube.com page for ytcfg context, visitor data, STS and the base.js player for nsig |
 | `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
-| `nsig.rs` | ~390 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
+| `nsig.rs` | ~430 | n-parameter challenge decoder using the vendored yt-dlp/ejs solver (`src/vendor/`) in QuickJS |
 | `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~280 | SSDP multicast discovery responder |
-| `dial.rs` | ~510 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
+| `dial.rs` | ~550 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
 | `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
-| `storage.rs` | ~310 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
-| `sabr/stream.rs` | ~1830 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
+| `storage.rs` | ~350 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
+| `sabr/stream.rs` | ~1800 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 | `adapter/raumfeld_adapter.py` | ~620 | Optional Python sidecar (not part of the binary): follows MPD and plays its httpd stream on a Raumfeld room via SSDP/UPnP AVTransport, standby after idle. See [adapter/README.md](adapter/README.md) |
@@ -178,7 +178,7 @@ The bgutil-pot sidecar generates PoTokens (BotGuard attestation) needed to preve
 
 - [sabr-rs](https://github.com/mthwJsmith/sabr-rs) - our Rust SABR implementation (extracted as a standalone crate)
 - [googlevideo](https://github.com/LuanRT/googlevideo) by LuanRT - TypeScript SABR reference implementation + proto definitions
-- [yt-dlp/ejs](https://github.com/nichobi/ejs) - JavaScript-based n-parameter (nsig) challenge solver, embedded in QuickJS
+- [yt-dlp/ejs](https://github.com/yt-dlp/ejs) - JavaScript-based n-parameter (nsig) challenge solver, embedded in QuickJS
 - [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs) by jim60105 - Rust PoToken provider (BotGuard attestation)
 - [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) - Rust BotGuard challenge solver used by bgutil-pot
 - [yt-cast-receiver](https://github.com/patrickkfkan/yt-cast-receiver) by patrickkfkan - Node.js cast receiver framework (protocol reference)
