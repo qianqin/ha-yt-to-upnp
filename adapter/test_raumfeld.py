@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 import raumfeld_adapter as ra
@@ -25,8 +26,14 @@ class ControllerTest(unittest.TestCase):
             "STREAM_MIME": "audio/mpeg",
             "STREAM_METADATA": "1" if self.metadata else "0",
         })
+        self.now = 1000.0  # sleeping moves the controller's clock on
         self.ctl = ra.Controller(config, self.discover, api_port=self.rf.port,
-                                 sleep=self.sleeps.append, zone_wait_s=10, zone_poll_s=0.5)
+                                 sleep=self.sleep, zone_wait_s=10, zone_poll_s=0.5,
+                                 clock=lambda: self.now)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
 
     def tearDown(self):
         # Scenario: never volume, never Stop or standby -- in every scenario.
@@ -88,6 +95,31 @@ class ControllerTest(unittest.TestCase):
         self.assertTrue(any("anyway" in m for m in logs.output), logs.output)
         self.assertEqual(len(self.sleeps), int(ra.WAKE_WAIT_S / ra.WAKE_POLL_S))
         self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def test_wake_wait_is_bounded_by_time_not_by_the_number_of_looks(self):
+        self.rf.wake_after_polls = 1000
+        start = self.now
+
+        def slow_answer():  # each getZones takes 3 s
+            self.now += 3
+        self.rf.on_get_zones = slow_answer
+        with mock.patch.object(ra, "http_get", wraps=ra.http_get) as get:
+            with self.assertLogs("raumfeld_adapter", "WARNING"):
+                self.ctl.ensure_playing()
+        # The first getZones is the look before the wake; then the wait, 3 s per look.
+        looks = [c for c in get.call_args_list if c.args[0].endswith("getZones")][1:]
+        self.assertEqual(self.now - start, 3 + ra.WAKE_WAIT_S)
+        # Each look may only take what is left of the wait: at +0, +3.5 and +7 s.
+        self.assertEqual([c.args[1] for c in looks], [ra.WAKE_WAIT_S, 6.5, 3.0])
+        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def test_woken_room_active_without_its_zone_is_waited_for_not_reconnected(self):
+        self.rf.rejoin_after_polls = 3  # ACTIVE at once, back in its zone a little later
+        self.ctl.ensure_playing()
+        self.assertNotIn("connectRoomToZone", self.rf.api_calls())
+        self.assertEqual(self.rf.api_calls(), ["getZones", "leaveStandby"] + ["getZones"] * 4)
+        self.assertEqual(self.discover.searches[-1], ZONE_UDN)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
 
     def test_active_room_is_not_waited_for(self):
         self.rf.power = "ACTIVE"
@@ -211,21 +243,43 @@ class ControllerTest(unittest.TestCase):
         with self.assertRaises(ra.RaumfeldError):
             self.ctl.renderer_state()
 
-    def test_forced_takeover_sets_up_a_transitioning_renderer_afresh(self):
+    def test_renderer_state_truncates_what_the_device_reports(self):
         self.rf.power = "ACTIVE"
-        self.rf.current_uri, self.rf.transport_state = STREAM_URL, "TRANSITIONING"
-        self.assertEqual(self.ctl.ensure_playing(), ra.ALREADY_PLAYING)  # unforced: left alone
-        self.assertNotIn("Play", self.rf.soap_actions())
-        self.assertEqual(self.ctl.ensure_playing(force=True), ra.TAKE_OVER)
+        self.ctl.check()
+        self.rf.transport_state, self.rf.current_uri = "X" * 500, ""
+        self.assertEqual(self.ctl.renderer_state(), "X" * 64 + " (another source)")
+
+    def test_retake_leaves_a_zone_playing_another_source_alone(self):
+        for state in ("PLAYING", "TRANSITIONING"):
+            with self.subTest(state=state):
+                self.rf.requests.clear()
+                self.rf.power = "ACTIVE"
+                self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, state
+                self.assertEqual(self.ctl.ensure_playing(retake=True), ra.OTHER_SOURCE)
+                self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
+                self.assertEqual(self.rf.api_calls(), ["getZones"])  # not woken either
+                self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+
+    def test_retake_sets_up_a_renderer_that_lost_our_stream(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = "", "NO_MEDIA_PRESENT"
+        self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
         self.assertEqual(self.rf.soap_actions()[-2:], ["SetAVTransportURI", "Play"])
         self.assertEqual(self.rf.transport_state, "PLAYING")
 
-    def test_forced_takeover_leaves_a_playing_renderer_alone(self):
-        self.rf.power = "ACTIVE"
-        self.rf.current_uri, self.rf.transport_state = STREAM_URL, "PLAYING"
-        self.assertEqual(self.ctl.ensure_playing(force=True), ra.ALREADY_PLAYING)
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
-        self.assertEqual(self.rf.api_calls(), ["getZones"])  # no leaveStandby either
+    def test_retake_wakes_a_room_back_in_standby(self):
+        self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
+        self.assertIn("leaveStandby", self.rf.api_calls())
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_renderer_transitioning_on_our_stream_is_left_alone(self):
+        for retake in (False, True):
+            with self.subTest(retake=retake):
+                self.rf.requests.clear()
+                self.rf.power = "ACTIVE"
+                self.rf.current_uri, self.rf.transport_state = STREAM_URL, "TRANSITIONING"
+                self.assertEqual(self.ctl.ensure_playing(retake=retake), ra.ALREADY_PLAYING)
+                self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"])
 
     def test_speaker_not_found_raises_device_not_found(self):
         self.discover.speaker_present = False

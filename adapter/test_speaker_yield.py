@@ -25,14 +25,15 @@ def make_controller(rf, discover):
     return ra.Controller(config, discover, api_port=rf.port, sleep=lambda s: None)
 
 
-def assert_speaker_left_alone(test, rf):
+def assert_speaker_left_alone(test, rf, restarts=0):
     """In every scenario: no volume, and the adapter never stops or powers down the room
-    itself (the Raumfeld's own auto power-off does that)."""
+    itself (the Raumfeld's own auto power-off does that); a Stop only as part of the
+    expected number of renderer restarts (Stop, Play)."""
     for method, path, action, body in rf.requests:
         test.assertNotIn("RenderingControl", path)
         test.assertNotIn("Volume", path + (action or "") + body)
         test.assertNotIn("Standby", path.replace("leaveStandby", ""))
-        test.assertNotEqual(action, "Stop")
+    test.assertEqual(rf.soap_actions().count("Stop"), restarts)
 
 
 class SpeakerYieldTest(unittest.TestCase):
@@ -443,9 +444,10 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
         self.clock = FakeClock()
         self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
                                     poll_seconds=POLL_S, clock=self.clock, start_gate_seconds=15)
+        self.restarts = 0
 
     def tearDown(self):
-        assert_speaker_left_alone(self, self.rf)
+        assert_speaker_left_alone(self, self.rf, self.restarts)
 
     def requests(self):
         return self.follower.take_mpd_requests()
@@ -525,6 +527,30 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
             self.poll()
         self.assertEqual(self.requests(), [])
         self.assertFalse(self.follower.yielded)
+
+    def test_another_source_started_during_the_gate_is_not_overridden(self):
+        self.rf.drop_plays = 1
+        self.cast()
+        with self.rf.lock:  # someone switches the room to line-in meanwhile
+            self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        logs = self.gate_until_released()
+        self.assertFalse(any("again" in m for m in logs), logs)
+        self.assertEqual(self.rf.soap_actions().count("SetAVTransportURI"), 1)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+
+    def test_renderer_hanging_in_transitioning_is_restarted_within_the_gate(self):
+        self.rf.stuck = True  # Play leaves it TRANSITIONING; Stop, Play brings it back
+        self.cast()
+        logs = self.gate_until_released()
+        self.restarts = 1
+        self.assertEqual([a for a in self.rf.soap_actions() if a in ("Stop", "Play")],
+                         ["Play", "Stop", "Play"])
+        self.assertEqual(self.rf.soap_actions().count("SetAVTransportURI"), 1)
+        self.assertFalse(any("taking over again" in m for m in logs), logs)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
 
     def test_user_stopping_the_speaker_after_it_played_is_still_respected(self):
         self.cast()

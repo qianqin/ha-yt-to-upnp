@@ -47,6 +47,11 @@ class FakeRaumfeld:
         self.wake_after_polls = 0
         self.zone_after_wake = None
         self._waking = None
+        # A room that is ACTIVE right after leaveStandby but rejoins its zone only after this
+        # many getZones.
+        self.rejoin_after_polls = 0
+        self._rejoining = None
+        self.on_get_zones = None  # called at every getZones, e.g. to model a slow answer
         self.fail_paths = set()  # substrings of paths that answer 500
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.redirect_base = HOST_PREFIX  # where the API's 307 points
@@ -114,6 +119,13 @@ class FakeRaumfeld:
     def _api(self, name, query):
         room = query.get("roomUDN", [None])[0]
         if name == "getZones":
+            if self.on_get_zones:
+                self.on_get_zones()
+            if self._rejoining is not None:
+                if self._rejoining[0] <= 0:
+                    self.zone_udn, self._rejoining = self._rejoining[1], None
+                else:
+                    self._rejoining = (self._rejoining[0] - 1, self._rejoining[1])
             if self._waking is not None:
                 if self._waking <= 0:
                     self._wake()
@@ -143,6 +155,8 @@ class FakeRaumfeld:
         self.power, self._waking = "ACTIVE", None
         if self.zone_after_wake:
             self.zone_udn = self.zone_after_wake
+        if self.rejoin_after_polls:
+            self._rejoining, self.zone_udn = (self.rejoin_after_polls, self.zone_udn), None
 
     def _soap(self, action, body):
         root = ET.fromstring(body)

@@ -36,8 +36,8 @@ HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and r
 MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a few KiB
 MPD_MAX_LINE = 64 * 1024
 # After leaveStandby the room is asked every WAKE_POLL_S whether it is awake (ACTIVE, in
-# its zone), at most WAKE_WAIT_S; a speaker still finishing its standby accepts the
-# takeover and drops it.
+# its zone), for at most WAKE_WAIT_S in all, slow answers included; a speaker still
+# finishing its standby accepts the takeover and drops it.
 WAKE_WAIT_S = 10
 WAKE_POLL_S = 0.5
 UDN_RE = re.compile(r"uuid:[0-9A-Za-z-]{1,64}")
@@ -162,6 +162,10 @@ NO_ZONE = "no_zone"
 OTHER_SOURCE = "other_source"
 # Someone else has the speaker now; the adapter must give it up.
 TAKEN_AWAY = (STANDBY, NO_ZONE, OTHER_SOURCE)
+# Appended by Controller.renderer_state when the renderer holds a URI other than ours.
+ANOTHER_SOURCE = " (another source)"
+# The longest transport state taken from a device into a log line.
+MAX_STATE_LEN = 64
 
 
 def is_line_in(uri):
@@ -181,6 +185,12 @@ def decide_play(status, stream_url):
             and status.current_uri == stream_url):
         return ALREADY_PLAYING
     return TAKE_OVER
+
+
+def plays_another_source(status, stream_url):
+    """The zone renderer plays (or is about to play) something other than our stream."""
+    return (status is not None and status.transport_state in _PLAYING_STATES
+            and status.current_uri != stream_url)
 
 
 def judge_speaker(power, zone, status, stream_url):
@@ -428,31 +438,32 @@ class Controller:
     the last discovery until it fails or the zone changes."""
 
     def __init__(self, config, discover, api_port=RAUMFELD_API_PORT, sleep=time.sleep,
-                 zone_wait_s=10.0, zone_poll_s=0.5):
+                 zone_wait_s=10.0, zone_poll_s=0.5, clock=time.monotonic):
         self.config = config
         self.discover = discover
         self.api_port = api_port
         self.sleep = sleep
+        self.clock = clock
         self.zone_polls = int(zone_wait_s / zone_poll_s)
         self.zone_poll_s = zone_poll_s
-        self.wake_polls = int(WAKE_WAIT_S / WAKE_POLL_S)
         self._api = None
         self._control = None  # (zone UDN, AVTransport control URL)
 
-    def ensure_playing(self, wake=True, force=False):
+    def ensure_playing(self, wake=True, retake=False):
         """Make the room play our stream; returns the decision taken. With wake=False
         (a track change on a zone we already own) a room someone took away is left
-        alone and its verdict returned instead. With force=True (a takeover done again
-        because the renderer did not start) a renderer TRANSITIONING on our stream is
-        set up afresh too; one that PLAYS our stream is still left alone."""
+        alone and its verdict returned instead. With retake=True (a takeover done again
+        because the renderer did not start) a zone that plays another source is left
+        alone and OTHER_SOURCE returned: someone started it after our takeover."""
         room = self._inspect()
         if not wake:
             verdict = judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
             if verdict in TAKEN_AWAY:
                 return verdict
+        if retake and plays_another_source(room.status, self.config.stream_url):
+            log.info("zone %r plays another source now; not taking it over again", room.zone)
+            return OTHER_SOURCE
         decision = decide_play(room.status, self.config.stream_url)
-        if force and room.status and room.status.transport_state != "PLAYING":
-            decision = TAKE_OVER
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
             return decision
@@ -494,8 +505,9 @@ class Controller:
         lag behind."""
         control = self._known_control()
         state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
+        state = state[:MAX_STATE_LEN]  # device-supplied, and it ends up in log lines
         uri = soap_call(control, "GetMediaInfo", []).get("CurrentURI", "")
-        return state if uri == self.config.stream_url else state + " (another source)"
+        return state if uri == self.config.stream_url else state + ANOTHER_SOURCE
 
     def restart_renderer(self):
         """Stop, then Play, on the zone renderer of the last look at the room. A renderer that
@@ -535,14 +547,20 @@ class Controller:
 
     def _wait_awake(self, api, had_zone):
         """The room's zone once getZones reports the room ACTIVE (and, if it had one before
-        the wake, in a zone); after WAKE_WAIT_S whatever it reports then."""
-        for look in range(self.wake_polls + 1):
-            if look:
-                self.sleep(WAKE_POLL_S)
-            zones = http_get(api + "getZones")
+        the wake, in a zone); after WAKE_WAIT_S whatever the last look reported. Each look
+        may only take what is left of the wait."""
+        deadline = self.clock() + WAKE_WAIT_S
+        while True:
+            zones = http_get(api + "getZones", deadline - self.clock())
             zone = zone_of_room(zones, self.config.room_udn)
             if room_power_state(zones, self.config.room_udn) == "ACTIVE" and (zone or not had_zone):
                 return zone
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            self.sleep(min(WAKE_POLL_S, remaining))
+            if self.clock() >= deadline:
+                break
         log.warning("room not awake %g s after leaveStandby; taking over anyway", WAKE_WAIT_S)
         return zone
 
@@ -737,10 +755,15 @@ GATE_POLL_S = 0.5
 # holding the song any longer only leaves the phone standing still.
 START_GATE_MAX_S = 60
 # A speaker still finishing its standby when woken accepts the takeover and drops it. So a
-# renderer not PLAYING our stream GATE_RETAKE_S after the takeover returned gets the whole
-# takeover again, at most GATE_MAX_RETAKES times per gate. Every takeover in the gate may
-# push its end to GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has
-# time to play.
+# renderer that has not loaded or does not play our stream (stopped, no media, a URI not
+# ours, no answer) GATE_RETAKE_S after the takeover returned gets the whole takeover again,
+# at most GATE_MAX_RETAKES times per gate, and only while it can still have its wake wait
+# and GATE_RETAKE_S before START_GATE_MAX_S. Every takeover in the gate may push its end to
+# GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has time to play.
+# Never taken over again: a renderer playing another source (someone started it) or one
+# TRANSITIONING on our stream (buffering); the latter is restarted (Stop, Play) once if
+# still TRANSITIONING 2 * GATE_RETAKE_S after the takeover, and after the gate the stuck
+# handling (STUCK_S) takes over.
 GATE_RETAKE_S = 5
 GATE_MAX_RETAKES = 2
 
@@ -766,9 +789,27 @@ class _Gate:
         self.song = song
         self.started = started
         self.deadline = started + seconds
-        self.taken = None  # when the last takeover returned
+        self.taken = None  # when the last takeover (or restart) in the gate returned
         self.retakes = 0
+        self.restarted = False  # a renderer TRANSITIONING on our stream was restarted
         self.seen = "not asked yet"  # the last renderer state, for the timeout warning
+
+    def fits(self, now, wake_s):
+        """A takeover starting now, after a wake wait of wake_s, still has GATE_RETAKE_S
+        to play before the gate's hard bound."""
+        return now + wake_s + GATE_RETAKE_S <= self.started + START_GATE_MAX_S
+
+    def retake_due(self, now):
+        return (self.seen != "TRANSITIONING" and self.retakes < GATE_MAX_RETAKES
+                and now >= self.taken + GATE_RETAKE_S and self.fits(now, WAKE_WAIT_S))
+
+    def restart_due(self, now):
+        return (self.seen == "TRANSITIONING" and not self.restarted
+                and now >= self.taken + 2 * GATE_RETAKE_S and self.fits(now, 0))
+
+
+# What renderer_state reports for a renderer someone else made play: never taken over again.
+_OTHER_SOURCE_PLAYING = tuple(state + ANOTHER_SOURCE for state in _PLAYING_STATES)
 
 _REASONS = {
     STANDBY: "room went to standby",
@@ -793,11 +834,14 @@ class Follower:
     asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
     pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). A
     renderer that does not start gets the takeover again (GATE_RETAKE_S,
-    GATE_MAX_RETAKES); if it still has never played when the gate ends, it gets one more
-    before it counts as taken away. Its own pause and resume are not followed; a failed takeover lets MPD play at once and is
-    retried after PLAY_RETRY_S without the gate. A stop or another song during the gate is
-    the user's doing and is never undone; a pause from the phone during the gate can't
-    be told apart from ours (MPD is already paused, nothing changes), so it is undone."""
+    GATE_MAX_RETAKES), one TRANSITIONING on our stream a restart instead; if it still has
+    never played when the gate ends, it gets one more takeover before it counts as taken
+    away. A renderer someone made play another source ends the gate at once and the next
+    look at the room yields to it. Its own pause and resume are not followed; a failed
+    takeover lets MPD play at once and is retried after PLAY_RETRY_S without the gate. A
+    stop or another song during the gate is the user's doing and is never undone; a pause
+    from the phone during the gate can't be told apart from ours (MPD is already paused,
+    nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
                  stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S):
@@ -922,7 +966,7 @@ class Follower:
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
-            self._took_over()
+            self._give_time()
         else:
             # The takeover failed and is retried later; never keep the phone waiting for it.
             self._release_gate("the takeover failed")
@@ -943,11 +987,15 @@ class Follower:
             log.debug("start gate: renderer check failed: %r", e)
             gate.seen = "check failed: %r" % e
         now = self.clock()
-        if gate.seen == "PLAYING":
+        if gate.seen == "PLAYING":  # our stream: renderer_state flags any other source
             log.info("speaker plays; resuming MPD after %.1f s", now - gate.started)
             self._end_gate()
-        elif (gate.retakes < GATE_MAX_RETAKES and now >= gate.taken + GATE_RETAKE_S
-              and now < gate.started + START_GATE_MAX_S):
+        elif gate.seen in _OTHER_SOURCE_PLAYING:
+            # Someone started another source during the gate: it is not ours to override.
+            self._release_gate("the zone plays another source (renderer %r)" % gate.seen)
+        elif gate.restart_due(now):
+            self._gate_restart(now)
+        elif gate.retake_due(now):
             self._gate_retake(now)
         elif now >= gate.deadline:
             self._gate_timeout(now)
@@ -959,13 +1007,28 @@ class Follower:
         gate.retakes += 1
         log.info("start gate: renderer %r %.1f s after the takeover; taking over again "
                  "(%d of %d)", gate.seen, now - gate.taken, gate.retakes, GATE_MAX_RETAKES)
-        # A failed one counts too: _attempt logs it, and the next is due GATE_RETAKE_S later.
-        gate.taken = now
-        self.controller.ensure_playing(wake=True, force=True)
-        self._took_over()
+        try:
+            decision = self.controller.ensure_playing(wake=True, retake=True)
+        finally:
+            # A failed retake counts and gets its time too; its error propagates up to the
+            # _attempt that runs this gate check, which logs it.
+            self._give_time()
+        if decision in TAKEN_AWAY:
+            self._release_gate("someone started another source during the takeover")
 
-    def _took_over(self):
-        # Every takeover gets GATE_RETAKE_S to start playing, even past the configured gate.
+    def _gate_restart(self, now):
+        gate = self._gate
+        gate.restarted = True
+        log.info("start gate: renderer still TRANSITIONING %.1f s after the takeover; "
+                 "restarting it (Stop, Play)", now - gate.taken)
+        try:
+            self.controller.restart_renderer()
+        finally:
+            self._give_time()
+
+    def _give_time(self):
+        # Every takeover or restart gets GATE_RETAKE_S to start playing, even past the
+        # configured gate.
         gate = self._gate
         gate.taken = self.clock()
         gate.deadline = min(max(gate.deadline, gate.taken + GATE_RETAKE_S),
@@ -1070,9 +1133,13 @@ class Follower:
                  "once more before the speaker counts as taken away")
         self._unstarted = False
         self.stopped_polls = 0
-        # Schedule first: a failing takeover is logged by _attempt and must not stop polling.
+        # Schedule first: a failing takeover propagates up to the _attempt that runs this
+        # poll, which logs it; polling must go on.
         self._schedule(_POLL)
-        self.controller.ensure_playing(wake=True, force=True)
+        decision = self.controller.ensure_playing(wake=True, retake=True)
+        if decision in TAKEN_AWAY:
+            self.pending = None
+            self._yield(decision)
 
     def _yield(self, verdict):
         log.info("speaker taken away (%s): ending the cast; not taking the room back "
