@@ -5,7 +5,8 @@ MPD and asks the receiver to end the cast. The adapter never stops the room or
 puts it into standby itself; the Raumfeld's own auto power-off does that.
 
 Python 3.9+ standard library only. Devices are identified exclusively by UPnP
-UDN (found via SSDP on every action), never by IP. No volume is ever touched:
+UDN (found via SSDP; a takeover always rediscovers, the frequent room check
+reuses the last discovery until a request fails or the zone changes), never by IP. No volume is ever touched:
 this module sends no RenderingControl requests at all.
 """
 
@@ -610,10 +611,12 @@ class Follower:
     """Turns the MPD player state stream into Controller actions. At most one action is
     pending at a time: the retry of a failed takeover, or the next look at the room.
 
-    While it owns the zone and MPD plays or is paused, it polls the room. When someone
-    takes the speaker away it yields: it asks run() to pause MPD (if playing) and to
-    tell the receiver to end the cast, and leaves the room alone until the user resumes
-    (MPD pause -> play) or the receiver ends the session (pause -> stop)."""
+    While it owns the zone it polls the room, whatever MPD's state. When someone takes
+    the speaker away while MPD plays or is paused, it yields: it asks run() to pause MPD
+    (if playing) and to tell the receiver to end the cast, and leaves the room alone
+    until the user resumes (MPD pause -> play) or the receiver ends the session
+    (pause -> stop). If the room goes away while MPD is stopped there is no cast to
+    end: it just lets go (no pause, no release) and the next play wakes the room."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic):
         self.controller = controller
