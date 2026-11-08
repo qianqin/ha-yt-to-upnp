@@ -427,10 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             continue;
                         }
                         ReleaseAction::StopPreRoll => {
-                            match playlist.preroll.stop(&mut mpd_client).await {
-                                Ok(_) => tracing::info!("[preroll] pre-roll stopped: released by speaker (adapter)"),
-                                Err(e) => tracing::warn!("[preroll] release: stopping the pre-roll failed: {e}"),
-                            }
+                            stop_preroll(&mut mpd_client, &mut playlist, &mut play_started, "released by speaker (adapter)").await;
                             continue;
                         }
                         ReleaseAction::EndCast => {}
@@ -539,13 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // No song came in time: stop the silence so the speaker can idle
             _ = preroll_expired(playlist.preroll.deadline()) => {
-                match playlist.preroll.stop(&mut mpd_client).await {
-                    Ok(_) => tracing::info!(
-                        "[preroll] pre-roll timed out after {} s without a song; MPD stopped",
-                        preroll::PREROLL_TIMEOUT.as_secs()
-                    ),
-                    Err(e) => tracing::warn!("[preroll] pre-roll timed out; stopping MPD failed: {e}"),
-                }
+                stop_preroll(&mut mpd_client, &mut playlist, &mut play_started, "timed out without a song").await;
             }
 
             // Position reporting + keepalive (every 3s)
@@ -556,7 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ = position_timer.tick() => {
                 match mpd_client.status().await {
                     Ok(status) => {
-                        if play_started && !playlist.video_ids.is_empty() {
+                        if reports_position(play_started, &playlist) {
                             if status.state == "play" {
                                 let elapsed = status.elapsed.unwrap_or(0.0);
                                 let duration = playlist.current_duration as f64;
@@ -680,6 +671,16 @@ async fn handle_command(
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
+        }
+
+        // The silence is no song: resuming, pausing or seeking it would make
+        // its later stop look like a song end. The phone hears that nothing
+        // plays, as MPD would say without the pre-roll.
+        PlayerCommand::Play | PlayerCommand::Pause | PlayerCommand::SeekTo { .. }
+            if playlist.preroll.is_active() =>
+        {
+            tracing::info!("[player] {cmd:?} ignored: only the pre-roll silence is playing");
+            send_state(mpd, state_tx, playlist, messages::PlayerState::Stopped).await?;
         }
 
         PlayerCommand::Play => {
@@ -916,14 +917,23 @@ enum ReleaseAction {
 }
 
 /// The adapter may release on every speaker standby, also with nobody casting.
+/// While the pre-roll runs no song has started yet, so the phone keeps its
+/// cast: when its song arrives it takes the speaker again, and the pre-roll
+/// cooldown keeps launches from looping.
 fn release_action(has_remote: bool, playlist: &PlaylistState) -> ReleaseAction {
-    if has_remote || !playlist.video_ids.is_empty() {
-        ReleaseAction::EndCast
-    } else if playlist.preroll.is_active() {
+    if playlist.preroll.is_active() {
         ReleaseAction::StopPreRoll
+    } else if has_remote || !playlist.video_ids.is_empty() {
+        ReleaseAction::EndCast
     } else {
         ReleaseAction::Ignore
     }
+}
+
+/// The 3 s position report is for a song the phone started, never the
+/// pre-roll silence.
+fn reports_position(play_started: bool, playlist: &PlaylistState) -> bool {
+    play_started && !playlist.video_ids.is_empty() && !playlist.preroll.is_active()
 }
 
 /// Player state and position the phone is told. The pre-roll silence is
@@ -1009,6 +1019,25 @@ async fn preroll_expired(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+/// End a pre-roll no song replaced (timeout, release) and stop MPD.
+/// `play_started` is cleared so that stop is not read as a song end.
+async fn stop_preroll(
+    mpd: &mut mpd::MpdClient,
+    playlist: &mut PlaylistState,
+    play_started: &mut bool,
+    why: &str,
+) {
+    *play_started = false;
+    match playlist.preroll.stop(mpd).await {
+        Ok(Some(played)) => tracing::info!(
+            "[preroll] pre-roll stopped after {:.1} s: {why}; MPD stopped",
+            played.as_secs_f64()
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("[preroll] pre-roll {why}; stopping MPD failed: {e}"),
     }
 }
 
@@ -1284,12 +1313,35 @@ mod stop_tests {
     }
 
     #[test]
-    fn release_during_a_pre_roll_alone_stops_only_the_silence() {
-        // The phone may still be connecting: ending its cast would break that.
+    fn release_before_any_song_stops_only_the_silence() {
+        // No song has started, so the phone keeps its cast, connected or
+        // still connecting: when its song arrives the speaker is taken
+        // again (the cast wins), and the cooldown stops a release loop.
         let pre_rolling = PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() };
         assert_eq!(release_action(false, &pre_rolling), ReleaseAction::StopPreRoll);
-        let connected = PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() };
-        assert_eq!(release_action(true, &connected), ReleaseAction::EndCast);
+        assert_eq!(release_action(true, &pre_rolling), ReleaseAction::StopPreRoll);
+    }
+
+    #[test]
+    fn position_is_reported_only_for_a_started_song() {
+        assert!(reports_position(true, &playlist(1, 0)));
+        assert!(!reports_position(false, &playlist(1, 0)));
+        assert!(!reports_position(true, &PlaylistState::default()));
+        let mut pre_rolling = playlist(1, 0);
+        pre_rolling.preroll = preroll::PreRoll::running();
+        assert!(!reports_position(true, &pre_rolling));
+    }
+
+    #[tokio::test]
+    async fn pre_roll_deadline_resolves_only_once_it_passes() {
+        use std::time::Duration;
+        use tokio::time::{timeout, Instant};
+        assert!(timeout(Duration::from_millis(50), preroll_expired(None)).await.is_err());
+        let soon = Instant::now() + Duration::from_millis(300);
+        assert!(timeout(Duration::from_millis(50), preroll_expired(Some(soon))).await.is_err());
+        assert!(timeout(Duration::from_secs(1), preroll_expired(Some(soon))).await.is_ok());
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(timeout(Duration::from_millis(50), preroll_expired(Some(past))).await.is_ok());
     }
 
     #[test]
@@ -1321,6 +1373,173 @@ mod stop_tests {
         assert_eq!(arg("state"), Some(messages::PlayerState::Idle.as_str()));
         assert_eq!(arg("currentTime"), Some("0"));
         assert_eq!(arg("loadedTime"), Some("0"));
+    }
+}
+
+#[cfg(all(test, not(feature = "mock-mpd")))]
+mod preroll_wiring_tests {
+    use super::*;
+    use crate::mpd::fake::fake_mpd;
+
+    const SILENCE: &str = "http://localhost:8008/silence";
+    const STATUS_PLAY: &str = "state: play\nvolume: 50\nelapsed: 3.0\nOK\n";
+    const STATUS_STOP: &str = "state: stop\nvolume: 50\nOK\n";
+
+    fn pre_rolling() -> PlaylistState {
+        PlaylistState { preroll: preroll::PreRoll::running(), ..Default::default() }
+    }
+
+    /// Run one phone command against a scripted MPD; returns the MPD
+    /// commands sent and the messages for the phone.
+    async fn command(
+        cmd: lounge::PlayerCommand,
+        playlist: &mut PlaylistState,
+        play_started: &mut bool,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
+        let (port, server) = fake_mpd(script).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(16);
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        handle_command(cmd, &mut mpd, &state_tx, playlist, play_started, &dial_state, None)
+            .await
+            .unwrap();
+        drop(mpd);
+        let mut sent = Vec::new();
+        while let Ok(msg) = state_rx.try_recv() {
+            sent.push(msg);
+        }
+        (server.await.unwrap(), sent)
+    }
+
+    fn arg<'a>(msg: &'a messages::OutgoingMessage, key: &str) -> Option<&'a str> {
+        msg.args.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn phone_play_pause_and_seek_leave_the_pre_roll_alone() {
+        // The silence is no song: resuming, pausing or seeking it must not
+        // start a song for MPD's later stop to end.
+        for cmd in [
+            lounge::PlayerCommand::Play,
+            lounge::PlayerCommand::Pause,
+            lounge::PlayerCommand::SeekTo { position: 30.0 },
+        ] {
+            let name = format!("{cmd:?}");
+            let mut playlist = pre_rolling();
+            let mut play_started = false;
+            let (seen, sent) =
+                command(cmd, &mut playlist, &mut play_started, vec![("status", STATUS_PLAY)]).await;
+            assert_eq!(seen, vec!["status"], "{name}: only the state is read");
+            assert!(!play_started, "{name}");
+            assert!(playlist.preroll.is_active(), "{name}");
+            assert_eq!(sent[0].command, "onStateChange", "{name}");
+            assert_eq!(arg(&sent[0], "state"), Some(messages::PlayerState::Stopped.as_str()), "{name}");
+            assert_eq!(arg(&sent[0], "currentTime"), Some(messages::fmt_time(0.0).as_str()), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn phone_stop_ends_the_pre_roll() {
+        let mut playlist = pre_rolling();
+        let (seen, _) = command(
+            lounge::PlayerCommand::Stop,
+            &mut playlist,
+            &mut false,
+            vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS_STOP)],
+        )
+        .await;
+        assert!(!playlist.preroll.is_active());
+        assert_eq!(seen, vec!["stop", "clear", "status"]);
+    }
+
+    #[tokio::test]
+    async fn next_at_the_end_of_the_playlist_ends_the_pre_roll() {
+        let mut playlist = pre_rolling();
+        let (seen, _) = command(
+            lounge::PlayerCommand::Next,
+            &mut playlist,
+            &mut false,
+            vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS_STOP)],
+        )
+        .await;
+        assert!(!playlist.preroll.is_active());
+        assert_eq!(seen, vec!["stop", "clear", "status"]);
+    }
+
+    #[tokio::test]
+    async fn remote_disconnect_ends_the_pre_roll() {
+        let mut playlist = pre_rolling();
+        let (seen, _) = command(
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into() },
+            &mut playlist,
+            &mut false,
+            vec![("stop", "OK\n"), ("clear", "OK\n")],
+        )
+        .await;
+        assert!(!playlist.preroll.is_active());
+        assert_eq!(seen, vec!["stop", "clear"]);
+    }
+
+    /// `start_preroll` against a scripted MPD; returns the MPD commands.
+    async fn start(
+        preroll: &mut preroll::PreRoll,
+        play_started: bool,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> Vec<String> {
+        let (port, server) = fake_mpd(script).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        start_preroll(&mut mpd, preroll, play_started, SILENCE).await;
+        drop(mpd);
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn launch_starts_the_silence_only_on_an_idle_player() {
+        // A song between two tracks (stopped, but started) is not idle.
+        let mut preroll = preroll::PreRoll::default();
+        assert_eq!(start(&mut preroll, true, vec![("status", STATUS_STOP)]).await, vec!["status"]);
+        assert!(!preroll.is_active());
+
+        assert_eq!(start(&mut preroll, false, vec![("status", STATUS_PLAY)]).await, vec!["status"]);
+        assert!(!preroll.is_active());
+
+        let seen = start(
+            &mut preroll,
+            false,
+            vec![("status", STATUS_STOP), ("clear", "OK\n"), ("addid", "Id: 5\nOK\n"), ("play", "OK\n")],
+        )
+        .await;
+        assert_eq!(seen, vec!["status", "clear", "addid \"http://localhost:8008/silence\"", "play"]);
+        assert!(preroll.is_active());
+    }
+
+    #[tokio::test]
+    async fn pre_roll_stopped_without_a_song_is_no_song_end_and_cools_down() {
+        // A stray resume during the silence, then the timeout (or a release)
+        // stops MPD: that stop must not read as a song end and auto-advance.
+        let mut playlist = pre_rolling();
+        playlist.video_ids = vec!["aaaaaaaaaaa".into()];
+        let mut play_started = false;
+        command(lounge::PlayerCommand::Play, &mut playlist, &mut play_started, vec![("status", STATUS_PLAY)]).await;
+
+        let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        // Even if something had set it, the stop clears it.
+        play_started = true;
+        stop_preroll(&mut mpd, &mut playlist, &mut play_started, "timed out").await;
+        drop(mpd);
+        assert_eq!(server.await.unwrap(), vec!["stop", "clear"]);
+
+        assert!(!play_started);
+        assert!(!playlist.preroll.is_active());
+        let mpd_stopped = mpd::IdleEvent { player: true, release: false };
+        assert!(!idle_plan(mpd_stopped, play_started, playlist.preroll.is_active()).check_song_end);
+
+        // A further launch within the cooldown gets no silence.
+        assert_eq!(start(&mut playlist.preroll, false, vec![("status", STATUS_STOP)]).await, vec!["status"]);
+        assert!(!playlist.preroll.is_active());
     }
 }
 

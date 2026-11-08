@@ -126,6 +126,30 @@ fn is_loopback_peer(peer: SocketAddr) -> bool {
     peer.ip().to_canonical().is_loopback()
 }
 
+#[cfg(test)]
+impl DialState {
+    /// A state with documentation-range addresses and no session.
+    pub(crate) fn for_tests(preroll_tx: mpsc::Sender<()>) -> Arc<Self> {
+        let (pairing_tx, _) = mpsc::channel(1);
+        let (pairing_tx_m, _) = mpsc::channel(1);
+        Arc::new(DialState {
+            preroll_tx,
+            running: AtomicBool::new(false),
+            pairing_tx,
+            pairing_tx_m,
+            device_name: "Test Receiver".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            local_ip: std::net::Ipv4Addr::new(192, 0, 2, 1),
+            port: 8008,
+            ctt: std::sync::RwLock::new(None),
+            yt_session: None,
+            screen_id: "test-screen".to_string(),
+            stream_failure: Default::default(),
+            silence_slots: Default::default(),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /ssdp/device-desc.xml
 // ---------------------------------------------------------------------------
@@ -457,23 +481,7 @@ mod tests {
     }
 
     fn test_state_with(preroll_tx: mpsc::Sender<()>) -> Arc<DialState> {
-        let (pairing_tx, _) = mpsc::channel(1);
-        let (pairing_tx_m, _) = mpsc::channel(1);
-        Arc::new(DialState {
-            preroll_tx,
-            running: AtomicBool::new(false),
-            pairing_tx,
-            pairing_tx_m,
-            device_name: "Test Receiver".to_string(),
-            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
-            local_ip: Ipv4Addr::new(192, 0, 2, 1),
-            port: 8008,
-            ctt: std::sync::RwLock::new(None),
-            yt_session: None,
-            screen_id: "test-screen".to_string(),
-            stream_failure: Default::default(),
-            silence_slots: Default::default(),
-        })
+        DialState::for_tests(preroll_tx)
     }
 
     /// Serve the real router on an ephemeral loopback port while pretending the
