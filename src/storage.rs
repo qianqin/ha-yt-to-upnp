@@ -1,8 +1,8 @@
 //! Where persistent files live and how they are written.
 //!
-//! `YTCAST_DATA_DIR` moves config, OAuth credentials, the nsig cache and the
-//! default cookie file into one directory (e.g. `/data` in a container). When
-//! it is unset, the historical per-user locations are used.
+//! `YTCAST_DATA_DIR` moves config, the nsig cache and the default cookie file
+//! into one directory (e.g. `/data` in a container). When it is unset, the
+//! historical per-user locations are used.
 //!
 //! Path resolution takes the env value as a parameter so it can be tested
 //! without mutating the process environment.
@@ -34,7 +34,7 @@ pub fn warn_if_relative_data_dir(dir: &Path) {
     }
 }
 
-/// Directory for config and OAuth credentials.
+/// Directory for the config file.
 pub fn config_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
     match data_dir {
         Some(d) => Some(d.to_path_buf()),

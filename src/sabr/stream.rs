@@ -350,7 +350,6 @@ async fn innertube_player(
     po_token: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    oauth_token: Option<&str>,
 ) -> Result<PlayerData, SabrError> {
     let is_web_remix = itclient.client_name == "WEB_REMIX";
 
@@ -432,13 +431,12 @@ async fn innertube_player(
     };
 
     tracing::info!(
-        "[sabr] innertube /player for {} using {} v{}{}{}{}{}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}{}{}",
         video_id,
         itclient.client_name,
         client_version,
         if ctt.is_some() { " +ctt" } else { "" },
         if po_token.is_some() { " +potoken" } else { "" },
-        if oauth_token.is_some() { " +oauth" } else { "" },
         if yt_cookies.is_some() { " +cookies" } else { "" },
         if yt_session.is_some() { " +session" } else { "" },
     );
@@ -470,10 +468,8 @@ async fn innertube_player(
                 }
             }
 
-            // Auth: OAuth Bearer > cookie-based triple SAPISIDHASH
-            if let Some(token) = oauth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            } else if let Some(c) = yt_cookies {
+            // Auth: cookie-based triple SAPISIDHASH
+            if let Some(c) = yt_cookies {
                 let user_sid = yt_session.and_then(|s| s.user_session_id.as_deref());
                 req = req
                     .header("Cookie", &c.cookie_header)
@@ -506,20 +502,14 @@ async fn innertube_player(
                     req = req.header("X-Goog-Visitor-Id", vd);
                 }
             }
-            if let Some(token) = oauth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            } else if let Some(c) = yt_cookies {
+            if let Some(c) = yt_cookies {
                 req = req
                     .header("Cookie", &c.cookie_header)
                     .header("Authorization", crate::cookies::full_sapisidhash(c, "https://www.youtube.com", None))
                     .header("X-Origin", "https://www.youtube.com");
             }
         }
-        _ => {
-            if let Some(token) = oauth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-        }
+        _ => {}
     }
 
     let resp = req.json(&body).send().await.map_err(|e| e.without_url())?;
@@ -637,7 +627,6 @@ async fn get_player_data(
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    _oauth_token: Option<&str>,
 ) -> Result<PlayerResult, SabrError> {
     let gvs = fetch_pot_token(http, Some(video_id)).await;
 
@@ -648,7 +637,7 @@ async fn get_player_data(
             ctt.is_some(), yt_cookies.is_some());
         match innertube_player(
             http, video_id, &WEB_REMIX_CLIENT, ctt, None, None,
-            yt_cookies, yt_session, None,
+            yt_cookies, yt_session,
         ).await {
             Ok(data) => {
                 tracing::info!("[sabr] WEB_REMIX /player OK");
@@ -663,7 +652,7 @@ async fn get_player_data(
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None, None).await?;
+    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None).await?;
     tracing::info!("[sabr] IOS /player OK");
     Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
 }
@@ -1306,21 +1295,14 @@ pub async fn stream_audio(
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    oauth: Option<&std::sync::Arc<crate::oauth::OAuthState>>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
     let client = credential_client();
-    // Get OAuth token if available (auto-refreshes if expired)
-    let oauth_token = if let Some(os) = oauth {
-        os.get_access_token().await
-    } else {
-        None
-    };
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
-    let result = get_player_data(client, video_id, ctt, yt_cookies, yt_session, oauth_token.as_deref()).await?;
+    let result = get_player_data(client, video_id, ctt, yt_cookies, yt_session).await?;
     let player = result.player;
     let client_config = result.client_config;
     // get_player_data already handled PoToken selection per attempt:
@@ -1558,6 +1540,15 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(is_trusted_google_host(url), expected, "{url}");
         }
+    }
+
+    #[test]
+    fn host_for_log_drops_path_and_query() {
+        assert_eq!(
+            host_for_log("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRET"),
+            "rr1---sn-abc.googlevideo.com"
+        );
+        assert_eq!(host_for_log("not a url"), "<unparseable>");
     }
 
     // -- helpers --------------------------------------------------------------

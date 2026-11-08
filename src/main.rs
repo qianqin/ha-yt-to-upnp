@@ -6,7 +6,6 @@ mod lounge;
 mod messages;
 mod mpd;
 mod nsig;
-mod oauth;
 mod sabr;
 mod ssdp;
 mod storage;
@@ -154,36 +153,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // 5c. Load OAuth credentials (YouTube TV device flow)
-    // If logged in with a Premium account, Bearer token bypasses PoToken
-    // requirement entirely — no bgutil-pot sidecar needed.
-    let oauth_creds = oauth::load_credentials();
-    let oauth_state = oauth::OAuthState::new(http_client.clone(), oauth_creds.clone());
-
-    // Run login flow if --login flag is passed
-    if std::env::args().any(|a| a == "--login") {
-        oauth_state.device_login().await?;
-        let creds = oauth_state.credentials.read().await;
-        oauth::save_credentials(&creds)?;
-        tracing::info!("[init] OAuth login complete, restart without --login to use");
-        return Ok(());
-    }
-
-    if oauth_creds.is_logged_in() {
-        tracing::info!("[init] OAuth: logged in (token expires {})", oauth_creds.expiry_date);
-    } else {
-        tracing::info!("[init] OAuth: not logged in (run with --login to authenticate)");
-    }
-
-    // --test <video_id>: Test OAuth /player calls without starting the full server.
-    // Tests multiple clients with Bearer token and prints what comes back.
-    if let Some(test_vid) = std::env::args()
-        .skip_while(|a| a != "--test")
-        .nth(1)
-    {
-        return test_oauth_player(&oauth_state, &http_client, &test_vid).await;
-    }
-
     // 6. Generate screen_ids on first run (one per theme)
     let mut config_changed = false;
     if config.screen_id.is_empty() {
@@ -264,7 +233,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctt: std::sync::RwLock::new(None),
         yt_cookies: yt_cookies.clone(),
         yt_session: yt_session.clone(),
-        oauth_state: if oauth_creds.is_logged_in() { Some(oauth_state.clone()) } else { None },
         screen_id: config.screen_id.clone(),
     });
 
@@ -402,7 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let innertube_client = http_client;
     let innertube_cookies = yt_cookies;
     let innertube_session = yt_session;
-    let innertube_oauth = if oauth_creds.is_logged_in() { Some(oauth_state.clone()) } else { None };
     let mut playlist = PlaylistState::default();
     let mut play_started = false;
     let mut has_remote = false;
@@ -458,7 +425,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &dial_state,
                     innertube_cookies.as_ref().map(|c| c.as_ref()),
                     innertube_session.as_ref().map(|s| s.as_ref()),
-                    innertube_oauth.as_ref(),
                 ).await {
                     tracing::error!("[player] Error handling command: {}", e);
                 }
@@ -514,8 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     &mut mpd_client, &innertube_client, &state_tx,
                                     &mut playlist, &video_id, 0.0, innertube_cookies.as_ref().map(|c| c.as_ref()),
                                     innertube_session.as_ref().map(|s| s.as_ref()),
-                                    innertube_oauth.as_ref(),
-                                ).await {
+                                                ).await {
                                     Ok(true) => play_started = true,
                                     Ok(false) => {
                                         tracing::warn!(
@@ -606,7 +571,6 @@ async fn handle_command(
     dial_state: &Arc<dial::DialState>,
     yt_cookies: Option<&cookies::YtCookies>,
     yt_session: Option<&cookies::YtMusicSession>,
-    oauth: Option<&Arc<oauth::OAuthState>>,
 ) -> CmdResult {
     use lounge::PlayerCommand;
 
@@ -645,7 +609,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session, oauth).await?;
+            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session).await?;
         }
 
         PlayerCommand::SetVideo {
@@ -669,7 +633,7 @@ async fn handle_command(
             *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
-            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session, oauth).await?;
+            *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time, yt_cookies, yt_session).await?;
         }
 
         PlayerCommand::Play => {
@@ -805,7 +769,7 @@ async fn handle_command(
                 tracing::info!("[player] Previous -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session, oauth).await?;
+                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session).await?;
             } else {
                 tracing::info!("[player] Previous: already at start");
             }
@@ -818,7 +782,7 @@ async fn handle_command(
                 tracing::info!("[player] Next -> index {} ({})", playlist.current_index, video_id);
                 playlist.last_state = messages::PlayerState::Idle; // Track change
                 *play_started = false;
-                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session, oauth).await?;
+                *play_started = play_video(mpd, http, state_tx, playlist, &video_id, 0.0, yt_cookies, yt_session).await?;
             } else {
                 tracing::info!("[player] Next: end of playlist");
                 *play_started = false;
@@ -874,17 +838,9 @@ async fn play_video(
     start_position: f64,
     yt_cookies: Option<&cookies::YtCookies>,
     yt_session: Option<&cookies::YtMusicSession>,
-    oauth: Option<&Arc<oauth::OAuthState>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Tell YouTube we're loading — app shows spinner immediately
     send_state(mpd, state_tx, playlist, messages::PlayerState::Loading).await?;
-
-    // Get OAuth Bearer token if available (auto-refreshes if expired)
-    let oauth_token = if let Some(os) = oauth {
-        os.get_access_token().await
-    } else {
-        None
-    };
 
     let stream = innertube::resolve_stream(
         http,
@@ -897,7 +853,6 @@ async fn play_video(
         },
         yt_cookies,
         yt_session,
-        oauth_token.as_deref(),
     )
     .await?;
 
@@ -1062,470 +1017,6 @@ async fn send_volume(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// --test mode: probe /player API with OAuth Bearer token
-// ---------------------------------------------------------------------------
-
-async fn test_oauth_player(
-    oauth: &std::sync::Arc<oauth::OAuthState>,
-    http: &reqwest::Client,
-    video_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("\n=== OAuth /player Test ===");
-    println!("Video ID: {}", video_id);
-
-    // 1. Get access token (login if needed)
-    let token = match oauth.get_access_token().await {
-        Some(t) => {
-            println!("Bearer token: present");
-            t
-        }
-        None => {
-            println!("Not logged in. Run with --login first.");
-            return Ok(());
-        }
-    };
-
-    let visitor_data = oauth::generate_visitor_data();
-
-    // 2. Test each client
-    let clients: &[(&str, &str, &str, i32, &str)] = &[
-        // (name, client_version, user_agent, client_name_id, player_url)
-        (
-            "WEB_REMIX",
-            "1.20260114.03.00",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            67,
-            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
-        ),
-        (
-            "TVHTML5",
-            "7.20250219.16.00",
-            "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
-            7,
-            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        ),
-        (
-            "IOS",
-            "19.45.4",
-            "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
-            5,
-            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        ),
-    ];
-
-    for (name, version, ua, name_id, url) in clients {
-        println!("\n--- {} (id={}) ---", name, name_id);
-
-        let mut body = serde_json::json!({
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "clientName": name,
-                    "clientVersion": version,
-                    "hl": "en",
-                    "gl": "US",
-                    "visitorData": visitor_data,
-                }
-            },
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-        });
-
-        // Add device fields for mobile clients
-        if *name == "IOS" {
-            body["context"]["client"]["deviceMake"] = "Apple".into();
-            body["context"]["client"]["deviceModel"] = "iPhone16,2".into();
-            body["context"]["client"]["osName"] = "iPhone".into();
-            body["context"]["client"]["osVersion"] = "18.1.0.22B83".into();
-        }
-
-        let mut req = http
-            .post(*url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("X-Goog-Visitor-Id", &visitor_data)
-            .header("User-Agent", *ua);
-
-        if *name == "WEB_REMIX" {
-            req = req
-                .header("Origin", "https://music.youtube.com")
-                .header("Referer", "https://music.youtube.com/");
-        }
-
-        let resp = req.json(&body).send().await?;
-        let status_code = resp.status();
-        println!("HTTP: {}", status_code);
-
-        if !status_code.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            println!("Error body: {} bytes", text.len());
-            continue;
-        }
-
-        let json: serde_json::Value = resp.json().await?;
-
-        // Playability
-        let play_status = json["playabilityStatus"]["status"]
-            .as_str()
-            .unwrap_or("MISSING");
-        let play_reason = json["playabilityStatus"]["reason"]
-            .as_str()
-            .unwrap_or("");
-        println!("Playability: {} {}", play_status, play_reason);
-
-        if play_status != "OK" {
-            continue;
-        }
-
-        // Title + duration
-        let title = json["videoDetails"]["title"].as_str().unwrap_or("?");
-        let duration = json["videoDetails"]["lengthSeconds"].as_str().unwrap_or("?");
-        println!("Title: {} [{}s]", title, duration);
-
-        // Streaming data
-        let sd = &json["streamingData"];
-        if sd.is_null() {
-            println!("streamingData: MISSING");
-            continue;
-        }
-
-        // SABR URL
-        if let Some(sabr_url) = sd["serverAbrStreamingUrl"].as_str() {
-            println!("SABR URL: host {}", sabr::stream::host_for_log(sabr_url));
-        } else {
-            println!("SABR URL: none");
-        }
-
-        // Adaptive formats (direct URLs — Path A)
-        if let Some(formats) = sd["adaptiveFormats"].as_array() {
-            let audio_formats: Vec<_> = formats
-                .iter()
-                .filter(|f| {
-                    f["mimeType"]
-                        .as_str()
-                        .map(|m| m.starts_with("audio/"))
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            println!("Adaptive formats: {} total, {} audio", formats.len(), audio_formats.len());
-
-            for f in &audio_formats {
-                let mime = f["mimeType"].as_str().unwrap_or("?");
-                let bitrate = f["bitrate"].as_u64().unwrap_or(0);
-                let has_url = f["url"].as_str().is_some();
-                let has_cipher = f["signatureCipher"].as_str().is_some();
-                let drm = f["drmFamilies"].as_array().map(|a| a.len()).unwrap_or(0);
-                let itag = f["itag"].as_u64().unwrap_or(0);
-
-                println!(
-                    "  itag={} {} {}kbps url={} cipher={} drm={}",
-                    itag,
-                    mime,
-                    bitrate / 1000,
-                    if has_url { "YES" } else { "no" },
-                    if has_cipher { "YES" } else { "no" },
-                    drm,
-                );
-            }
-        } else {
-            println!("Adaptive formats: none (SABR-only?)");
-        }
-
-        // Check for po_token hints in the response
-        if let Some(sid) = json["serviceIntegrityDimensions"].as_object() {
-            println!("serviceIntegrityDimensions: {:?}", sid.keys().collect::<Vec<_>>());
-        }
-
-        // attestation info
-        if let Some(att) = json["attestation"].as_object() {
-            if let Some(challenge) = att.get("playerAttestationRenderer") {
-                let has_challenge = challenge.get("challenge").is_some();
-                println!("Attestation challenge present: {}", has_challenge);
-            }
-        }
-    }
-
-    // 3. SABR probe: test with multiple /player clients and SABR auth combos.
-    //    IOS without auth = baseline (works on Pi for 60s).
-    //    Then try adding Bearer to SABR to see if Premium changes status.
-    let sabr_clients: &[(&str, &str, &str, i32, bool)] = &[
-        // (name, version, user_agent, name_id, use_bearer_for_player)
-        ("IOS", "19.45.4", "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)", 5, false),
-        ("TVHTML5", "7.20250219.16.00", "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version", 7, true),
-    ];
-
-    for (cname, cversion, cua, cname_id, player_bearer) in sabr_clients {
-        println!("\n--- SABR Probe ({} {}) ---", cname, if *player_bearer { "+ Bearer" } else { "no auth" });
-        let mut body = serde_json::json!({
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "clientName": cname,
-                    "clientVersion": cversion,
-                    "hl": "en",
-                    "gl": "US",
-                    "visitorData": visitor_data,
-                }
-            },
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-        });
-        if *cname == "IOS" {
-            body["context"]["client"]["deviceMake"] = "Apple".into();
-            body["context"]["client"]["deviceModel"] = "iPhone16,2".into();
-            body["context"]["client"]["osName"] = "iPhone".into();
-            body["context"]["client"]["osVersion"] = "18.1.0.22B83".into();
-        }
-
-        let mut player_req = http
-            .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-            .header("Content-Type", "application/json")
-            .header("X-Goog-Visitor-Id", &visitor_data)
-            .header("User-Agent", *cua);
-        if *player_bearer {
-            player_req = player_req.header("Authorization", format!("Bearer {}", token));
-        }
-        let resp = player_req.json(&body).send().await?;
-
-        if !resp.status().is_success() {
-            println!("SABR probe: /player failed ({})", resp.status());
-        } else {
-            let json: serde_json::Value = resp.json().await?;
-            let sabr_url = json["streamingData"]["serverAbrStreamingUrl"]
-                .as_str()
-                .unwrap_or("");
-
-            if sabr_url.is_empty() {
-                println!("SABR probe: no serverAbrStreamingUrl");
-            } else {
-                // Get format info for the SABR request
-                let formats = json["streamingData"]["adaptiveFormats"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-
-                // Pick an audio format (prefer opus)
-                let audio_fmt = formats.iter()
-                    .filter(|f| f["mimeType"].as_str().map(|m| m.starts_with("audio/")).unwrap_or(false))
-                    .max_by_key(|f| f["bitrate"].as_u64().unwrap_or(0));
-                // Pick a video format (lowest bitrate for discard trick)
-                let video_fmt = formats.iter()
-                    .filter(|f| f["mimeType"].as_str().map(|m| m.starts_with("video/")).unwrap_or(false))
-                    .min_by_key(|f| f["bitrate"].as_u64().unwrap_or(u64::MAX));
-
-                if let (Some(af), Some(vf)) = (audio_fmt, video_fmt) {
-                    println!("Audio: itag={} lastMod={} xtags={}", af["itag"], af["lastModified"], af["xtags"]);
-                    println!("Video: itag={} lastMod={} xtags={}", vf["itag"], vf["lastModified"], vf["xtags"]);
-
-                    // Build minimal SABR protobuf request
-                    use prost::Message;
-
-                    let audio_format_id = sabr::proto::misc::FormatId {
-                        itag: af["itag"].as_i64().map(|v| v as i32),
-                        last_modified: af["lastModified"].as_str().and_then(|s| s.parse().ok()),
-                        xtags: af["xtags"].as_str().map(|s| s.to_owned()),
-                    };
-                    let video_format_id = sabr::proto::misc::FormatId {
-                        itag: vf["itag"].as_i64().map(|v| v as i32),
-                        last_modified: vf["lastModified"].as_str().and_then(|s| s.parse().ok()),
-                        xtags: vf["xtags"].as_str().map(|s| s.to_owned()),
-                    };
-
-                    let client_info = sabr::proto::vs::streamer_context::ClientInfo {
-                        client_name: Some(*cname_id),
-                        client_version: Some(cversion.to_string()),
-                        ..Default::default()
-                    };
-
-                    let streamer_context = sabr::proto::vs::StreamerContext {
-                        client_info: Some(client_info),
-                        po_token: None, // No PoToken — testing if Premium bypasses it
-                        ..Default::default()
-                    };
-
-                    // Video: fully buffered (discard trick)
-                    let video_range = sabr::proto::vs::BufferedRange {
-                        format_id: video_format_id.clone(),
-                        start_time_ms: 0,
-                        duration_ms: i32::MAX as i64,
-                        start_segment_index: i32::MAX,
-                        end_segment_index: i32::MAX,
-                        time_range: Some(sabr::proto::vs::TimeRange {
-                            start_ticks: Some(0),
-                            duration_ticks: Some(i32::MAX as i64),
-                            timescale: Some(1000),
-                        }),
-                        ..Default::default()
-                    };
-
-                    let client_abr_state = sabr::proto::vs::ClientAbrState {
-                        enabled_track_types_bitfield: Some(1),
-                        playback_rate: Some(1.0),
-                        bandwidth_estimate: Some(5_000_000),
-                        player_time_ms: Some(0),
-                        visibility: Some(1),
-                        player_state: Some(1),
-                        ..Default::default()
-                    };
-
-                    // Get ustreamer config
-                    let ustreamer_b64 = json["playerConfig"]["mediaCommonConfig"]
-                        ["mediaUstreamerRequestConfig"]["videoPlaybackUstreamerConfig"]
-                        .as_str()
-                        .unwrap_or("");
-                    let ustreamer_config = if ustreamer_b64.is_empty() {
-                        Vec::new()
-                    } else {
-                        use base64::Engine;
-                        use base64::engine::{GeneralPurpose, GeneralPurposeConfig, DecodePaddingMode};
-                        const URL_SAFE_LENIENT: GeneralPurpose = GeneralPurpose::new(
-                            &base64::alphabet::URL_SAFE,
-                            GeneralPurposeConfig::new()
-                                .with_decode_padding_mode(DecodePaddingMode::Indifferent),
-                        );
-                        URL_SAFE_LENIENT.decode(ustreamer_b64).unwrap_or_default()
-                    };
-
-                    // First SABR request: only video in selected_format_ids.
-                    // Audio goes in preferred_audio_format_ids only.
-                    // The CDN sends FORMAT_INITIALIZATION_METADATA first,
-                    // and audio is added to selected_format_ids in subsequent requests.
-                    let sabr_req = sabr::proto::vs::VideoPlaybackAbrRequest {
-                        client_abr_state: Some(client_abr_state),
-                        selected_format_ids: vec![video_format_id.clone()],
-                        buffered_ranges: vec![video_range],
-                        video_playback_ustreamer_config: if ustreamer_config.is_empty() {
-                            None
-                        } else {
-                            Some(ustreamer_config)
-                        },
-                        streamer_context: Some(streamer_context),
-                        preferred_audio_format_ids: vec![audio_format_id],
-                        preferred_video_format_ids: vec![video_format_id],
-                        ..Default::default()
-                    };
-
-                    let mut proto_buf = Vec::new();
-                    sabr_req.encode(&mut proto_buf)?;
-
-                    let sabr_full_url = match sabr_probe_url(sabr_url) {
-                        Ok(url) => url,
-                        Err(host) => {
-                            println!("SABR probe: refusing untrusted host {}", host);
-                            continue;
-                        }
-                    };
-                    println!("SABR POST to host: {}", sabr::stream::host_for_log(&sabr_full_url));
-
-                    // Try SABR: no auth first (baseline), then with Bearer (Premium test)
-                    let sabr_attempts: &[(&str, bool)] = &[
-                        ("No auth (baseline)", false),
-                        ("+ Bearer token (Premium?)", true),
-                    ];
-
-                    for (label, use_bearer) in sabr_attempts {
-                        println!("\n  SABR attempt: {}", label);
-                        let mut sabr_req_builder = http
-                            .post(&sabr_full_url)
-                            .header("Content-Type", "application/x-protobuf")
-                            .header("Accept", "application/vnd.yt-ump")
-                            .header("Accept-Encoding", "identity")
-                            .header("User-Agent", "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version");
-
-                        if *use_bearer {
-                            sabr_req_builder = sabr_req_builder
-                                .header("Authorization", format!("Bearer {}", token));
-                        }
-
-                        // Signed streaming URLs are credentials; reqwest errors would print them.
-                        let sabr_resp = sabr_req_builder
-                            .body(proto_buf.clone())
-                            .send()
-                            .await
-                            .map_err(|e| e.without_url())?;
-
-                    println!("  HTTP: {}", sabr_resp.status());
-
-                    if sabr_resp.status().is_success() {
-                        let sabr_bytes = sabr_resp.bytes().await.map_err(|e| e.without_url())?;
-                        println!("  Response: {} bytes", sabr_bytes.len());
-
-                        // Parse UMP response using the real YouTube varint format
-                        let mut parser = sabr::ump::UmpParser::new();
-                        parser.push(&sabr_bytes);
-                        while let Some(part) = parser.next_part() {
-                            let part_type = part.part_type;
-                            let part_data = &part.data;
-
-                            let type_name = match part_type {
-                                20 => "MEDIA_HEADER",
-                                21 => "MEDIA",
-                                22 => "MEDIA_END",
-                                35 => "NEXT_REQUEST_POLICY",
-                                42 => "FORMAT_INIT_METADATA",
-                                43 => "SABR_REDIRECT",
-                                44 => "SABR_ERROR",
-                                51 => "USTREAMER_VIDEO_FORMAT_DATA",
-                                57 => "SABR_CONTEXT_UPDATE",
-                                58 => "STREAM_PROTECTION_STATUS",
-                                59 => "SABR_CONTEXT_SENDING_POLICY",
-                                _ => "OTHER",
-                            };
-                            println!("  UMP[{} {}] {} bytes", part_type, type_name, part_data.len());
-
-                            // Decode SABR_ERROR to see what went wrong
-                            if part_type == 44 {
-                                // Try protobuf decode: SabrError has fields like error_code, etc.
-                                if let Ok(err) = <sabr::proto::vs::SabrError as prost::Message>::decode(part_data.as_slice()) {
-                                    println!("    SABR_ERROR decoded: {:?}", err);
-                                }
-                            }
-
-                            if part_type == sabr::ump::STREAM_PROTECTION_STATUS {
-                                if let Ok(sps) = <sabr::proto::vs::StreamProtectionStatus as prost::Message>::decode(part_data.as_slice()) {
-                                    let status = sps.status.unwrap_or(-1);
-                                    match status {
-                                        1 => println!("  >>> stream_protection_status = 1 (OK!) — PREMIUM BYPASS WORKS! <<<"),
-                                        2 => println!("  >>> stream_protection_status = 2 (GRACE PERIOD ~60s) — no Premium bypass <<<"),
-                                        3 => println!("  >>> stream_protection_status = 3 (HARD BLOCK) <<<"),
-                                        other => println!("  >>> stream_protection_status = {} (unknown) <<<", other),
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let err_text = sabr_resp.text().await.unwrap_or_default();
-                        println!("  Error body: {} bytes", err_text.len());
-                    }
-                    } // end sabr_attempts loop
-                } else {
-                    println!("SABR probe: could not find audio+video formats");
-                }
-            }
-        }
-    } // end sabr_clients loop
-
-    // Save credentials (token may have been refreshed)
-    let creds = oauth.credentials.read().await;
-    oauth::save_credentials(&creds)?;
-
-    println!("\n=== Test Complete ===");
-    Ok(())
-}
-
-/// The SABR probe URL, or the host to report if `sabr_url` is not on a Google
-/// host: the probe attaches the OAuth Bearer token, so it must not follow a
-/// server-supplied URL anywhere else.
-fn sabr_probe_url(sabr_url: &str) -> Result<String, String> {
-    if sabr::stream::is_trusted_google_host(sabr_url) {
-        Ok(format!("{}&rn=0", sabr_url))
-    } else {
-        Err(sabr::stream::host_for_log(sabr_url))
-    }
-}
-
 #[cfg(test)]
 mod log_hygiene_tests {
     // Pairing identities and session tokens must never reach the logs. The
@@ -1537,40 +1028,69 @@ mod log_hygiene_tests {
             concat!("ctt received", ": {}"),
             concat!("Generated screen_id (cl)", ": {}"),
             concat!("Generated screen_id (m)", ": {}"),
-            // --test mode: token, visitor_data, full URLs and body previews.
-            concat!("Bearer token", ": {}"),
-            concat!("Visitor data", ": {}"),
-            concat!("SABR URL", ": {}..."),
-            concat!("SABR POST to", ": {}..."),
-            concat!("SABR_ERROR hex", ": {}"),
-            concat!("len().min(", "200)"),
         ] {
             assert!(!src.contains(needle), "secret-logging format string found: {needle}");
         }
     }
+}
 
-    #[test]
-    fn sabr_probe_refuses_untrusted_host() {
-        assert_eq!(
-            super::sabr_probe_url("https://evil.example/videoplayback?sig=SECRET"),
-            Err("evil.example".to_string())
-        );
-        assert_eq!(
-            super::sabr_probe_url("http://rr1---sn-abc.googlevideo.com/videoplayback?sig=SECRET"),
-            Err("rr1---sn-abc.googlevideo.com".to_string())
-        );
-        assert_eq!(
-            super::sabr_probe_url("https://rr1---sn-abc.googlevideo.com/videoplayback?sig=S"),
-            Ok("https://rr1---sn-abc.googlevideo.com/videoplayback?sig=S&rn=0".to_string())
-        );
+#[cfg(test)]
+mod no_stored_credentials_tests {
+    // The receiver never stores or uses its own credentials: it only uses what
+    // the cast client hands over (ctt) and the optional cookie file. Needles
+    // are split with concat! so these tests do not match themselves.
+
+    /// Non-test source of every `.rs` file under `src/`, by path.
+    fn production_sources() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).unwrap();
+                    let prod = src.split("#[cfg(test)]").next().unwrap().to_string();
+                    out.push((path, prod));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        assert!(out.len() > 10, "source walk found too few files: {}", out.len());
+        out
     }
 
     #[test]
-    fn host_for_log_drops_path_and_query() {
-        assert_eq!(
-            super::sabr::stream::host_for_log("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRET"),
-            "rr1---sn-abc.googlevideo.com"
-        );
-        assert_eq!(super::sabr::stream::host_for_log("not a url"), "<unparseable>");
+    fn no_oauth_module_or_credentials_file() {
+        for (path, src) in production_sources() {
+            assert_ne!(path.file_name().unwrap(), "oauth.rs");
+            for needle in [concat!("mod ", "oauth"), concat!("ytcast-", "oauth"), concat!("OAuth", "State")] {
+                assert!(!src.contains(needle), "{} contains {needle}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn no_bearer_authorization() {
+        for (path, src) in production_sources() {
+            assert!(!src.contains(concat!("Bear", "er")), "{} mentions a bearer token", path.display());
+            // The only Authorization header allowed is the cookie SAPISIDHASH.
+            for (i, _) in src.match_indices(concat!("\"Authori", "zation\"")) {
+                let value = &src[i..(i + 200).min(src.len())];
+                assert!(
+                    value.contains("full_sapisidhash("),
+                    "{}: Authorization header that is not SAPISIDHASH: {value}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn login_and_test_flags_are_not_parsed() {
+        let main = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        for needle in [concat!("\"--", "login\""), concat!("\"--", "test\"")] {
+            assert!(!main.contains(needle), "main.rs still parses {needle}");
+        }
     }
 }

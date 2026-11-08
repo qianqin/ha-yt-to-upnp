@@ -39,8 +39,6 @@ pub struct DialState {
     pub yt_cookies: Option<std::sync::Arc<crate::cookies::YtCookies>>,
     /// Live YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::cookies::YtMusicSession>>,
-    /// OAuth state for Premium Bearer token auth.
-    pub oauth_state: Option<std::sync::Arc<crate::oauth::OAuthState>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
     pub screen_id: String,
 }
@@ -280,8 +278,7 @@ async fn stream_audio(
     let ctt = state.ctt.read().unwrap().clone();
     let yt_cookies = state.yt_cookies.as_ref().map(|c| c.as_ref());
     let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
-    let oauth = state.oauth_state.clone();
-    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_cookies, yt_session, oauth.as_ref()).await {
+    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_cookies, yt_session).await {
         Ok((info, rx)) => {
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
@@ -371,7 +368,6 @@ mod tests {
             ctt: std::sync::RwLock::new(None),
             yt_cookies: None,
             yt_session: None,
-            oauth_state: None,
             screen_id: "test-screen".to_string(),
         })
     }

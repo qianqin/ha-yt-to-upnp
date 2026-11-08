@@ -19,14 +19,13 @@ pub async fn resolve_stream(
     _playlist_id: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    oauth_token: Option<&str>,
 ) -> Result<Option<StreamInfo>> {
     let stream_url = format!("http://localhost:8008/stream/{}", video_id);
 
     // When ctt or session is available, use WEB_REMIX (YouTube Music web client).
     // WEB_REMIX is the only client that accepts credentialTransferTokens from cast sessions.
     let (title, duration) = if ctt.is_some() || yt_session.is_some() {
-        match web_remix_player(client, video_id, ctt, yt_cookies, yt_session, oauth_token).await {
+        match web_remix_player(client, video_id, ctt, yt_cookies, yt_session).await {
             Ok(td) => td,
             Err(e) => {
                 tracing::warn!("[innertube] WEB_REMIX failed: {}, trying IOS", e);
@@ -57,7 +56,6 @@ async fn web_remix_player(
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    oauth_token: Option<&str>,
 ) -> Result<(String, u64)> {
     // Build context: use full INNERTUBE_CONTEXT from session if available
     let body = if let Some(session) = yt_session {
@@ -146,10 +144,8 @@ async fn web_remix_player(
         }
     }
 
-    // Auth: OAuth Bearer > cookie-based triple SAPISIDHASH
-    if let Some(token) = oauth_token {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    } else if let Some(c) = yt_cookies {
+    // Auth: cookie-based triple SAPISIDHASH
+    if let Some(c) = yt_cookies {
         let user_sid = yt_session.and_then(|s| s.user_session_id.as_deref());
         req = req
             .header("Cookie", &c.cookie_header)
