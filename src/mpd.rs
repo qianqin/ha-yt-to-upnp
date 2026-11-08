@@ -162,13 +162,15 @@ mod real {
         port: u16,
     }
 
-    /// A URI as one quoted MPD argument; quotes and line breaks would let it
-    /// end the argument or the command early.
+    /// A URI as one quoted MPD argument. Quotes and backslashes are escaped
+    /// so they cannot end the argument; line breaks would end the command
+    /// and cannot be escaped, so they are refused.
     fn quoted_uri(uri: &str) -> Result<String> {
-        if uri.contains('"') || uri.contains('\n') || uri.contains('\r') {
-            return Err(MpdError::Protocol("URI contains forbidden characters".into()));
+        if uri.contains('\n') || uri.contains('\r') {
+            return Err(MpdError::Protocol("URI contains a line break".into()));
         }
-        Ok(format!("\"{uri}\""))
+        let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!("\"{escaped}\""))
     }
 
     impl MpdClient {
@@ -470,6 +472,11 @@ pub use real::{MpdClient, MpdIdleClient};
 mod mock {
     use super::*;
 
+    /// The first 80 characters; a byte slice could split a character.
+    fn log_prefix(uri: &str) -> String {
+        uri.chars().take(80).collect()
+    }
+
     pub struct MpdClient;
 
     impl MpdClient {
@@ -483,7 +490,7 @@ mod mock {
         }
 
         pub async fn add(&mut self, uri: &str) -> Result<()> {
-            tracing::info!("[mock-mpd] add: {}", &uri[..uri.len().min(80)]);
+            tracing::info!("[mock-mpd] add: {}", log_prefix(uri));
             Ok(())
         }
 
@@ -493,7 +500,7 @@ mod mock {
         }
 
         pub async fn addid(&mut self, uri: &str) -> Result<u32> {
-            tracing::info!("[mock-mpd] addid: {}", &uri[..uri.len().min(80)]);
+            tracing::info!("[mock-mpd] addid: {}", log_prefix(uri));
             Ok(1)
         }
 
@@ -567,6 +574,23 @@ mod mock {
 
 #[cfg(feature = "mock-mpd")]
 pub use mock::{MpdClient, MpdIdleClient};
+
+#[cfg(all(test, feature = "mock-mpd"))]
+mod mock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_logs_long_multibyte_uris_without_panicking() {
+        // 'ä' is two bytes: byte 80 falls inside a character.
+        let uri = format!("http://x/{}", "ä".repeat(60));
+        // Log arguments are only evaluated with a subscriber listening.
+        let capture = crate::storage::test_util::LogCapture::start();
+        let mut mpd = MpdClient::connect("127.0.0.1", 0).await.unwrap();
+        mpd.add(&uri).await.unwrap();
+        mpd.addid(&uri).await.unwrap();
+        assert!(capture.text().contains("[mock-mpd] addid: http://x/ä"));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -647,10 +671,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn addid_escapes_quotes_and_backslashes() {
+            // Unescaped, a trailing backslash would swallow the closing quote.
+            let (port, server) = fake_mpd(vec![("addid", "Id: 1\nOK\n"), ("add", "OK\n")]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            mpd.addid(r#"http://x/a"b\"#).await.unwrap();
+            mpd.add(r#"http://x/c\d"#).await.unwrap();
+            drop(mpd);
+            assert_eq!(
+                server.await.unwrap(),
+                vec![r#"addid "http://x/a\"b\\""#, r#"add "http://x/c\\d""#]
+            );
+        }
+
+        #[tokio::test]
         async fn addid_rejects_uris_that_could_inject_commands() {
             let (port, server) = fake_mpd(vec![]).await;
             let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
-            for uri in ["http://x/\"", "http://x/\nstop", "http://x/\r"] {
+            for uri in ["http://x/\nstop", "http://x/\r"] {
                 assert!(mpd.addid(uri).await.is_err(), "{uri:?}");
             }
             drop(mpd);
