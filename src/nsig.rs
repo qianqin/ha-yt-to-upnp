@@ -6,7 +6,7 @@
 //! Caching strategy:
 //! - First decode parses base.js with meriyah (~40s, ~256MB). Produces a
 //!   "preprocessed player" string that's cached both in memory and to disk.
-//! - Subsequent decodes reuse the preprocessed player (~0.6s, ~50MB).
+//! - Subsequent decodes reuse the preprocessed player (~0.6s, ~65MB).
 //! - Disk cache survives reboots. Only re-parses when base.js hash changes.
 
 use std::path::PathBuf;
@@ -72,6 +72,38 @@ pub fn decode_nsig_cached_at(
     player_hash: &str,
     disk_cache: Option<PathBuf>,
 ) -> Result<String, String> {
+    decode_with_limits(player_js, n_value, player_hash, disk_cache, MEM_LIMITS)
+}
+
+/// QuickJS heap limits per decode; each decode gets a fresh runtime.
+#[derive(Clone, Copy)]
+struct MemLimits {
+    /// Running a cached preprocessed player.
+    cached: usize,
+    /// Parsing base.js with meriyah.
+    fresh: usize,
+}
+
+// Measured peaks (QuickJS has no peak counter, so: smallest limit that
+// decodes) for a ~4 MB preprocessed player: 63 MiB cached, 172 MiB fresh.
+// The cached path gets 2x headroom; players grow and GC timing varies.
+const MEM_LIMITS: MemLimits = MemLimits {
+    cached: 128 * 1024 * 1024,
+    fresh: 256 * 1024 * 1024,
+};
+
+/// Reported for a null/undefined exception: QuickJS could not even allocate
+/// the error object (Linux under a tight limit). Matches the solver call's
+/// own message for a null exception.
+const NULL_EXCEPTION: &str = "null exception (OOM?)";
+
+fn decode_with_limits(
+    player_js: &str,
+    n_value: &str,
+    player_hash: &str,
+    disk_cache: Option<PathBuf>,
+    limits: MemLimits,
+) -> Result<String, String> {
     let player_js = player_js.to_owned();
     let n_value = n_value.to_owned();
     let player_hash = player_hash.to_owned();
@@ -95,16 +127,12 @@ pub fn decode_nsig_cached_at(
         .name("nsig-solver".into())
         .stack_size(SOLVER_STACK_SIZE)
         .spawn(move || {
-            let result = decode_nsig_inner(&player_js, &n_value, cached.as_deref())
-                .inspect_err(|_| {
-                    if cached.is_some() {
-                        discard_cache(&player_hash, disk_cache.as_deref());
-                    }
-                })?;
+            let result = run_solver(&player_js, &n_value, cached.as_deref(), limits)?;
             // An unusable answer from a player that ran is not a cache fault.
             check_decoded(&n_value, &result.decoded)?;
 
-            // Cache the preprocessed player if we got one back
+            // A preprocessed player comes back only from a fresh parse; it
+            // replaces whatever was cached.
             if let Some(ref pp) = result.preprocessed {
                 *PREPROCESSED_CACHE.lock().unwrap() = Some((player_hash.clone(), pp.clone()));
                 if let Some(ref path) = disk_cache {
@@ -134,21 +162,36 @@ fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A cached player that fails to run is never retried: drop it from memory
-/// and disk so the next call re-parses base.js.
-fn discard_cache(player_hash: &str, disk_cache: Option<&std::path::Path>) {
-    let mut guard = PREPROCESSED_CACHE.lock().unwrap();
-    if guard.as_ref().is_some_and(|(h, _)| h == player_hash) {
-        *guard = None;
-    }
-    drop(guard);
-    if let Some(path) = disk_cache {
-        match std::fs::remove_file(path) {
-            Ok(()) => tracing::warn!("[nsig] discarded failing disk cache: {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!("[nsig] failed to remove disk cache {}: {}", path.display(), e),
+/// Runs the solver without judging error messages (QuickJS reports running
+/// out of memory differently per platform). A failing cached player is
+/// retried at the fresh-path limit, then base.js is parsed afresh. Only a
+/// successful fresh parse proves the cache bad, and its result replaces the
+/// cache; if it fails too, the cache is left alone.
+fn run_solver(
+    player_js: &str,
+    n_value: &str,
+    cached: Option<&str>,
+    limits: MemLimits,
+) -> Result<DecodeResult, String> {
+    if let Some(preprocessed) = cached {
+        for limit in [limits.cached, limits.fresh] {
+            match decode_nsig_inner(player_js, n_value, Some(preprocessed), limit) {
+                Ok(result) => return Ok(result),
+                Err(e) => tracing::warn!("[nsig] cached player failed at {} MiB: {}", limit >> 20, e),
+            }
         }
+        tracing::warn!("[nsig] re-parsing base.js; the cache is replaced only if that succeeds");
     }
+    decode_nsig_inner(player_js, n_value, None, limits.fresh)
+}
+
+/// Runs a cached player with 3/4 of the cached-path limit, so a live test
+/// fails while some headroom is left. Not 1/2: the measured peak sits right
+/// at half the limit and varies by a few MiB between runs.
+#[cfg(test)]
+#[allow(dead_code)] // used by the binary crate's network test
+pub(crate) fn decode_cached_below_limit(preprocessed: &str, n_value: &str) -> Result<String, String> {
+    decode_nsig_inner("", n_value, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|r| r.decoded)
 }
 
 struct DecodeResult {
@@ -160,10 +203,8 @@ fn decode_nsig_inner(
     player_js: &str,
     n_value: &str,
     cached_preprocessed: Option<&str>,
+    mem_limit: usize,
 ) -> Result<DecodeResult, String> {
-    let is_cached = cached_preprocessed.is_some();
-    let mem_limit = if is_cached { 64 * 1024 * 1024 } else { 256 * 1024 * 1024 };
-
     let rt = rquickjs::Runtime::new()
         .map_err(|e| format!("QuickJS runtime failed: {}", e))?;
     rt.set_memory_limit(mem_limit);
@@ -187,13 +228,13 @@ fn decode_nsig_inner(
         // 4. Set variables
         let global = ctx.globals();
         global.set("_n_value", n_value)
-            .map_err(|e| format!("set _n_value failed: {}", e))?;
+            .map_err(|e| fmt_js_error(&ctx, e, "set _n_value"))?;
 
         let result_json: String = if let Some(preprocessed) = cached_preprocessed {
-            // Fast path: use cached preprocessed player (~0.6s, ~50MB)
+            // Fast path: use cached preprocessed player (~0.6s, ~65MB)
             tracing::info!("[nsig] using cached preprocessed player");
             global.set("_preprocessed", preprocessed)
-                .map_err(|e| format!("set _preprocessed failed: {}", e))?;
+                .map_err(|e| fmt_js_error(&ctx, e, "set _preprocessed"))?;
 
             let call_js = r#"
                 try {
@@ -215,7 +256,7 @@ fn decode_nsig_inner(
             // Slow path: parse base.js from scratch (~40s, ~256MB)
             tracing::info!("[nsig] parsing base.js with meriyah (first time, ~40s)...");
             global.set("_player_js", player_js)
-                .map_err(|e| format!("set _player_js failed: {}", e))?;
+                .map_err(|e| fmt_js_error(&ctx, e, "set _player_js"))?;
 
             let call_js = r#"
                 try {
@@ -281,8 +322,18 @@ fn decode_nsig_inner(
     })
 }
 
-fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, _e: rquickjs::Error, stage: &str) -> String {
+/// Formats a failed QuickJS call. Non-exception errors keep their own text
+/// and a null/undefined exception is named instead of printed raw.
+fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, stage: &str) -> String {
+    match e {
+        rquickjs::Error::Exception => {}
+        rquickjs::Error::Allocation => return format!("{} failed: out of memory", stage),
+        e => return format!("{} failed: {}", stage, e),
+    }
     let caught = ctx.catch();
+    if caught.is_null() || caught.is_undefined() {
+        return format!("{} failed: {}", stage, NULL_EXCEPTION);
+    }
     if let Some(exc) = caught.as_exception() {
         let msg = exc.message().unwrap_or_default();
         let stack = exc
@@ -383,20 +434,6 @@ mod tests {
         assert!(path.exists(), "cache was discarded for a player that ran");
     }
 
-    #[test]
-    fn corrupt_cache_is_removed_after_failed_run() {
-        let tmp = TempDir::new("nsig-corrupt");
-        let path = tmp.path().join("nsig-preprocessed-corrupt.js");
-        std::fs::write(&path, "this is not a preprocessed player").unwrap();
-
-        // Empty player JS: the fresh path is never taken, so no network or
-        // real base.js is involved.
-        let result = decode_nsig_cached_at("", "abc", "test-corrupt-cache", Some(path.clone()));
-
-        assert!(result.is_err(), "{result:?}");
-        assert!(!path.exists(), "corrupt cache file was kept");
-    }
-
     /// Minimal player in base.js's shape: one IIFE whose URL builder calls
     /// `x.set("alr", "yes")`; its first non-accessor URL method reverses n.
     const SYNTHETIC_PLAYER: &str = r#"(function(g){
@@ -421,10 +458,94 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         assert_eq!(cached.unwrap(), "zyx");
     }
 
+    /// Limits far below what lib.js needs, so every attempt fails.
+    const STARVED: MemLimits = MemLimits { cached: 1 << 20, fresh: 1 << 20 };
+
+    /// A player the solver parses but finds no n function in.
+    const PLAYER_WITHOUT_N: &str = "(function(g){ var a = 1; }).call(this, {});";
+
+    fn cache_synthetic_player(name: &str) -> (TempDir, PathBuf) {
+        let tmp = TempDir::new(name);
+        let path = tmp.path().join("nsig-preprocessed-synthetic.js");
+        decode_nsig_cached_at(SYNTHETIC_PLAYER, "abc123", &format!("test-{name}"), Some(path.clone())).unwrap();
+        (tmp, path)
+    }
+
+    fn write_corrupt_cache(name: &str) -> (TempDir, PathBuf) {
+        let tmp = TempDir::new(name);
+        let path = tmp.path().join("nsig-preprocessed-corrupt.js");
+        std::fs::write(&path, CORRUPT).unwrap();
+        (tmp, path)
+    }
+
+    const CORRUPT: &str = "this is not a preprocessed player";
+
+    #[test]
+    fn failing_cached_player_is_retried_at_fresh_limit() {
+        let (_tmp, path) = cache_synthetic_player("nsig-retry");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let limits = MemLimits { cached: STARVED.cached, fresh: MEM_LIMITS.fresh };
+
+        // No player JS: only the retry of the cached player can succeed.
+        let decoded = decode_with_limits("", "xyz", "test-retry-disk", Some(path.clone()), limits);
+
+        assert_eq!(decoded.unwrap(), "zyx");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn corrupt_cache_is_replaced_by_fresh_parse() {
+        let (_tmp, path) = write_corrupt_cache("nsig-corrupt-replace");
+
+        let decoded = decode_nsig_cached_at(SYNTHETIC_PLAYER, "xyz", "test-corrupt-replace", Some(path.clone()));
+
+        assert_eq!(decoded.unwrap(), "zyx");
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), CORRUPT);
+        let from_cache = decode_nsig_cached_at("", "abc", "test-corrupt-replace-disk", Some(path));
+        assert_eq!(from_cache.unwrap(), "cba");
+    }
+
+    #[test]
+    fn cache_is_kept_when_fresh_parse_fails_too() {
+        let (_tmp, path) = write_corrupt_cache("nsig-corrupt-keep");
+
+        let decoded = decode_nsig_cached_at(PLAYER_WITHOUT_N, "xyz", "test-corrupt-keep", Some(path.clone()));
+
+        assert!(decoded.is_err(), "{decoded:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CORRUPT);
+    }
+
+    #[test]
+    fn cache_is_kept_when_every_attempt_runs_out_of_memory() {
+        let (_tmp, path) = cache_synthetic_player("nsig-starved");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let decoded = decode_with_limits(SYNTHETIC_PLAYER, "xyz", "test-starved-disk", Some(path.clone()), STARVED);
+
+        assert!(decoded.is_err(), "{decoded:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let again = decode_nsig_cached_at("", "xyz", "test-starved-again", Some(path));
+        assert_eq!(again.unwrap(), "zyx");
+    }
+
+    /// QuickJS can leave a null exception when it cannot allocate the error
+    /// object; the formatter names it instead of printing the raw value.
+    #[test]
+    fn null_or_undefined_exception_is_named() {
+        for script in ["throw null", "throw undefined"] {
+            let rt = rquickjs::Runtime::new().unwrap();
+            let ctx = rquickjs::Context::full(&rt).unwrap();
+            let err = ctx.with(|ctx| {
+                let e = ctx.eval::<rquickjs::Value, _>(script.as_bytes().to_vec()).unwrap_err();
+                fmt_js_error(&ctx, e, "stage")
+            });
+            assert_eq!(err, format!("stage failed: {NULL_EXCEPTION}"), "{script}");
+        }
+    }
+
     #[test]
     fn player_without_n_function_reports_solver_error() {
-        let player = "(function(g){ var a = 1; }).call(this, {});";
-        let err = decode_nsig_cached_at(player, "abc", "test-no-solution", None).unwrap_err();
+        let err = decode_nsig_cached_at(PLAYER_WITHOUT_N, "abc", "test-no-solution", None).unwrap_err();
         assert!(err.starts_with("jsc n error: no solutions"), "{err}");
     }
 }
