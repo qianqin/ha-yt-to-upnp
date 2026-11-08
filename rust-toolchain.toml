@@ -1,5 +1,5 @@
 [toolchain]
-# Exact version so local Docker builds (rust:1.99.1-bookworm) and CI compile with the same compiler.
+# Exact version so local and container builds (rust:1.99.1-bookworm) compile with the same compiler.
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
