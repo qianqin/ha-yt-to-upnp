@@ -597,4 +597,34 @@ mod tests {
         assert_eq!(web_remix_auth(None, Some(&session)).err(), Some("no ctt from the cast"));
         assert_eq!(web_remix_auth(None, None).err(), Some("no ctt from the cast"));
     }
+
+    /// Network: solves an n challenge against YouTube's current player, first
+    /// from base.js, then from the preprocessed player it cached on disk.
+    /// Run with `cargo test --locked -- --ignored current_player`.
+    #[tokio::test]
+    #[ignore]
+    async fn current_player_solves_n() {
+        let session = fetch_music_session().await.expect("music.youtube.com session");
+        let hash = session.player_hash.expect("player hash");
+        let js = session.player_js.expect("base.js");
+        let tmp = crate::storage::test_util::TempDir::new("nsig-live");
+        let path = tmp.path().join("nsig-preprocessed-live.js");
+        let n = "ZdZIqFPQK-Ty8wIdab";
+
+        let (fresh, cached) = tokio::task::spawn_blocking(move || {
+            let fresh = crate::nsig::decode_nsig_cached_at(&js, n, &hash, Some(path.clone()))
+                .unwrap_or_else(|e| panic!("player {hash}: {e}"));
+            assert!(path.exists(), "preprocessed player not cached");
+            // Another key misses the in-memory cache, so this runs the disk copy.
+            let cached = crate::nsig::decode_nsig_cached_at("", n, &format!("{hash}-disk"), Some(path))
+                .unwrap();
+            eprintln!("player {hash}: {n} -> {fresh}");
+            (fresh, cached)
+        })
+        .await
+        .unwrap();
+
+        assert!(!fresh.is_empty() && fresh != n);
+        assert_eq!(cached, fresh);
+    }
 }

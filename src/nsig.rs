@@ -14,6 +14,9 @@ use std::sync::Mutex;
 
 const LIB_JS: &str = include_str!("vendor/yt.solver.lib.min.js");
 const CORE_JS: &str = include_str!("vendor/yt.solver.core.min.js");
+/// yt-dlp/ejs release of the vendored files (see `vendor/README.md`). Part of
+/// the disk cache key: a player preprocessed by another core is not reused.
+const EJS_VERSION: &str = "0.8.0";
 
 /// Stack size for the solver thread. meriyah recurses deeply parsing 2.7MB base.js.
 const SOLVER_STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
@@ -22,14 +25,14 @@ const SOLVER_STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
 static PREPROCESSED_CACHE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// Disk cache file path: `$YTCAST_DATA_DIR/nsig-cache/` or `~/.cache/ytcast/`,
-/// file `nsig-preprocessed-{hash}.js`.
+/// file `nsig-preprocessed-ejs{EJS_VERSION}-{hash}.js`.
 fn cache_path(player_hash: &str) -> Option<PathBuf> {
     cache_path_in(crate::storage::data_dir_env().as_deref(), player_hash)
 }
 
 fn cache_path_in(data_dir: Option<&std::path::Path>, player_hash: &str) -> Option<PathBuf> {
     crate::storage::nsig_cache_dir(data_dir)
-        .map(|d| d.join(format!("nsig-preprocessed-{}.js", player_hash)))
+        .map(|d| d.join(format!("nsig-preprocessed-ejs{}-{}.js", EJS_VERSION, player_hash)))
 }
 
 fn load_disk_cache_at(path: &std::path::Path) -> Option<String> {
@@ -62,7 +65,8 @@ pub fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<
     decode_nsig_cached_at(player_js, n_value, player_hash, cache_path(player_hash))
 }
 
-fn decode_nsig_cached_at(
+/// [`decode_nsig`] with an explicit disk cache file.
+pub fn decode_nsig_cached_at(
     player_js: &str,
     n_value: &str,
     player_hash: &str,
@@ -246,11 +250,20 @@ fn decode_nsig_inner(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        // Extract decoded n from responses[0].data[n_value]
-        let decoded = result
+        let response = result
             .get("responses")
             .and_then(|r| r.as_array())
-            .and_then(|arr| arr.first())
+            .and_then(|arr| arr.first());
+        if let Some(err) = response
+            .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("error"))
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_str())
+        {
+            return Err(format!("jsc n error: {}", &err[..err.floor_char_boundary(300)]));
+        }
+
+        // Extract decoded n from responses[0].data[n_value]
+        let decoded = response
             .and_then(|resp| resp.get("data"))
             .and_then(|data| data.get(n_value))
             .and_then(|v| v.as_str())
@@ -300,7 +313,7 @@ mod tests {
     fn cache_path_unchanged_without_data_dir() {
         assert_eq!(
             cache_path_in(None, "abc"),
-            dirs::cache_dir().map(|d| d.join("ytcast").join("nsig-preprocessed-abc.js"))
+            dirs::cache_dir().map(|d| d.join("ytcast").join("nsig-preprocessed-ejs0.8.0-abc.js"))
         );
     }
 
@@ -308,7 +321,7 @@ mod tests {
     fn cache_written_under_data_dir() {
         let tmp = TempDir::new("nsig-cache");
         let path = cache_path_in(Some(tmp.path()), "abc").unwrap();
-        assert_eq!(path, tmp.path().join("nsig-cache").join("nsig-preprocessed-abc.js"));
+        assert_eq!(path, tmp.path().join("nsig-cache").join("nsig-preprocessed-ejs0.8.0-abc.js"));
 
         save_disk_cache_at(&path, "preprocessed");
         assert_eq!(load_disk_cache_at(&path).as_deref(), Some("preprocessed"));
@@ -382,5 +395,36 @@ mod tests {
 
         assert!(result.is_err(), "{result:?}");
         assert!(!path.exists(), "corrupt cache file was kept");
+    }
+
+    /// Minimal player in base.js's shape: one IIFE whose URL builder calls
+    /// `x.set("alr", "yes")`; its first non-accessor URL method reverses n.
+    const SYNTHETIC_PLAYER: &str = r#"(function(g){
+var Q = function(u){ this.p = {}; };
+Q.prototype.set = function(k, v){ this.p[k] = v; };
+Q.prototype.get = function(k){ return this.p[k]; };
+Q.prototype.clone = function(){ return this; };
+Q.prototype.mutate = function(){ var n = this.p.n; if (n) this.p.n = n.split("").reverse().join(""); };
+g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val) u.set(key, val); return u; };
+}).call(this, {});"#;
+
+    #[test]
+    fn solver_extracts_n_from_player_and_reuses_preprocessed() {
+        let tmp = TempDir::new("nsig-synthetic");
+        let path = tmp.path().join("nsig-preprocessed-synthetic.js");
+
+        let fresh = decode_nsig_cached_at(SYNTHETIC_PLAYER, "abc123", "test-synthetic", Some(path.clone()));
+        assert_eq!(fresh.unwrap(), "321cba");
+        assert!(path.exists(), "preprocessed player not cached");
+
+        let cached = decode_nsig_cached_at("", "xyz", "test-synthetic-disk", Some(path));
+        assert_eq!(cached.unwrap(), "zyx");
+    }
+
+    #[test]
+    fn player_without_n_function_reports_solver_error() {
+        let player = "(function(g){ var a = 1; }).call(this, {});";
+        let err = decode_nsig_cached_at(player, "abc", "test-no-solution", None).unwrap_err();
+        assert!(err.starts_with("jsc n error: no solutions"), "{err}");
     }
 }
