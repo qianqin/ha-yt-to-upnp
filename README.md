@@ -119,7 +119,7 @@ cargo build --features mock-mpd
 cargo build --release
 
 # Cross-compile for Raspberry Pi (aarch64)
-docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
+docker run --rm -v "$PWD:/src" -w /src rust:1.99.1-bookworm bash -c \
   "apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu protobuf-compiler && \
    rustup target add aarch64-unknown-linux-gnu && \
    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \

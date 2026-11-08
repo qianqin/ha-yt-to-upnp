@@ -5,53 +5,80 @@ comes later; its container image will also be built locally.
 
 There is no hosted pipeline. Every check runs locally: natively on macOS
 (Apple Silicon) and in a temporary Linux container for platform coverage.
-The toolchain is pinned in `rust-toolchain.toml`; keep the Docker image tag
-below in sync with its `channel`.
+The toolchain is pinned in `rust-toolchain.toml`; the Linux image tag
+(`rust:<channel>-bookworm`) follows its `channel`.
+
+## Prerequisites
+
+One-time setup on the release machine:
+
+- **rustup** with its `cargo` on `PATH`. rustup picks up the pinned toolchain
+  from `rust-toolchain.toml` automatically (e.g. `brew install rustup`, then
+  put `$(brew --prefix rustup)/bin` on `PATH`).
+- **protoc**, needed by `build.rs`: `brew install protobuf`
+- **Docker** (running daemon), for the Linux checks.
+- **python3**, for the adapter tests.
+- **cargo-audit 0.22.2**:
+
+  ```sh
+  cargo install cargo-audit --version 0.22.2 --locked
+  ```
 
 ## Release
 
-A release is a push to `master`. Push only after **all** local checks below
-passed on the exact commit you are about to push (clean working tree,
-`git status` shows nothing to commit). Run everything from the repository root.
+A release is a push to `master`. Commit everything (clean working tree), then
+run from the repository root:
 
-### Local checks
+```sh
+scripts/release-check.sh
+```
 
-1. macOS, native toolchain (picked up from `rust-toolchain.toml` via rustup):
+**Push only if it exits 0:**
+
+```sh
+git push origin master
+```
+
+The script refuses to run on a dirty tree, runs the local checks below in
+order on the current commit, stops at the first failure, and always removes
+the Docker volumes and containers it created plus any image it had to pull
+(images that were already present are left alone). Add `--with-ubuntu` to
+also run the optional Ubuntu variant.
+
+### Local checks (what the script runs)
+
+For reference, the same checks by hand, from the repository root:
+
+1. macOS, native toolchain:
 
    ```sh
    cargo build --locked && cargo test --locked
    ```
 
-2. Linux, in a temporary container. The `target` directory lives in a
-   throwaway Docker volume so Linux build artifacts do not mix with the macOS
-   ones in `./target`:
+2. Linux, in a temporary container. The source is mounted read-only; build
+   output goes to a throwaway named volume, so Linux artifacts never mix with
+   the macOS ones in `./target`:
 
    ```sh
-   docker run --rm -v "$PWD":/src -w /src \
-     -v ytcast-linux-target:/src/target \
+   docker run --rm -v "$PWD":/src:ro -w /src \
+     -v ytcast-linux-target:/target -e CARGO_TARGET_DIR=/target \
      rust:1.99.1-bookworm bash -c \
-     'apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null && cargo test --locked'
+     'apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null && cargo build --locked && cargo test --locked'
    ```
 
-   Optional second Linux variant on a plain Ubuntu base with rustup:
+   Optional variant on a plain Ubuntu base with rustup:
 
    ```sh
-   docker run --rm -v "$PWD":/src -w /src \
-     -v ytcast-ubuntu-target:/src/target \
+   docker run --rm -v "$PWD":/src:ro -w /src \
+     -v ytcast-ubuntu-target:/target -e CARGO_TARGET_DIR=/target \
      ubuntu:24.04 bash -c \
-     'apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config protobuf-compiler >/dev/null \
-      && curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal \
-      && . "$HOME/.cargo/env" && cargo test --locked'
+     'apt-get update -qq && apt-get install -y -qq curl ca-certificates build-essential pkg-config protobuf-compiler >/dev/null \
+      && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+      && . "$HOME/.cargo/env" && cargo build --locked && cargo test --locked'
    ```
 
 3. Dependency audit (fails on vulnerabilities; unmaintained/unsound advisories
-   are reported as warnings). One-time install:
-
-   ```sh
-   cargo install cargo-audit --version 0.22.2 --locked
-   ```
-
-   Then:
+   are reported as warnings):
 
    ```sh
    cargo audit
@@ -63,21 +90,22 @@ passed on the exact commit you are about to push (clean working tree,
    python3 -m unittest discover -s adapter
    ```
 
-5. Clean up the temporary Linux environment:
+5. Cleanup. Run this **every time**, also when a step above failed. One
+   command per resource:
 
    ```sh
-   docker volume rm ytcast-linux-target ytcast-ubuntu-target
-   docker image rm rust:1.99.1-bookworm ubuntu:24.04
+   docker volume rm ytcast-linux-target
+   docker image rm rust:1.99.1-bookworm
    ```
 
-   (`docker volume rm` / `docker image rm` report an error for a volume or
-   image the optional variant did not create; that is harmless.)
+   Only if you ran the optional Ubuntu variant:
 
-Then push:
+   ```sh
+   docker volume rm ytcast-ubuntu-target
+   ```
 
-```sh
-git push origin master
-```
+   Remove `ubuntu:24.04` (`docker image rm ubuntu:24.04`) only if you pulled it
+   for this run and nothing else uses it.
 
 ### Check
 
@@ -93,27 +121,28 @@ Both must print the same SHA.
 
 ### Rollback
 
-Never force-push `master`. Revert the bad commit(s) and push the revert:
+Never force-push `master`. Revert the bad commit(s) and commit the revert:
 
 ```sh
-git revert --no-edit <sha>                    # single commit
+git revert --no-edit <sha>                         # single commit
 git revert --no-edit <oldest-bad>^..<newest-bad>   # range
 ```
 
-Run all local checks above on the reverted tree, then `git push origin master`
-and repeat the health check.
+Run `scripts/release-check.sh` on the reverted tree, push only if it exits 0
+(`git push origin master`), and repeat the health check.
 
 ## Targets
 
 ### Target: Test
 
 Local build and test on the exact commit, natively on macOS and in a
-temporary Linux container: steps 1, 2, and 4 of [Local checks](#local-checks),
-followed by the cleanup in step 5.
+temporary Linux container, with the Docker resources removed afterwards:
+`scripts/release-check.sh` (steps 1, 2, and 4 of the local checks, plus
+cleanup).
 
 ### Target: Production
 
 The push to `master` succeeded, `git ls-remote origin master` matches the
-local commit, and all local checks (macOS build and tests, Linux container
-tests, `cargo audit`, adapter tests) passed on that commit. There is no
-pipeline to watch.
+local commit, and `scripts/release-check.sh` exited 0 on that commit (macOS
+build and tests, Linux container build and tests, `cargo audit`, adapter
+tests). There is no pipeline to watch.
