@@ -47,7 +47,9 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 5. Extracts and streams audio segments as chunked HTTP to MPD
 6. Reports buffered ranges so the server sends the next segments
 
-The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions (18 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
+If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`), the stream ends with a clear error instead of restarting the same session in a loop.
+
+The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions (18 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
 
 ## Features
 
@@ -139,7 +141,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `dial.rs` | ~550 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint (loopback peers only) |
 | `config.rs` | ~180 | JSON config (UUID, screen_id, screen_id_m) load/save |
 | `storage.rs` | ~350 | Data path resolution (`YTCAST_DATA_DIR`), private 0600 atomic writes, 0700 dirs, loose-permission warnings |
-| `sabr/stream.rs` | ~1800 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
+| `sabr/stream.rs` | ~2000 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing. Credentials (PoToken, ctt) are only sent to https `*.youtube.com` / `*.googlevideo.com`; stream URLs or redirects to any other host fail closed |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 | `adapter/raumfeld_adapter.py` | ~620 | Optional Python sidecar (not part of the binary): follows MPD and plays its httpd stream on a Raumfeld room via SSDP/UPnP AVTransport, standby after idle. See [adapter/README.md](adapter/README.md) |
@@ -162,6 +164,8 @@ RSS = Resident Set Size (actual physical RAM used by the process).
 The previous architecture used a Node.js SABR proxy (ytresolve, ~84MB) alongside the Rust binary. That's gone now. All SABR streaming is built into the single binary via [sabr-rs](https://github.com/mthwJsmith/sabr-rs).
 
 The bgutil-pot sidecar generates PoTokens (BotGuard attestation) needed to prevent YouTube's CDN from throttling streams after 60 seconds. It uses ~66MB because it embeds a V8/Deno JavaScript VM to execute Google's BotGuard challenges — this is unfortunately unavoidable as BotGuard requires real JS execution. To save RAM on constrained devices, bgutil-pot can be hosted on a separate machine or VPS and accessed via a single HTTP call.
+
+The log shows whether a PoToken was sent: `stream_protection_status=2 (attestation pending, no PoToken sent …)` means the stream will be throttled after ~60s; running the bgutil-pot sidecar avoids that.
 
 ## Comparison
 
