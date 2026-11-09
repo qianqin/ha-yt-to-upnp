@@ -431,6 +431,10 @@ def soap_call(control_url, action, args):
     return {_local(el.tag): (el.text or "") for el in root.iter()}
 
 
+# Everything a misbehaving network or device can cause; the follow loop must survive it.
+_ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
+
+
 # What one inspection of the room found; control/status are None unless the room is active in a zone.
 _Room = namedtuple("_Room", "api zone power control status")
 
@@ -565,20 +569,31 @@ class Controller:
 
     def _wait_awake(self, api, had_zone):
         """The room's zone once getZones reports the room ACTIVE (and, if it had one before
-        the wake, in a zone); after WAKE_WAIT_S whatever the last look reported. Each look
-        may only take what is left of the wait."""
+        the wake, in a zone); after WAKE_WAIT_S whatever the last look that answered
+        reported. Each look may only take what is left of the wait; one that fails or times
+        out counts as "not awake yet". Raises the last error if no look answered."""
         deadline = self.clock() + WAKE_WAIT_S
+        answered, error = False, None
         while True:
-            zones = http_get(api + "getZones", deadline - self.clock())
-            zone = zone_of_room(zones, self.config.room_udn)
-            if room_power_state(zones, self.config.room_udn) == "ACTIVE" and (zone or not had_zone):
-                return zone
+            try:
+                zones = http_get(api + "getZones", deadline - self.clock())
+                power = room_power_state(zones, self.config.room_udn)
+                look_zone = zone_of_room(zones, self.config.room_udn)
+            except _ERRORS as e:
+                log.debug("room not awake yet: getZones failed: %r", e)
+                error = e
+            else:
+                answered, zone = True, look_zone
+                if power == "ACTIVE" and (zone or not had_zone):
+                    return zone
             remaining = deadline - self.clock()
             if remaining <= 0:
                 break
             self.sleep(min(WAKE_POLL_S, remaining))
             if self.clock() >= deadline:
                 break
+        if not answered:
+            raise error
         log.warning("room not awake %g s after leaveStandby; taking over anyway", WAKE_WAIT_S)
         return zone
 
@@ -746,10 +761,6 @@ class MpdClient:
 
 
 # --------------------------------------------------------------------------- orchestration
-
-# Everything a misbehaving network or device can cause; the follow loop must survive it.
-_ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
-
 
 # Delay before re-trying a failed takeover while MPD keeps playing.
 PLAY_RETRY_S = 30

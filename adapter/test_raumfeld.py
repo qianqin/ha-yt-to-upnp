@@ -1,6 +1,7 @@
 """Feature: Raumfeld follows the cast -- Controller against a fake Raumfeld host."""
 
 import os
+import socket
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
@@ -113,6 +114,55 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.now - start, 3 + ra.WAKE_WAIT_S)
         # Each look may only take what is left of the wait: at +0, +3.5 and +7 s.
         self.assertEqual([c.args[1] for c in looks], [ra.WAKE_WAIT_S, 6.5, 3.0])
+        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+
+    def slow_wake_looks(self, look_s, times_out=lambda deadline_s: False):
+        """Each getZones takes look_s; a look after the wake for whose time limit times_out
+        is true takes all of it and times out."""
+        real_get = ra.http_get
+
+        def get(url, *args):
+            woken = "leaveStandby" in self.rf.api_calls()
+            if url.endswith("getZones") and woken and times_out(*args):
+                self.now += args[0]
+                raise socket.timeout("timed out")
+            return real_get(url, *args)
+
+        def slow_answer():
+            self.now += look_s
+        self.rf.on_get_zones = slow_answer
+        return mock.patch.object(ra, "http_get", side_effect=get)
+
+    def test_a_wake_look_running_into_the_deadline_still_takes_over(self):
+        self.rf.wake_after_polls = 1000
+        start = self.now
+        # Looks at +0 and +3.5 s answer (standby); the one at +7 s times out at the deadline.
+        with self.slow_wake_looks(3, times_out=lambda deadline_s: deadline_s < 3.5):
+            with self.assertLogs("raumfeld_adapter", "WARNING") as logs:
+                self.ctl.ensure_playing()
+        self.assertTrue(any("anyway" in m for m in logs.output), logs.output)
+        self.assertEqual(self.now - start, 3 + ra.WAKE_WAIT_S)
+        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
+        self.assertEqual(self.discover.searches[-1], ZONE_UDN)  # the zone of the last answer
+        self.assertNotIn("connectRoomToZone", self.rf.api_calls())
+
+    def test_a_wake_wait_in_which_no_look_answers_fails_the_takeover(self):
+        self.rf.wake_after_polls = 1000
+        with self.slow_wake_looks(0, times_out=lambda deadline_s: True):
+            with self.assertRaises(socket.timeout):
+                self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
+        self.assertNotIn("connectRoomToZone", self.rf.api_calls())
+
+    def test_the_last_wake_sleep_never_passes_the_deadline(self):
+        self.rf.wake_after_polls = 1000
+        start = self.now
+        with self.slow_wake_looks(4.7):
+            with self.assertLogs("raumfeld_adapter", "WARNING"):
+                self.ctl.ensure_playing()
+        # Looks at +4.7 and +9.9 s (each 4.7 s); only 0.1 s is left for the last sleep.
+        self.assertAlmostEqual(self.now - start, 4.7 + ra.WAKE_WAIT_S, places=9)
+        self.assertAlmostEqual(self.sleeps[-1], 0.1, places=9)
         self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
 
     def test_woken_room_active_without_its_zone_is_waited_for_not_reconnected(self):
