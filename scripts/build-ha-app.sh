@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Assembles the Home Assistant app folder, ready to copy into the HA host's
-# /addons share: ha-yt-to-upnp/ as committed at HEAD plus prebuilt artefacts for
+# /local_apps folder: ha-yt-to-upnp/ as committed at HEAD plus prebuilt artefacts for
 # linux/amd64, so the Supervisor's build only installs Debian packages and
 # copies files. The build images are pinned by digest, Deno by checksum,
 # bgutil by commit and lock files; any mismatch aborts. Not pinned: protoc
@@ -30,15 +30,17 @@ readonly BGUTIL_DIR=/opt/bgutil
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/build-ha-app.sh [--receiver-ref REF] [--adapter-ref REF] [--out DIR]
-  --receiver-ref REF  commit of the receiver (Rust) to build (default 7a699f5)
-  --adapter-ref REF   commit to take adapter/raumfeld_adapter.py from (default 556d421)
+  --receiver-ref REF  commit of the receiver (Rust) to build (default HEAD)
+  --adapter-ref REF   commit to take adapter/raumfeld_adapter.py from (default HEAD)
   --out DIR           output folder (default dist/ha-yt-to-upnp); replaced only if it
                       holds a previous build (artefacts/BUILD-INFO) or is empty
 EOF
 }
 
-receiver_ref=7a699f5
-adapter_ref=556d421
+# By default receiver, adapter and app folder all come from the same commit, so
+# the app folder's run scripts and the programs they start are in step.
+receiver_ref=HEAD
+adapter_ref=HEAD
 out=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -199,4 +201,4 @@ rm -rf "$out"
 mkdir -p "$(dirname "$out")"
 mv "$app" "$out"
 cat "$out/artefacts/BUILD-INFO"
-echo "==> done: copy $out to the HA host's /addons share (see docs/DEVOPS.md)"
+echo "==> done: copy $out to the HA host's /local_apps folder (see docs/DEVOPS.md)"

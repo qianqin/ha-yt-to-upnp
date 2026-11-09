@@ -9,7 +9,16 @@ configuration:
     description: UPnP UDN of the Raumfeld room, e.g. uuid:00000000-0000-0000-0000-000000000001
   raumfeld_speaker_udn:
     name: Raumfeld speaker UDN
-    description: UPnP UDN of the speaker device that hosts the Raumfeld API.
+    description: >-
+      UPnP UDN of the speaker device that hosts the Raumfeld API; the app finds
+      it on the LAN by this UDN. Required unless the Raumfeld host is set.
+  raumfeld_host:
+    name: Raumfeld host
+    description: >-
+      IPv4 address (recommended) or DNS name of the speaker device that hosts
+      the Raumfeld API, without port or http://. Reaches it directly instead of
+      searching the LAN, so a cast starts sooner. Leave empty to search by the
+      speaker UDN.
   stream_host:
     name: Stream host
     description: >-
