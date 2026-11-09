@@ -5,8 +5,10 @@
 # BUILD_VERSION/BUILD_ARCH), runs it with test options and checks that all four
 # services come up and stay up, run as their own users, listen where they
 # should, get the options as environment and cannot read the Supervisor token;
-# that the PoToken helper mints a token; and that an invalid option stops the
-# app with one clear error.
+# that the receiver's /silence answers on loopback only; that the PoToken helper
+# mints a token; that the adapter keeps running whether it looks for the
+# Raumfeld host by SSDP or is given an unreachable raumfeld_host; and that
+# invalid options stop the app with one clear error.
 #
 # Nothing is announced on the LAN: the container runs on its own Docker bridge
 # network (no host networking, no published ports), so the receiver's SSDP and
@@ -265,6 +267,33 @@ if mode == "full":
     check(st is not None and st.st_mode & 0o077 == 0 and user_of(st.st_uid) == "ytcast",
           "receiver keeps its config private under /data/ytcast")
 
+    # The pre-roll's endless silence, fetched by MPD at http://localhost:8008/silence.
+    # curl ends it after 2 s (exit 28); what arrived must be zero samples.
+    def silence(host):
+        r = subprocess.run(["curl", "-sS", "--max-time", "2", "-o", "/tmp/silence.raw",
+                            "-w", "%{http_code} %{content_type}",
+                            "http://%s:8008/silence" % host],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            with open("/tmp/silence.raw", "rb") as f:
+                body = f.read()
+            os.remove("/tmp/silence.raw")
+        except OSError:
+            body = b""
+        return r.stdout, body
+    answer, body = silence("localhost")
+    check(answer == "200 audio/L16;rate=44100;channels=2" and len(body) > 4096
+          and body.count(0) == len(body),
+          "receiver serves /silence on loopback (%s, %d zero bytes)" % (answer, len(body)))
+    answer, body = silence(ip)
+    check(answer.startswith("403") and not body,
+          "receiver refuses /silence on %s:8008 (%s)" % (ip, answer))
+
+    st = os.stat("/data/adapter") if os.path.isdir("/data/adapter") else None
+    check(st is not None and st.st_mode & 0o777 == 0o700 and user_of(st.st_uid) == "adapter",
+          "/data/adapter exists, mode 0700, owned by adapter (%s)"
+          % ((oct(st.st_mode & 0o777), user_of(st.st_uid)) if st else "missing",))
+
     # with-contenv keeps the container's environment in files; the services'
     # users must not be able to read the Supervisor token from there.
     envdir = "/run/s6/container_environment"
@@ -316,7 +345,7 @@ wait_for_checks() {
 
 pids_of() { sed -n 's/^PIDS //p' "$tmp/$1.out"; }
 
-step "run 1: all options set, stream host auto-detected"
+step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected"
 main="$run_id-main"
 start_app "$main" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
@@ -329,7 +358,8 @@ expect_main='{"cast_name": "Smoke Test",
                   "RAUMFELD_SPEAKER_UDN": "uuid:00000000-0000-0000-0000-000000000002",
                   "STREAM_URL": "http://{ip}:8000/stream.mp3", "MPD_HOST": "127.0.0.1",
                   "MPD_PORT": "6600", "START_GATE_SECONDS": "7", "STUCK_SECONDS": "20",
-                  "LOG_LEVEL": "DEBUG"}}'
+                  "LOG_LEVEL": "DEBUG", "ADAPTER_STATE_DIR": "/data/adapter"},
+  "adapter_env_absent": ["RAUMFELD_HOST"]}'
 wait_for_checks "$main" full "$expect_main"
 first_pids="$(pids_of "$main")"
 
@@ -353,37 +383,82 @@ echo "PASS no service exit or traceback in the log"
 echo "--- container log excerpt (run 1)"
 grep -E "Starting|\[init\]|SSDP|DIAL server|raumfeld_adapter|WARN|ERROR" <<<"$logs" | cut -c1-200 | head -40
 
-step "run 2: explicit stream_host, optional timings unset"
+# Waits until the container's log has a line matching the regex.
+wait_for_log() {
+  local name="$1" pattern="$2" deadline=$((SECONDS + 90))
+  until docker logs "$name" 2>&1 | grep -qE "$pattern"; do
+    [ "$SECONDS" -lt "$deadline" ] || { docker logs "$name" 2>&1 | tail -40; die "no log line matching '$pattern' within 90s"; }
+    sleep 2
+  done
+}
+
+step "run 2: raumfeld_host (unreachable) without speaker UDN, explicit stream_host, optional timings unset"
 second="$run_id-host"
 start_app "$second" '{"cast_name": "Smoke Test 2",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
-  "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
+  "raumfeld_host": "192.0.2.20",
   "stream_host": "192.0.2.10", "log_level": "warning"}'
-wait_for_checks "$second" env '{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
-  "adapter_env": {"STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "LOG_LEVEL": "WARNING"},
-  "adapter_env_absent": ["START_GATE_SECONDS", "STUCK_SECONDS"]}'
+expect_host='{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
+  "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "ADAPTER_STATE_DIR": "/data/adapter",
+                  "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001",
+                  "STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "LOG_LEVEL": "WARNING"},
+  "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN", "START_GATE_SECONDS", "STUCK_SECONDS"]}'
+wait_for_checks "$second" env "$expect_host"
+host_pids="$(pids_of "$second")"
+# The adapter's start-up look for the room fails (no answer from 192.0.2.20);
+# it logs that and waits for the first cast.
+wait_for_log "$second" "Raumfeld room not found yet"
+sleep "$STABLE_S"
+wait_for_checks "$second" env "$expect_host" >/dev/null
+[ "$(pids_of "$second")" = "$host_pids" ] || die "a service restarted: $host_pids -> $(pids_of "$second")"
+echo "PASS no service restarted ($host_pids)"
+host_logs="$(docker logs "$second" 2>&1)"
+grep -q "Starting Raumfeld adapter (stream http://192.0.2.10:8000/stream.mp3, Raumfeld host 192.0.2.20)" <<<"$host_logs" \
+  || die "adapter start with the Raumfeld host not logged"
+echo "PASS adapter start logged with the Raumfeld host"
+echo "PASS adapter logged the unreachable host and kept running:"
+grep "Raumfeld room not found yet" <<<"$host_logs" | cut -c1-240
+if grep -E "exited with code|exited \(code|Traceback|configuration error" <<<"$host_logs"; then die "a service failed (see above)"; fi
+echo "PASS no service exit, configuration error or traceback in the log"
 
-step "run 3: an invalid option stops the app with one clear error"
-bad="$run_id-bad"
-start_app "$bad" '{"cast_name": "Bad <name>",
+# Starts the app with invalid options; it must stop (no restart loop) with one
+# FATAL line naming the option, before any service starts.
+expect_fatal() {
+  local name="$1" options="$2" message="$3" deadline=$((SECONDS + 60)) logs code
+  start_app "$name" "$options"
+  until [ "$(docker inspect -f '{{.State.Status}}' "$name")" = exited ]; do
+    [ "$SECONDS" -lt "$deadline" ] || { docker logs "$name" 2>&1 | tail -40; die "the app did not stop within 60s"; }
+    sleep 2
+  done
+  logs="$(docker logs "$name" 2>&1)"
+  code="$(docker inspect -f '{{.State.ExitCode}}' "$name")"
+  echo "--- container log ($name)"
+  cut -c1-200 <<<"$logs"
+  [ "$code" != 0 ] || die "the app stopped with exit code 0"
+  echo "PASS the app stopped (exit code $code), no restart loop"
+  [ "$(grep -F "$message" <<<"$logs" | grep -c FATAL)" = 1 ] || die "no single FATAL line with: $message"
+  echo "PASS one FATAL line: $message"
+  if grep -E "Starting " <<<"$logs"; then die "a service started on invalid options"; fi
+  echo "PASS no service started"
+}
+
+step "run 3: an invalid cast_name stops the app with one clear error"
+expect_fatal "$run_id-bad" '{"cast_name": "Bad <name>",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
-  "log_level": "info"}'
-deadline=$((SECONDS + 60))
-until [ "$(docker inspect -f '{{.State.Status}}' "$bad")" = exited ]; do
-  [ "$SECONDS" -lt "$deadline" ] || { docker logs "$bad" 2>&1 | tail -40; die "the app did not stop within 60s"; }
-  sleep 2
-done
-bad_logs="$(docker logs "$bad" 2>&1)"
-bad_code="$(docker inspect -f '{{.State.ExitCode}}' "$bad")"
-echo "--- container log (run 3)"
-cut -c1-200 <<<"$bad_logs"
-[ "$bad_code" != 0 ] || die "the app stopped with exit code 0"
-echo "PASS the app stopped (exit code $bad_code), no restart loop"
-[ "$(grep -c "option 'cast_name' is invalid" <<<"$bad_logs")" = 1 ] || die "no single error naming cast_name"
-grep -qF 'must match ^[^<>&"\x00-\x1f]{1,60}$' <<<"$bad_logs" || die "the error does not show the rule as written"
-echo "PASS one error names the invalid option and shows its rule"
-if grep -E "Starting " <<<"$bad_logs"; then die "a service started on invalid options"; fi
-echo "PASS no service started"
+  "log_level": "info"}' "option 'cast_name' is invalid"
+grep -qF 'must match ^[^<>&"\x00-\x1f]{1,60}$' <<<"$(docker logs "$run_id-bad" 2>&1)" \
+  || die "the error does not show the rule as written"
+echo "PASS the error shows the rule as written"
+
+step "run 4: an invalid raumfeld_host stops the app with one clear error"
+expect_fatal "$run_id-badhost" '{"cast_name": "Smoke Test",
+  "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+  "raumfeld_host": "192.0.2.20:47365", "log_level": "info"}' "option 'raumfeld_host' is invalid"
+
+step "run 5: neither raumfeld_speaker_udn nor raumfeld_host stops the app with one clear error"
+expect_fatal "$run_id-nohost" '{"cast_name": "Smoke Test",
+  "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+  "log_level": "info"}' "option 'raumfeld_speaker_udn' is required when raumfeld_host is not set"
 
 step "smoke test passed"
