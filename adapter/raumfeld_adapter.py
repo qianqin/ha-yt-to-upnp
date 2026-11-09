@@ -167,6 +167,8 @@ TAKEN_AWAY = (STANDBY, NO_ZONE, OTHER_SOURCE)
 # another one (someone chose it since).
 PREVIOUS_SOURCE = " (source before the takeover)"
 ANOTHER_SOURCE = " (another source)"
+# Appended instead when the renderer holds no URI at all: nothing anyone chose.
+NOTHING_LOADED = " (nothing loaded)"
 # The longest transport state taken from a device into a log line.
 MAX_STATE_LEN = 64
 
@@ -191,9 +193,10 @@ def decide_play(status, stream_url):
 
 
 def plays_another_source(status, stream_url):
-    """The zone renderer plays (or is about to play) something other than our stream."""
+    """The zone renderer plays (or is about to play) something other than our stream. An
+    empty URI is nothing loaded, whatever the transport state says: no source."""
     return (status is not None and status.transport_state in _PLAYING_STATES
-            and status.current_uri != stream_url)
+            and status.current_uri not in ("", stream_url))
 
 
 def judge_speaker(power, zone, status, stream_url):
@@ -476,6 +479,10 @@ class Controller:
                 and not self._was_source_before(room.status.current_uri)):
             log.info("zone %r plays another source now; not taking it over again", room.zone)
             return OTHER_SOURCE
+        if not retake:
+            # Also when our stream already plays: an older source before is history then.
+            uri = room.status.current_uri if room.status else ""
+            self._source_before = "" if uri == self.config.stream_url else uri
         decision = decide_play(room.status, self.config.stream_url)
         if decision == ALREADY_PLAYING:
             log.debug("zone %r already plays the stream", room.zone)
@@ -483,9 +490,6 @@ class Controller:
         if room.status and room.status.current_uri not in ("", self.config.stream_url):
             source = "line-in" if is_line_in(room.status.current_uri) else "another source"
             log.info("zone %r was on %s; the cast takes over", room.zone, source)
-        if not retake:
-            uri = room.status.current_uri if room.status else ""
-            self._source_before = "" if uri == self.config.stream_url else uri
 
         room_param = quote(self.config.room_udn, safe="")
         zone, control = room.zone, room.control
@@ -516,16 +520,17 @@ class Controller:
 
     def renderer_state(self):
         """Transport state of the zone renderer of the last takeover or look, e.g. PLAYING
-        or STOPPED, with PREVIOUS_SOURCE or ANOTHER_SOURCE appended unless it holds our
-        stream. Only the
-        renderer is asked: right after a wake the room's power state in getZones may still
-        lag behind."""
+        or STOPPED, with NOTHING_LOADED, PREVIOUS_SOURCE or ANOTHER_SOURCE appended unless
+        it holds our stream. Only the renderer is asked: right after a wake the room's power
+        state in getZones may still lag behind."""
         control = self._known_control()
         state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
         state = state[:MAX_STATE_LEN]  # device-supplied, and it ends up in log lines
         uri = soap_call(control, "GetMediaInfo", []).get("CurrentURI", "")
         if uri == self.config.stream_url:
             return state
+        if not uri:
+            return state + NOTHING_LOADED
         return state + (PREVIOUS_SOURCE if self._was_source_before(uri) else ANOTHER_SOURCE)
 
     def _was_source_before(self, uri):

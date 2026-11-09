@@ -284,7 +284,10 @@ class ControllerTest(unittest.TestCase):
                                  ("PLAYING", LINE_IN_URI, "PLAYING (another source)"),
                                  ("TRANSITIONING", STREAM_URL, "TRANSITIONING"),
                                  ("STOPPED", STREAM_URL, "STOPPED"),
-                                 ("STOPPED", "", "STOPPED (another source)")):
+                                 ("STOPPED", OTHER_URI, "STOPPED (another source)"),
+                                 # nothing loaded is no source anyone chose
+                                 ("STOPPED", "", "STOPPED (nothing loaded)"),
+                                 ("PLAYING", "", "PLAYING (nothing loaded)")):
             with self.subTest(state=state, uri=uri):
                 self.rf.transport_state, self.rf.current_uri = state, uri
                 self.assertEqual(self.ctl.renderer_state(), seen)
@@ -298,7 +301,7 @@ class ControllerTest(unittest.TestCase):
     def test_renderer_state_truncates_what_the_device_reports(self):
         self.rf.power = "ACTIVE"
         self.ctl.check()
-        self.rf.transport_state, self.rf.current_uri = "X" * 500, ""
+        self.rf.transport_state, self.rf.current_uri = "X" * 500, OTHER_URI
         self.assertEqual(self.ctl.renderer_state(), "X" * 64 + " (another source)")
 
     def test_retake_leaves_a_zone_playing_another_source_alone(self):
@@ -325,10 +328,45 @@ class ControllerTest(unittest.TestCase):
 
     def test_after_a_takeover_from_standby_any_source_is_a_new_one(self):
         self.ctl.ensure_playing()  # nothing was playing before
-        for uri in (LINE_IN_URI, ""):
+        for uri, seen in ((LINE_IN_URI, "PLAYING (another source)"),
+                          (OTHER_URI, "PLAYING (another source)"),
+                          # an empty URI is nothing loaded, not a source someone chose
+                          ("", "PLAYING (nothing loaded)")):
             with self.subTest(uri=uri):
                 self.rf.current_uri, self.rf.transport_state = uri, "PLAYING"
-                self.assertEqual(self.ctl.renderer_state(), "PLAYING (another source)")
+                self.assertEqual(self.ctl.renderer_state(), seen)
+
+    def test_retake_sets_up_a_renderer_playing_nothing_loaded(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = "", "PLAYING"
+        self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_takeover_finding_our_stream_playing_forgets_an_older_source_before(self):
+        self.rf.power = "ACTIVE"
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        self.ctl.ensure_playing()  # the cast takes line-in over, then ends
+        self.assertEqual(self.ctl.ensure_playing(), ra.ALREADY_PLAYING)  # the next cast
+        self.rf.current_uri = LINE_IN_URI  # someone switches to line-in now
+        self.assertEqual(self.ctl.renderer_state(), "PLAYING (another source)")
+
+    def test_a_retake_keeps_the_source_before_the_first_takeover(self):
+        for retake_finds in ("our stream stopped", "standby"):
+            with self.subTest(retake_finds=retake_finds):
+                self.rf.power = "ACTIVE"
+                self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+                self.rf.drop_takeovers = 1
+                self.ctl.ensure_playing()  # dropped: still on line-in
+                if retake_finds == "standby":
+                    self.rf.power = "MANUAL_STANDBY"
+                else:
+                    self.rf.current_uri, self.rf.transport_state = STREAM_URL, "STOPPED"
+                self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
+                # The speaker drops back to line-in: still the source before the takeover.
+                self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+                self.assertEqual(self.ctl.ensure_playing(retake=True), ra.TAKE_OVER)
+                self.assertEqual(self.rf.current_uri, STREAM_URL)
 
     def test_retake_takes_over_the_source_before_the_takeover_again(self):
         self.rf.power = "ACTIVE"

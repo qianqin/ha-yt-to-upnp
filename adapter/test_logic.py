@@ -155,6 +155,16 @@ class DecisionTest(unittest.TestCase):
             for uri in (LINE_IN_URI, "http://other.invalid/x", ""):
                 self.assertEqual(d(self.s(state, uri), STREAM_URL), ra.TAKE_OVER)
 
+    def test_another_source_plays(self):
+        p = ra.plays_another_source
+        self.assertFalse(p(None, STREAM_URL))
+        for state in ("PLAYING", "TRANSITIONING"):
+            for uri in (LINE_IN_URI, "http://other.invalid/x"):
+                self.assertTrue(p(self.s(state, uri), STREAM_URL))
+            self.assertFalse(p(self.s(state, STREAM_URL), STREAM_URL))
+            self.assertFalse(p(self.s(state, ""), STREAM_URL))  # nothing loaded
+        self.assertFalse(p(self.s("STOPPED", LINE_IN_URI), STREAM_URL))
+
     def test_speaker_verdicts(self):
         j = ra.judge_speaker
         zone = "uuid:00000000-0000-0000-0000-0000000000b2"
@@ -867,6 +877,18 @@ class StartGateTest(unittest.TestCase):
         self.gate_runs_out()
         self.assertEqual(self.ctl.calls.count("ensure_playing(retake)"), ra.GATE_MAX_RETAKES)
         self.released()
+
+    def test_renderer_with_nothing_loaded_is_taken_over_again_whatever_its_state(self):
+        for seen in ("PLAYING (nothing loaded)", "TRANSITIONING (nothing loaded)"):
+            with self.subTest(seen=seen):
+                self.setUp()
+                self.ctl.renderer = seen  # no source anyone chose
+                self.held()
+                self.gate_runs_out()
+                self.assertEqual(self.ctl.calls.count("ensure_playing(retake)"),
+                                 ra.GATE_MAX_RETAKES)
+                self.released()
+                self.assertFalse(self.f.yielded)
 
     def test_a_retake_finding_a_new_source_yields_straight_from_the_gate(self):
         self.ctl.retake_decision = ra.OTHER_SOURCE
