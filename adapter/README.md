@@ -35,6 +35,17 @@ Raumfeld room play the receiver's MPD stream automatically.
     count; others are ignored (at most 3 s). The Raumfeld does **not** answer a
     unicast M-SEARCH sent to `<host>:1900`, so the setting filters multicast
     answers instead of replacing multicast.
+  - **Kept across restarts** with `ADAPTER_STATE_DIR`: after a search the zone
+    renderer's location is written to `raumfeld-adapter-state.json` there (zone
+    UDN, host address, description URL; nothing secret), atomically (temporary
+    file, rename) with mode 0600. At start it is tried first: if its description
+    still names the zone (and, with `RAUMFELD_HOST`, it is on that host's
+    address), no search is needed. Otherwise, or for another zone, the search
+    runs and the file is updated. A file that can't be read, is larger than
+    4 KiB or holds no valid location (plain `http://` on its stored host) is
+    ignored with a warning; a file that can't be written is logged and the
+    adapter goes on with its in-memory cache. Without `ADAPTER_STATE_DIR` nothing
+    is written. The host itself is still found by SSDP without `RAUMFELD_HOST`.
   - Either way: a host whose `getZones` doesn't list `RAUMFELD_ROOM_UDN` is an
     error (a wrong host), and a renderer description whose `UDN` is not the zone
     UDN is refused: never a wrong device. If nothing is found at start, that is
@@ -202,6 +213,7 @@ the stream (the phone shows it paused).
 | `RAUMFELD_ROOM_UDN` | required | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
 | `RAUMFELD_SPEAKER_UDN` | required without `RAUMFELD_HOST` | UDN of the speaker device that hosts the Raumfeld API; found by multicast SSDP. Not used with `RAUMFELD_HOST` (checked if set) |
 | `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly (no SSDP for the host) and takes only that address's answer to the multicast search for the zone renderer (the Raumfeld doesn't answer unicast SSDP). The room and zone UDNs are still checked: a wrong host is an error |
+| `ADAPTER_STATE_DIR` | unset | Absolute path of an existing, writable directory (e.g. `/data` in a container) where the zone renderer's location is kept across restarts, so a restart needs no search. Unset: in-memory cache only |
 | `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
