@@ -354,8 +354,8 @@ def ssdp_discover(st, timeout=6.0, addr=SSDP_ADDR):
 
 def ssdp_unicast(st, addr, timeout):
     """Unicast M-SEARCH for one UDN to one device at addr (host, port); returns (sender host,
-    LOCATION). UPnP 1.1 devices answer a unicast search at once; MX 1 keeps an older one
-    that waits up to MX seconds before it answers from waiting long."""
+    LOCATION). UPnP 1.1 devices answer a unicast search at once; MX 1 bounds the delay of
+    an older one that waits up to MX seconds before it answers."""
     return _m_search(st, addr, "%s:%d" % addr, 1, timeout)
 
 
