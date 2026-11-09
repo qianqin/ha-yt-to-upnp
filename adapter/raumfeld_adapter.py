@@ -795,10 +795,11 @@ START_GATE_MAX_S = 60
 # and GATE_RETAKE_S before START_GATE_MAX_S. Every takeover in the gate may push its end to
 # GATE_RETAKE_S after it returned (never past START_GATE_MAX_S), so it has time to play.
 # Never taken over again: a renderer playing another source than the one before the
-# takeover (someone chose it: the gate yields to it, MPD stays paused) or one
-# TRANSITIONING on our stream (buffering); the latter is restarted (Stop, Play) once if
-# still TRANSITIONING 2 * GATE_RETAKE_S after the takeover, and after the gate the stuck
-# handling (STUCK_S) takes over.
+# takeover (someone chose it: the gate yields to it, MPD stays paused; an empty URI is
+# nothing loaded, no source) or one TRANSITIONING on our stream (buffering); the latter
+# is restarted (Stop, Play) once if still TRANSITIONING 2 * GATE_RETAKE_S after the
+# takeover, the gate lasting that long for it (never past START_GATE_MAX_S), and after
+# the gate the stuck handling (STUCK_S) takes over.
 GATE_RETAKE_S = 5
 GATE_MAX_RETAKES = 2
 
@@ -874,7 +875,8 @@ class Follower:
     GATE_MAX_RETAKES), one TRANSITIONING on our stream a restart instead; if it still has
     never played when the gate ends, it gets one more takeover before it counts as taken
     away. A renderer someone made play another source than the one before the takeover
-    ends the gate at once: it yields (MPD stays paused, the cast is released). Its own pause and resume are not followed; a failed
+    ends the gate at once: it yields (MPD stays paused, the cast is released). Its own
+    pause and resume are not followed; a failed
     takeover lets MPD play at once and is retried after PLAY_RETRY_S without the gate. A
     stop or another song during the gate is the user's doing and is never undone; a pause
     from the phone during the gate can't be told apart from ours (MPD is already paused,
@@ -1024,6 +1026,11 @@ class Follower:
             log.debug("start gate: renderer check failed: %r", e)
             gate.seen = "check failed: %r" % e
         now = self.clock()
+        if gate.seen == "TRANSITIONING" and not gate.restarted:
+            # Buffering our stream, or hanging: the gate lasts until its restart is due, even
+            # after a takeover slower than GATE_RETAKE_S (a speaker woken from standby).
+            gate.deadline = max(gate.deadline, min(gate.taken + 2 * GATE_RETAKE_S,
+                                                   gate.started + START_GATE_MAX_S))
         if gate.seen == "PLAYING":  # our stream: renderer_state flags any other source
             log.info("speaker plays; resuming MPD after %.1f s", now - gate.started)
             self._end_gate()

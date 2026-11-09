@@ -595,6 +595,25 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
         self.assertFalse(any("taking over again" in m for m in logs), logs)
         self.assertEqual(self.rf.transport_state, "PLAYING")
 
+    def test_renderer_hanging_after_a_slow_wake_is_still_restarted_within_the_gate(self):
+        # Woken from standby, the room takes 8 s to report ACTIVE: longer than GATE_RETAKE_S.
+        def sleep(seconds):
+            self.clock.now += seconds
+        controller = make_controller(self.rf, FakeDiscovery(self.rf))
+        controller.sleep, controller.clock = sleep, self.clock
+        self.follower = ra.Follower(controller, poll_seconds=POLL_S, clock=self.clock,
+                                    start_gate_seconds=15)
+        self.rf.wake_after_polls = int(8 / ra.WAKE_POLL_S)
+        self.rf.stuck = True
+        self.cast()
+        self.assertEqual(self.clock.now, 1008)
+        logs = self.gate_until_released()
+        self.restarts = 1
+        self.assertEqual([a for a in self.rf.soap_actions() if a in ("Stop", "Play")],
+                         ["Play", "Stop", "Play"])
+        self.assertTrue(any("speaker plays" in m for m in logs), logs)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
     def test_user_stopping_the_speaker_after_it_played_is_still_respected(self):
         self.cast()
         self.gate_until_released()

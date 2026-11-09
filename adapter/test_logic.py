@@ -935,6 +935,68 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.requests(), [])
         self.assertFalse(self.f.yielded)
 
+    def test_a_transitioning_renderer_is_restarted_once_however_long_the_gate(self):
+        self.max_gate()
+        self.ctl.renderer = "TRANSITIONING"
+        self.held()
+        self.gate_runs_out("WARNING")
+        self.assertEqual(self.ctl.calls.count("restart_renderer"), 1)
+        self.assertEqual(self.clock.now, 1000 + ra.START_GATE_MAX_S)
+        self.released()
+
+    def test_a_slow_takeover_of_a_transitioning_renderer_still_gets_its_restart(self):
+        # A speaker woken from standby: the takeover takes longer than GATE_RETAKE_S.
+        for takeover_s in (ra.GATE_RETAKE_S + 3, ra.WAKE_WAIT_S + 2):
+            with self.subTest(takeover_s=takeover_s):
+                self.setUp()
+                self.ctl.renderer = "TRANSITIONING"
+                self.ctl.takeover_s = takeover_s
+                self.held()
+                self.ctl.takeover_s = 0
+                logs = self.gate_runs_out("WARNING")
+                self.assertEqual(self.ctl.calls.count("restart_renderer"), 1)
+                self.assertNotIn("ensure_playing(retake)", self.ctl.calls)
+                # Restarted 2 * GATE_RETAKE_S after the takeover returned; then its own time.
+                self.assertEqual(self.clock.now,
+                                 1000 + takeover_s + 2 * ra.GATE_RETAKE_S + ra.GATE_RETAKE_S)
+                self.assertTrue(any("renderer 'TRANSITIONING'" in m for m in logs), logs)
+                self.released()
+
+    def test_waiting_for_the_restart_keeps_the_60_s_bound(self):
+        # Back at +52 s: the restart would be due at +62 s, past the maximum.
+        self.ctl.renderer = "TRANSITIONING"
+        self.ctl.takeover_s = ra.START_GATE_MAX_S - 8
+        self.held()
+        self.ctl.takeover_s = 0
+        self.gate_runs_out("WARNING")
+        self.assertNotIn("restart_renderer", self.ctl.calls)
+        self.assertEqual(self.clock.now, 1000 + ra.START_GATE_MAX_S)
+        self.released()
+
+    def until_restarted(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(200):
+                self.advance(ra.GATE_POLL_S)
+                if "restart_renderer" in self.ctl.calls:
+                    return
+        self.fail("no restart")
+
+    def test_the_restart_gets_its_own_time_to_play(self):
+        for fail in (None, OSError("speaker unreachable")):
+            with self.subTest(fail=fail):
+                self.setUp()
+                self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
+                                     start_gate_seconds=12)
+                self.ctl.renderer = "TRANSITIONING"
+                self.ctl.restart_fail = fail  # a failed restart gets its time too
+                self.held()
+                self.until_restarted()
+                self.assertEqual(self.clock.now, 1000 + 2 * ra.GATE_RETAKE_S)
+                self.assertGreaterEqual(self.f._gate.deadline, self.clock.now + ra.GATE_RETAKE_S)
+                self.gate_runs_out("WARNING")
+                self.assertEqual(self.clock.now, 1000 + 3 * ra.GATE_RETAKE_S)
+                self.released()
+
     def test_a_failing_retake_still_gets_its_time_and_keeps_the_deadlines_consistent(self):
         self.ctl.takeover_s = 3
         self.held()
