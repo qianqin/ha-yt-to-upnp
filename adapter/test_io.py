@@ -666,7 +666,7 @@ class SsdpTest(unittest.TestCase):
         self.assertTrue(msg.startswith("M-SEARCH * HTTP/1.1\r\n"))
         self.assertIn("ST: %s\r\n" % SPEAKER_UDN, msg)
         self.assertIn('MAN: "ssdp:discover"\r\n', msg)
-        self.assertIn("MX: 2\r\n", msg)
+        self.assertIn("MX: 1\r\n", msg)  # answers come within a second
 
     def test_resends_each_second(self):
         addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")], drop_first=1)
@@ -679,22 +679,28 @@ class SsdpTest(unittest.TestCase):
         self.assertEqual(ra.ssdp_discover(SPEAKER_UDN, timeout=3, addr=addr),
                          ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
 
-    def test_unicast_search_names_the_host_and_is_answered(self):
+    def test_returns_at_the_first_matching_answer(self):
         addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
         started = time.monotonic()
-        self.assertEqual(ra.ssdp_unicast(SPEAKER_UDN, addr, timeout=3),
-                         ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
-        self.assertLess(time.monotonic() - started, 0.5)  # no multicast MX wait
-        msg = self.received[0]
-        self.assertTrue(msg.startswith("M-SEARCH * HTTP/1.1\r\n"))
-        self.assertIn("HOST: %s:%d\r\n" % addr, msg)
-        self.assertIn("ST: %s\r\n" % SPEAKER_UDN, msg)
-        self.assertIn("MX: 1\r\n", msg)
+        ra.ssdp_discover(SPEAKER_UDN, timeout=3, addr=addr)
+        self.assertLess(time.monotonic() - started, 0.5)
 
-    def test_unicast_search_without_an_answer_times_out(self):
-        addr = self.responder([])
+    def test_search_for_one_hosts_answer_goes_to_the_group_and_returns_at_its_first(self):
+        # The Raumfeld host doesn't answer a unicast M-SEARCH; it answers a multicast one.
+        addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
+        started = time.monotonic()
+        self.assertEqual(ra.ssdp_from_host(SPEAKER_UDN, "127.0.0.1", timeout=3, group=addr),
+                         ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
+        self.assertLess(time.monotonic() - started, 0.5)
+        msg = self.received[0]
+        self.assertIn("HOST: 239.255.255.250:1900\r\n", msg)
+        self.assertIn("MX: 1\r\n", msg)
+        self.assertIn("ST: %s\r\n" % SPEAKER_UDN, msg)
+
+    def test_search_for_one_hosts_answer_ignores_other_senders(self):
+        addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
         with self.assertRaises(ra.DeviceNotFound):
-            ra.ssdp_unicast(SPEAKER_UDN, addr, timeout=0.3)
+            ra.ssdp_from_host(SPEAKER_UDN, "127.0.0.9", timeout=0.5, group=addr)
 
     def test_not_found_times_out(self):
         addr = self.responder([])

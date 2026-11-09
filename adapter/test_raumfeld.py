@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
@@ -551,8 +552,10 @@ class ControllerWithoutMetadataTest(ControllerTest):
 
 
 class ControllerWithHostTest(unittest.TestCase):
-    """RAUMFELD_HOST: the host API is reached directly, the zone renderer found by a
-    unicast M-SEARCH to the host; UDNs are still verified."""
+    """RAUMFELD_HOST: the host API is reached directly; the zone renderer is found by a
+    multicast M-SEARCH (the Raumfeld doesn't answer unicast ones) whose answers count only
+    from the host's address. UDNs are still verified. The fake responder stands in for the
+    multicast group: no real multicast in tests."""
 
     HOST = "raumfeld-host.invalid"
 
@@ -565,25 +568,30 @@ class ControllerWithHostTest(unittest.TestCase):
         config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN, "RAUMFELD_HOST": self.HOST,
                                      "STREAM_URL": STREAM_URL})
         self.locator = ra.HostLocator(config.raumfeld_host, resolve=self.resolve,
-                                      ssdp_port=self.ssdp.port)
+                                      group=("127.0.0.1", self.ssdp.port))
         self.ctl = ra.Controller(config, self.locator, api_port=self.rf.port,
                                  sleep=lambda s: None)
 
     def tearDown(self):
         assert_speaker_left_alone(self, self.rf)
 
+    address = "127.0.0.1"  # what the host name resolves to
+
     def resolve(self, name):
         self.resolved.append(name)
-        return "127.0.0.1"
+        return self.address
 
-    def test_cast_reaches_the_host_directly_and_finds_the_renderer_by_unicast(self):
+    def test_cast_reaches_the_host_directly_and_finds_the_renderer_by_multicast(self):
+        started = time.monotonic()
         self.ctl.ensure_playing()
+        self.assertLess(time.monotonic() - started, 0.9)  # the first answer, not the timeout
         self.assertEqual(self.rf.transport_state, "PLAYING")
         self.assertEqual(self.resolved, [self.HOST])
         self.assertEqual(len(self.ssdp.received), 1)
         search = self.ssdp.received[0]
         self.assertTrue(search.startswith("M-SEARCH * HTTP/1.1\r\n"))
-        self.assertIn("HOST: 127.0.0.1:%d\r\n" % self.ssdp.port, search)
+        self.assertIn("HOST: 239.255.255.250:1900\r\n", search)
+        self.assertIn("MX: 1\r\n", search)
         self.assertIn("ST: %s\r\n" % ZONE_UDN, search)
         self.rf.transport_state = "STOPPED"
         self.ctl.ensure_playing()  # cached: no DNS, no SSDP
@@ -626,16 +634,18 @@ class ControllerWithHostTest(unittest.TestCase):
             self.ctl.ensure_playing()
         self.assertEqual(self.rf.soap_actions(), [])
 
-    def test_an_answer_from_another_address_is_refused(self):
-        locator = ra.HostLocator(self.HOST, resolve=self.resolve,
-                                 search=lambda st, addr, timeout: ("127.0.0.9", "http://x/"))
-        with self.assertRaisesRegex(ra.RaumfeldError, "127.0.0.9"):
-            locator.renderer(ZONE_UDN)
+    def test_answers_from_another_address_are_ignored(self):
+        # Another Raumfeld host (or anything else on the LAN) answering for the zone UDN.
+        self.address = "127.0.0.9"  # the configured host; the fake answers from 127.0.0.1
+        with mock.patch.object(ra, "HOST_SEARCH_S", 1.2), \
+                self.assertRaises(ra.DeviceNotFound):
+            self.locator.renderer(ZONE_UDN)
+        self.assertEqual(len(self.ssdp.received), 2)  # re-sent after a second, then gave up
 
-    def test_no_unicast_answer_is_device_not_found(self):
+    def test_no_answer_is_device_not_found(self):
         self.rf.power = "ACTIVE"
         self.ssdp.silent = True
-        with mock.patch.object(ra, "UNICAST_SEARCH_S", 0.3), \
+        with mock.patch.object(ra, "HOST_SEARCH_S", 0.3), \
                 self.assertRaises(ra.DeviceNotFound):
             self.ctl.ensure_playing()
         self.assertEqual(self.rf.soap_actions(), [])

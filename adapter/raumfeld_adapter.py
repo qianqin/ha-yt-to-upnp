@@ -7,7 +7,7 @@ zone renderer to restart it (Stop, Play) when it hangs in TRANSITIONING.
 
 Python 3.9+ standard library only. Devices are identified exclusively by UPnP
 UDN, never by IP: the host by SSDP (or at RAUMFELD_HOST, verified by knowing our room),
-the zone renderer by an SSDP search for the zone UDN (unicast to RAUMFELD_HOST if set) and
+the zone renderer by an SSDP search for the zone UDN (answered by RAUMFELD_HOST, if set) and
 its description's UDN. Both are found at start and cached until a request fails or the
 zone changes. No volume is ever touched:
 this module sends no RenderingControl requests at all.
@@ -33,10 +33,9 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 log = logging.getLogger("raumfeld_adapter")
 
 SSDP_ADDR = ("239.255.255.250", 1900)
-SSDP_PORT = 1900
-# A unicast M-SEARCH to the Raumfeld host is answered at once; this bounds a host that
-# doesn't answer (re-sent every second).
-UNICAST_SEARCH_S = 3.0
+# The Raumfeld host answers a multicast search with MX 1 in a few hundred ms (it does not
+# answer unicast M-SEARCH at all); this bounds a search for its answer (re-sent every second).
+HOST_SEARCH_S = 3.0
 RAUMFELD_API_PORT = 47365
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and redirects
@@ -95,7 +94,7 @@ _HOST_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 def _raumfeld_host(env):
     """RAUMFELD_HOST: an IPv4 address or a DNS name, nothing else (no port, scheme or
-    path; the unicast SSDP search is IPv4). None if unset."""
+    path; SSDP and the host's address are IPv4). None if unset."""
     host = env.get("RAUMFELD_HOST", "").strip()
     if not host:
         return None
@@ -348,20 +347,22 @@ def _local(tag):
 # --------------------------------------------------------------------------- network I/O
 
 def ssdp_discover(st, timeout=6.0, addr=SSDP_ADDR):
-    """Multicast M-SEARCH for one UDN; returns (sender host, LOCATION). Re-sends every second."""
-    return _m_search(st, addr, "239.255.255.250:1900", 2, timeout)
+    """Multicast M-SEARCH for one UDN; returns (sender host, LOCATION) of the first answer.
+    Re-sends every second."""
+    return _m_search(st, addr, timeout)
 
 
-def ssdp_unicast(st, addr, timeout):
-    """Unicast M-SEARCH for one UDN to one device at addr (host, port); returns (sender host,
-    LOCATION). UPnP 1.1 devices answer a unicast search at once; MX 1 bounds the delay of
-    an older one that waits up to MX seconds before it answers."""
-    return _m_search(st, addr, "%s:%d" % addr, 1, timeout)
+def ssdp_from_host(st, host, timeout, group=SSDP_ADDR):
+    """Multicast M-SEARCH for one UDN, taking only an answer sent from `host` (an IPv4
+    address); returns (host, LOCATION) of the first one. Re-sends every second."""
+    return _m_search(st, group, timeout, sender=host)
 
 
-def _m_search(st, addr, host_header, mx, timeout):
-    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: %s\r\n"
-           'MAN: "ssdp:discover"\r\nMX: %d\r\nST: %s\r\n\r\n' % (host_header, mx, st)).encode()
+def _m_search(st, addr, timeout, sender=None):
+    # MX 1: devices spread their answers over up to MX seconds; the Raumfeld answers in
+    # about 0.3 s with MX 1, about 2 s with MX 2.
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+           'MAN: "ssdp:discover"\r\nMX: 1\r\nST: %s\r\n\r\n' % st).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
@@ -376,12 +377,14 @@ def _m_search(st, addr, host_header, mx, timeout):
                 next_send = now + 1.0
             sock.settimeout(max(0.01, min(next_send, deadline) - now))
             try:
-                data, sender = sock.recvfrom(65507)
+                data, (source, _port) = sock.recvfrom(65507)
             except socket.timeout:
+                continue
+            if sender is not None and source != sender:
                 continue
             headers = _parse_headers(data.decode("utf-8", "replace"))
             if headers.get("st", "").lower() == st.lower() and headers.get("location"):
-                return sender[0], headers["location"]
+                return source, headers["location"]
     finally:
         sock.close()
 
@@ -410,15 +413,16 @@ class SsdpLocator:
 
 class HostLocator:
     """RAUMFELD_HOST: the Raumfeld host at a configured name or address. A name is resolved
-    once and again after forget() (a request to the host failed); zone renderers, which
-    the host serves, are found by a unicast M-SEARCH to it, answered in milliseconds,
-    instead of a multicast one. Only answers from the host itself count."""
+    once and again after forget() (a request to the host failed). Zone renderers, which
+    the host serves, are found by a multicast M-SEARCH (the Raumfeld doesn't answer
+    unicast ones) of which only answers from the host's address count, so another host
+    on the LAN can't answer for it. `group` is the multicast group; tests point it at a
+    local fake."""
 
-    def __init__(self, host, resolve=resolve_ipv4, search=ssdp_unicast, ssdp_port=SSDP_PORT):
+    def __init__(self, host, resolve=resolve_ipv4, group=SSDP_ADDR):
         self.host = host
         self.resolve = resolve
-        self.search = search
-        self.ssdp_port = ssdp_port
+        self.group = group
         self._address = None
 
     def api_host(self):
@@ -427,12 +431,7 @@ class HostLocator:
         return self._address
 
     def renderer(self, zone):
-        address = self.api_host()
-        sender, location = self.search(zone, (address, self.ssdp_port), timeout=UNICAST_SEARCH_S)
-        if sender != address:
-            raise RaumfeldError("SSDP answer for %r came from %r, not from the Raumfeld host %r"
-                                % (zone, sender, address))
-        return sender, location
+        return ssdp_from_host(zone, self.api_host(), HOST_SEARCH_S, self.group)
 
     def forget(self):
         self._address = None

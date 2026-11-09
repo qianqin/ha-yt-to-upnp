@@ -1,5 +1,5 @@
 """Test doubles: a fake Raumfeld host (HTTP API, device description, AVTransport
-SOAP endpoint), a fake MPD TCP server, a fake SSDP resolver and a fake unicast SSDP
+SOAP endpoint), a fake MPD TCP server, a fake SSDP resolver and a fake SSDP
 responder.
 
 All identifiers are obviously fake placeholders; servers bind to 127.0.0.1 on
@@ -272,8 +272,10 @@ class FakeDiscovery:
 
 
 class FakeSsdpResponder:
-    """Answers unicast M-SEARCH on 127.0.0.1 like the Raumfeld host: a search for the
-    current zone UDN gets the zone renderer's LOCATION. Records every request."""
+    """Stands in for the SSDP multicast group on 127.0.0.1 with the Raumfeld host as its only
+    member: a search for the current zone UDN gets the zone renderer's LOCATION, from
+    127.0.0.1. Records every request. Tests point the locator at it instead of the real
+    group, so no multicast leaves the machine."""
 
     def __init__(self, raumfeld):
         self.raumfeld = raumfeld

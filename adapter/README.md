@@ -22,15 +22,19 @@ Raumfeld room play the receiver's MPD stream automatically.
   the cached address fails (then the request is sent once more to the address
   found afresh) or the room is in another zone (its renderer is looked for by the
   new zone UDN). With a valid cache a takeover sends no SSDP at all.
-  - Without `RAUMFELD_HOST`: the host by a multicast SSDP search for
-    `RAUMFELD_SPEAKER_UDN`, the zone renderer by one for the zone UDN (each up to
-    6 s if nobody answers).
+  - SSDP searches are multicast (`239.255.255.250:1900`) with `MX: 1`, re-sent
+    each second, and return at the first matching answer (the Raumfeld answers
+    in about 0.3 s with `MX: 1`, about 2 s with `MX: 2`).
+  - Without `RAUMFELD_HOST`: the host by a search for `RAUMFELD_SPEAKER_UDN`, the
+    zone renderer by one for the zone UDN (each up to 6 s if nobody answers);
+    any answering device counts, and its description is checked.
   - With `RAUMFELD_HOST` (an IPv4 address or a DNS name): the API is reached
     at `http://<host>:47365/` directly; a name is resolved once (IPv4) and again
-    after a failed request. The zone renderer is found by a **unicast** SSDP
-    search (`ST:` the zone UDN) sent to `<host>:1900`, which the host answers at
-    once (at most 3 s, re-sent each second); only an answer from that address
-    counts.
+    after a failed request. The zone renderer is found by a search for the zone
+    UDN (`ST:` the zone UDN) of which only answers sent from the host's address
+    count; others are ignored (at most 3 s). The Raumfeld does **not** answer a
+    unicast M-SEARCH sent to `<host>:1900`, so the setting filters multicast
+    answers instead of replacing multicast.
   - Either way: a host whose `getZones` doesn't list `RAUMFELD_ROOM_UDN` is an
     error (a wrong host), and a renderer description whose `UDN` is not the zone
     UDN is refused: never a wrong device. If nothing is found at start, that is
@@ -197,7 +201,7 @@ the stream (the phone shows it paused).
 | --- | --- | --- |
 | `RAUMFELD_ROOM_UDN` | required | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
 | `RAUMFELD_SPEAKER_UDN` | required without `RAUMFELD_HOST` | UDN of the speaker device that hosts the Raumfeld API; found by multicast SSDP. Not used with `RAUMFELD_HOST` (checked if set) |
-| `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly and finds the zone renderer by unicast SSDP to it: no multicast needed, and no 6 s SSDP wait when a device has to be looked for again. The room and zone UDNs are still checked: a wrong host is an error |
+| `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly (no SSDP for the host) and takes only that address's answer to the multicast search for the zone renderer (the Raumfeld doesn't answer unicast SSDP). The room and zone UDNs are still checked: a wrong host is an error |
 | `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
@@ -225,10 +229,8 @@ python3 -m adapter
 # or: python3 adapter/raumfeld_adapter.py
 ```
 
-Without `RAUMFELD_HOST`, SSDP needs multicast on the LAN, so in a container use
-host networking. With it, the adapter needs unicast UDP to the host's port 1900
-and TCP to its port 47365 (and to the zone renderer's port), and the host's
-answer back to the adapter's UDP port.
+SSDP needs multicast on the LAN (with or without `RAUMFELD_HOST`: the Raumfeld
+doesn't answer unicast searches), so in a container use host networking.
 
 ## Pre-roll and cast start timing
 
@@ -261,5 +263,5 @@ python3 -m unittest discover -s adapter -v
 ```
 
 The tests use local fake servers (MPD, Raumfeld host API, device description,
-AVTransport SOAP, multicast and unicast SSDP responders) on 127.0.0.1 and need
-no real devices.
+AVTransport SOAP, SSDP responders standing in for the multicast group) on
+127.0.0.1 and need no real devices; no multicast leaves the machine.
