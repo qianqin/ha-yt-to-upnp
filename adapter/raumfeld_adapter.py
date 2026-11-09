@@ -419,14 +419,23 @@ def resolve_ipv4(host):
     return socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
 
 
+# Where a Raumfeld host answering SSDP can be: RFC 1918 and link-local. Explicit, as Python's
+# is_private also covers loopback, 0.0.0.0/8 and the documentation ranges.
+_LAN_NETWORKS = tuple(ipaddress.IPv4Network(n) for n in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
+_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
+
+
 class SsdpLocator:
     """Finds the Raumfeld host (by the speaker's UDN) and zone renderers by multicast SSDP."""
 
     looks_up_api_host = True  # every api_host() is a search
 
-    def __init__(self, discover, speaker_udn):
+    def __init__(self, discover, speaker_udn, allow_loopback=False):
         self.discover = discover
         self.speaker_udn = speaker_udn
+        # Only tests, whose fake host serves on 127.0.0.1, accept loopback.
+        self.networks = _LAN_NETWORKS + ((_LOOPBACK,) if allow_loopback else ())
 
     def api_host(self):
         return self.discover(self.speaker_udn)[0]
@@ -439,13 +448,13 @@ class SsdpLocator:
 
     def accepts(self, host):
         """A stored renderer's host must be what an SSDP sender is: an IPv4 address on the
-        LAN (private or link-local). Its description's UDN decides the rest."""
+        LAN, i.e. in a private (RFC 1918) or the link-local range; not loopback, not
+        0.0.0.0/8. Its description's UDN decides the rest."""
         try:
             address = ipaddress.IPv4Address(host)
         except ValueError:
             return False
-        return ((address.is_private or address.is_link_local)
-                and not (address.is_unspecified or address.is_reserved or address.is_multicast))
+        return any(address in network for network in self.networks)
 
 
 class HostLocator:
@@ -624,7 +633,12 @@ class StateFile:
             log.warning("ignoring the adapter state %s: %r", self.path, e)
             return None
         try:
-            with os.fdopen(fd, "rb") as f:
+            try:
+                f = os.fdopen(fd, "rb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
                 if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                     raise ValueError("not a regular file")
                 return self._parse(f.read(STATE_MAX_BYTES + 1))
@@ -839,7 +853,8 @@ class Controller:
             cached = self._api is not None
             try:
                 if not cached:
-                    self._lookups += self.locator.looks_up_api_host
+                    if self.locator.looks_up_api_host:
+                        self._lookups += 1
                     self._api = "http://%s:%d/" % (self.locator.api_host(), self.api_port)
                 zones = http_get(self._api + "getZones")
                 if not room_listed(zones, self.config.room_udn):
@@ -1344,6 +1359,9 @@ class Follower:
         gate = self._gate
         if gate.phase == _PAUSING and state == "pause":
             # Our pause 1 holds the song: now wake the room.
+            if song != gate.song:
+                # The receiver's held hand-over came with our pause: the song has arrived.
+                self._log_song_held(song)
             gate.phase, gate.song = _HOLDING, song
             self._gate_take_over()
             return True
@@ -1393,10 +1411,16 @@ class Follower:
             if RESUME_PLAYER not in self._requests:
                 self._requests.append(RESUME_PLAYER)
             return
-        log.info("start: song %r at +%.1f s, speaker not playing yet: held", song, at)
+        self._log_song_held(song)
         if state == "play" and PAUSE_PLAYER not in self._requests:
             # MPD went to play the song: hold it at its start until the speaker plays.
             self._requests.append(PAUSE_PLAYER)
+
+    def _log_song_held(self, song):
+        gate = self._gate
+        gate.song_at = self.clock()
+        log.info("start: song %r at +%.1f s, speaker not playing yet: held", song,
+                 gate.song_at - gate.started)
 
     def _log_resumed(self, gate):
         now = self.clock()
@@ -1413,7 +1437,9 @@ class Follower:
 
     def _held_handover(self, after_gate, state, previous, song, elapsed):
         gate, ended = after_gate
-        return (state == "pause" and previous == "play" and not self.yielded
+        # Only the pre-roll silence is replaced by a hand-over.
+        return (gate.song_at is None and state == "pause" and previous == "play"
+                and not self.yielded
                 and song is not None and song != gate.song
                 and elapsed is not None and elapsed <= HANDOVER_ELAPSED_S
                 and self.clock() - ended <= AFTER_GATE_HANDOVER_S)

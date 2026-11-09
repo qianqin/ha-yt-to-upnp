@@ -1357,6 +1357,8 @@ class StartGateTest(unittest.TestCase):
     def test_a_pause_after_the_gate_that_is_no_held_hand_over_stays_paused(self):
         cases = {
             "too late": (ra.AFTER_GATE_HANDOVER_S + 0.1, "2", 0.0),
+            # A literal time: the window stays short whatever the constant says.
+            "6 s after our pause 0 landed": (6.0, "2", 0.0),
             "not at the start of the song": (0.3, "2", 5.0),
             "elapsed unknown": (0.3, "2", None),
             "same song (a pause from the phone)": (0.3, "1", 0.0),
@@ -1369,6 +1371,48 @@ class StartGateTest(unittest.TestCase):
                 self.f.on_mpd_state("pause", song, elapsed)
                 self.assertEqual(self.requests(), [])
                 self.assertIsNone(self.f._gate)
+
+    def test_the_after_gate_window_is_a_few_seconds(self):
+        self.assertLessEqual(ra.AFTER_GATE_HANDOVER_S, 5)
+
+    def test_after_a_gate_whose_song_already_came_a_new_paused_song_is_left_paused(self):
+        # A held hand-over only replaces the pre-roll silence; after the song came in the
+        # gate, a paused new song is something else (e.g. the phone).
+        self.held("1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "2", 0.0)  # the song, handed over in the gate
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.released("2")
+        self.assertIsNone(self.f._gate)
+        self.clock.now += 0.3
+        self.f.on_mpd_state("pause", "3", 0.0)
+        self.assertEqual(self.requests(), [])
+        self.assertIsNone(self.f._gate)
+
+    def test_song_handed_over_with_our_pause_still_counts_as_the_songs_arrival(self):
+        # The receiver's held hand-over and our pause 1 both landed before the status read:
+        # MPD reports pause with the song's songid while the gate is still pausing.
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")  # the silence
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        self.clock.now += 0.4
+        self.ctl.takeover_s = 2
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("pause", "2", 0.0)
+        self.assertEqual(self.start_lines(logs.output)[0],
+                         "start: song '2' at +0.4 s, speaker not playing yet: held")
+        gate = self.f._gate
+        self.assertEqual((gate.phase, gate.song, gate.song_at), (ra._HOLDING, "2", 1000.4))
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.released("2")
+        self.assertTrue(any("song '2' held 2.2 s" in m for m in logs.output), logs.output)
 
     def test_the_preroll_song_after_a_gate_timeout_keeps_the_unstarted_takeover(self):
         for state, elapsed in (("play", None), ("pause", 0.0)):

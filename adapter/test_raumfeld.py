@@ -686,7 +686,7 @@ class ControllerWithHostTest(unittest.TestCase):
 
     def test_answers_from_another_address_are_ignored(self):
         # Another Raumfeld host (or anything else on the LAN) answering for the zone UDN.
-        self.address = "127.0.0.9"  # the configured host; the fake answers from 127.0.0.1
+        self.address = "192.0.2.9"  # the configured host; the fake answers from 127.0.0.1
         with mock.patch.object(ra, "HOST_SEARCH_S", 1.2), \
                 self.assertLogs("raumfeld_adapter", "WARNING") as logs, \
                 self.assertRaises(ra.DeviceNotFound):
@@ -694,7 +694,7 @@ class ControllerWithHostTest(unittest.TestCase):
         self.assertEqual(len(self.ssdp.received), 2)  # re-sent after a second, then gave up
         self.assertEqual(len(logs.output), 1, logs.output)  # names both addresses, once
         self.assertIn("from 127.0.0.1", logs.output[0])
-        self.assertIn("only 127.0.0.9", logs.output[0])
+        self.assertIn("only 192.0.2.9", logs.output[0])
 
     def test_no_answer_is_device_not_found(self):
         self.rf.power = "ACTIVE"
@@ -727,7 +727,9 @@ class StoredRendererTest(unittest.TestCase):
         assert_speaker_left_alone(self, self.rf)
 
     def controller(self, locator=None):
-        return ra.Controller(self.config, locator or ra.SsdpLocator(self.discover, SPEAKER_UDN),
+        # The fake host serves on 127.0.0.1, which only tests accept as a renderer host.
+        locator = locator or ra.SsdpLocator(self.discover, SPEAKER_UDN, allow_loopback=True)
+        return ra.Controller(self.config, locator,
                              api_port=self.rf.port, sleep=lambda s: None,
                              state=ra.StateFile(self.path))
 
@@ -813,10 +815,40 @@ class StoredRendererTest(unittest.TestCase):
     def stored_fetched(self):
         return [p for m, p, a, b in self.rf.requests if p.endswith("?stored")]
 
+    def test_in_ssdp_mode_a_stored_loopback_host_is_refused_by_default(self):
+        self.store(self.entry(self.rf.base + "/zone.xml?stored"))  # reachable, our zone
+        output = self.warm_up(self.controller(ra.SsdpLocator(self.discover, SPEAKER_UDN)))
+        self.assertTrue(any("state" in m for m in output), output)
+        self.assertEqual(self.stored_fetched(), [])
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+
+    def test_a_state_file_descriptor_is_closed_if_it_cannot_be_wrapped(self):
+        self.store(self.entry())
+        real_open, opened = os.open, []
+
+        def open_(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            opened.append(fd)
+            return fd
+
+        def fdopen(fd, *args, **kwargs):
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        with mock.patch.object(ra.os, "open", open_), mock.patch.object(ra.os, "fdopen", fdopen):
+            self.assertIsNone(self.state_file_load())
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError) as raised:
+            os.fstat(opened[0])
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def state_file_load(self):
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            return ra.StateFile(self.path).load()
+
     def test_in_ssdp_mode_a_stored_host_off_the_lan_is_never_fetched(self):
         # The first is reachable and describes our zone; only its host is a name, which no
         # SSDP sender is. The second is an address outside the LAN.
-        for host in ("localhost", "8.8.8.8"):
+        for host in ("localhost", "203.0.113.9"):
             with self.subTest(host=host):
                 self.rf.requests.clear()
                 self.discover.searches.clear()
@@ -919,7 +951,7 @@ class StoredRendererTest(unittest.TestCase):
 
     def test_with_raumfeld_host_a_stored_renderer_must_be_on_that_host(self):
         # Stored when the host had another address (or before RAUMFELD_HOST was set).
-        self.store(self.entry("http://127.0.0.9:%d/zone.xml" % self.rf.port, host="127.0.0.9"))
+        self.store(self.entry("http://192.0.2.9:%d/zone.xml" % self.rf.port, host="192.0.2.9"))
         searched = []
         output = self.warm_up(self.host_controller(searched))
         self.assertTrue(any("state" in m for m in output), output)
@@ -974,21 +1006,32 @@ class LocatorAcceptsTest(unittest.TestCase):
     """Which host a stored renderer location may be on."""
 
     def test_with_raumfeld_host_only_its_address(self):
-        locator = ra.HostLocator("raumfeld-host.invalid", resolve=lambda name: "192.168.1.5")
-        self.assertTrue(locator.accepts("192.168.1.5"))
-        for host in ("192.168.1.6", "raumfeld-host.invalid", "localhost", ""):
+        locator = ra.HostLocator("raumfeld-host.invalid", resolve=lambda name: "192.0.2.5")
+        self.assertTrue(locator.accepts("192.0.2.5"))
+        for host in ("192.0.2.6", "raumfeld-host.invalid", "localhost", ""):
             with self.subTest(host=host):
                 self.assertFalse(locator.accepts(host))
 
     def test_in_ssdp_mode_an_ipv4_address_on_the_lan(self):
         locator = ra.SsdpLocator(lambda st: None, SPEAKER_UDN)
-        for host in ("192.168.1.5", "10.0.0.2", "172.16.0.9", "169.254.3.4", "127.0.0.1"):
+        # Generic examples of the private and link-local ranges; no real network.
+        for host in ("10.0.0.2", "172.16.0.9", "169.254.3.4"):
             with self.subTest(host=host):
                 self.assertTrue(locator.accepts(host))
-        for host in ("8.8.8.8", "0.0.0.0", "255.255.255.255", "239.255.255.250", "localhost",
-                     "raumfeld.example", "::1", "192.168.1.5 ", ""):
+        # Off the LAN: documentation and other public addresses, loopback (a stored
+        # 127.0.0.1 would point at a local service), "this network", broadcast, multicast,
+        # names, IPv6.
+        for host in ("203.0.113.9", "198.51.100.7", "192.0.2.1", "127.0.0.1", "0.0.0.0",
+                     "0.1.2.3", "255.255.255.255", "239.255.255.250", "localhost",
+                     "raumfeld.example", "::1", "10.0.0.2 ", ""):
             with self.subTest(host=host):
                 self.assertFalse(locator.accepts(host))
+
+    def test_tests_may_allow_loopback_for_the_fake_host(self):
+        locator = ra.SsdpLocator(lambda st: None, SPEAKER_UDN, allow_loopback=True)
+        self.assertTrue(locator.accepts("127.0.0.1"))
+        self.assertTrue(locator.accepts("10.0.0.2"))
+        self.assertFalse(locator.accepts("203.0.113.9"))
 
 
 class RendererRestartTest(unittest.TestCase):
