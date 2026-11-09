@@ -23,7 +23,8 @@ def make_controller(rf, discover):
         "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
         "STREAM_URL": STREAM_URL,
     })
-    return ra.Controller(config, discover, api_port=rf.port, sleep=lambda s: None)
+    return ra.Controller(config, ra.SsdpLocator(discover, SPEAKER_UDN), api_port=rf.port,
+                         sleep=lambda s: None)
 
 
 def assert_speaker_left_alone(test, rf, restarts=0):
@@ -338,7 +339,9 @@ class SpeakerYieldTest(unittest.TestCase):
         self.nothing_requested()  # a network hiccup is not "taken away"
         self.rf.fail_paths.clear()
         self.poll()
-        self.assertEqual(self.discover.searches[searches:], [SPEAKER_UDN, ZONE_UDN])
+        # The host was searched for again at once and at the next poll; the zone renderer
+        # never failed, so its cached address is kept.
+        self.assertEqual(self.discover.searches[searches:], [SPEAKER_UDN, SPEAKER_UDN])
         self.nothing_requested()
 
 

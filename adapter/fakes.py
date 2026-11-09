@@ -1,5 +1,6 @@
 """Test doubles: a fake Raumfeld host (HTTP API, device description, AVTransport
-SOAP endpoint), a fake MPD TCP server and a fake SSDP resolver.
+SOAP endpoint), a fake MPD TCP server, a fake SSDP resolver and a fake unicast SSDP
+responder.
 
 All identifiers are obviously fake placeholders; servers bind to 127.0.0.1 on
 ephemeral ports.
@@ -9,7 +10,7 @@ import socket
 import threading
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 ROOM_UDN = "uuid:00000000-0000-0000-0000-000000000001"
 SPEAKER_UDN = "uuid:00000000-0000-0000-0000-000000000002"
@@ -58,6 +59,8 @@ class FakeRaumfeld:
         self.on_get_zones = None  # called at every getZones, e.g. to model a slow answer
         self.fail_paths = set()  # substrings of paths that answer 500
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
+        self.description_udn = None  # the UDN the description names, if not the zone's
+        self.room_listed = True  # False: a host that doesn't know our room (a wrong host)
         self.redirect_base = HOST_PREFIX  # where the API's 307 points
         self.lock = threading.Lock()
         self._pending_new_zone = None
@@ -88,15 +91,14 @@ class FakeRaumfeld:
         raise AssertionError("no SOAP call %s" % action)
 
     def zones_xml(self):
-        zone = ""
-        if self.zone_udn:
+        zone = unassigned = ""
+        if self.room_listed and self.zone_udn:
             zone = (
                 "<zone udn='%s'><room udn='%s' name='Room A' powerState='%s'>"
                 "<renderer udn='%s' name='Speaker A'/></room></zone>"
                 % (self.zone_udn, ROOM_UDN, self.power, SPEAKER_UDN)
             )
-            unassigned = ""
-        else:
+        elif self.room_listed:
             unassigned = (
                 "<unassignedRooms><room udn='%s' name='Room A' powerState='%s'/>"
                 "</unassignedRooms>" % (ROOM_UDN, self.power)
@@ -117,7 +119,8 @@ class FakeRaumfeld:
             "</serviceType><controlURL>/RenderingControl/ctrl</controlURL></service>"
             "<service><serviceType>%s</serviceType>"
             "<controlURL>%s</controlURL></service>"
-            "</serviceList></device></root>" % (self.zone_udn, AVT_NS, self.control_url)
+            "</serviceList></device></root>"
+            % (self.description_udn or self.zone_udn, AVT_NS, self.control_url)
         )
 
     def _api(self, name, query):
@@ -235,7 +238,8 @@ class FakeRaumfeld:
                     fake.requests.append(("POST", self.path, soap_action.strip('"').split("#")[-1], body))
                     if any(f in self.path for f in fake.fail_paths):
                         return self._send(500, "boom")
-                    assert self.path == "/AVTransport/ctrl", self.path
+                    if self.path != urlsplit(urljoin("/zone.xml", fake.control_url)).path:
+                        return self._send(404, "no such control URL")  # the renderer moved
                     assert soap_action == '"%s#%s"' % (AVT_NS, fake.requests[-1][2]), soap_action
                     return self._send(200, fake._soap(fake.requests[-1][2], body),
                                       [("Content-Type", 'text/xml; charset="utf-8"')])
@@ -265,6 +269,42 @@ class FakeDiscovery:
         if st == self.raumfeld.zone_udn:
             return "127.0.0.1", self.zone_location or self.raumfeld.base + "/zone.xml"
         raise DeviceNotFound(st)
+
+
+class FakeSsdpResponder:
+    """Answers unicast M-SEARCH on 127.0.0.1 like the Raumfeld host: a search for the
+    current zone UDN gets the zone renderer's LOCATION. Records every request."""
+
+    def __init__(self, raumfeld):
+        self.raumfeld = raumfeld
+        self.received = []
+        self.silent = False
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def close(self):
+        self.sock.close()
+
+    def _serve(self):
+        while True:
+            try:
+                data, sender = self.sock.recvfrom(4096)
+            except OSError:
+                return
+            text = data.decode()
+            self.received.append(text)
+            st = [line.split(":", 1)[1].strip() for line in text.split("\r\n")
+                  if line.upper().startswith("ST:")]
+            if self.silent or st != [self.raumfeld.zone_udn]:
+                continue
+            reply = ("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nST: %s\r\nUSN: %s\r\n"
+                     "LOCATION: %s/zone.xml\r\n\r\n" % (st[0], st[0], self.raumfeld.base))
+            try:
+                self.sock.sendto(reply.encode(), sender)
+            except OSError:
+                return
 
 
 class FakeMpd:

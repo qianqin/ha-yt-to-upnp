@@ -6,13 +6,16 @@ standby itself (the Raumfeld's own auto power-off does that) and only stops the
 zone renderer to restart it (Stop, Play) when it hangs in TRANSITIONING.
 
 Python 3.9+ standard library only. Devices are identified exclusively by UPnP
-UDN (found via SSDP; a takeover always rediscovers, the frequent room check
-reuses the last discovery until a request fails or the zone changes), never by IP. No volume is ever touched:
+UDN, never by IP: the host by SSDP (or at RAUMFELD_HOST, verified by knowing our room),
+the zone renderer by an SSDP search for the zone UDN (unicast to RAUMFELD_HOST if set) and
+its description's UDN. Both are found at start and cached until a request fails or the
+zone changes. No volume is ever touched:
 this module sends no RenderingControl requests at all.
 """
 
 import errno
 import http.client
+import ipaddress
 import logging
 import math
 import os
@@ -30,6 +33,10 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 log = logging.getLogger("raumfeld_adapter")
 
 SSDP_ADDR = ("239.255.255.250", 1900)
+SSDP_PORT = 1900
+# A unicast M-SEARCH to the Raumfeld host is answered at once; this bounds a host that
+# doesn't answer (re-sent every second).
+UNICAST_SEARCH_S = 3.0
 RAUMFELD_API_PORT = 47365
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and redirects
@@ -83,12 +90,35 @@ def _seconds(env, key, default, minimum, maximum=math.inf):
     return value
 
 
-class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime stream_metadata "
-                                  "poll_seconds stuck_seconds start_gate_seconds mpd_host mpd_port "
-                                  "log_level")):
+_HOST_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _raumfeld_host(env):
+    """RAUMFELD_HOST: an IPv4 address or a DNS name, nothing else (no port, scheme or
+    path; the unicast SSDP search is IPv4). None if unset."""
+    host = env.get("RAUMFELD_HOST", "").strip()
+    if not host:
+        return None
+    if re.fullmatch(r"[0-9.]+", host):
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            raise ConfigError("RAUMFELD_HOST is not a valid IPv4 address: %r" % host) from None
+        return host
+    if len(host) > 253 or not all(_HOST_LABEL.fullmatch(label) for label in host.split(".")):
+        raise ConfigError("RAUMFELD_HOST must be an IPv4 address or a DNS name, got %r" % host)
+    return host
+
+
+class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url stream_mime "
+                                  "stream_metadata poll_seconds stuck_seconds start_gate_seconds "
+                                  "mpd_host mpd_port log_level")):
     @classmethod
     def from_env(cls, env):
-        required = ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN", "STREAM_URL")
+        raumfeld_host = _raumfeld_host(env)
+        # With RAUMFELD_HOST the host is not searched for by its UDN.
+        required = ("RAUMFELD_ROOM_UDN", "STREAM_URL") + (
+            () if raumfeld_host else ("RAUMFELD_SPEAKER_UDN",))
         missing = [k for k in required if not env.get(k, "").strip()]
         if missing:
             raise ConfigError("missing required environment variable(s): " + ", ".join(missing))
@@ -123,13 +153,15 @@ class Config(namedtuple("Config", "room_udn speaker_udn stream_url stream_mime s
             raise ConfigError("LOG_LEVEL must be one of " + ", ".join(_LOG_LEVELS))
 
         for key in ("RAUMFELD_ROOM_UDN", "RAUMFELD_SPEAKER_UDN"):
-            if not UDN_RE.fullmatch(env[key].strip()):
+            value = env.get(key, "").strip()
+            if (value or key in required) and not UDN_RE.fullmatch(value):
                 raise ConfigError("%s must look like uuid:<letters, digits, dashes>, got %r"
                                   % (key, env[key]))
 
         return cls(
             room_udn=env["RAUMFELD_ROOM_UDN"].strip(),
-            speaker_udn=env["RAUMFELD_SPEAKER_UDN"].strip(),
+            speaker_udn=env.get("RAUMFELD_SPEAKER_UDN", "").strip() or None,
+            raumfeld_host=raumfeld_host,
             stream_url=stream_url,
             stream_mime=env.get("STREAM_MIME", "audio/mpeg").strip(),
             stream_metadata=metadata == "1",
@@ -251,6 +283,11 @@ def zone_of_room(zones_xml, room_udn):
     return None
 
 
+def room_listed(zones_xml, room_udn):
+    """The host knows the room (in a zone or unassigned): a wrong host doesn't."""
+    return any(room.get("udn") == room_udn for room in _elements(_parse_xml(zones_xml), "room"))
+
+
 def room_power_state(zones_xml, room_udn):
     for room in _elements(_parse_xml(zones_xml), "room"):
         if room.get("udn") == room_udn:
@@ -298,6 +335,12 @@ def avtransport_control_url(description_xml, location):
     raise RaumfeldError("no AVTransport service in device description at %r" % location)
 
 
+def device_udn(description_xml):
+    """UDN of the (root) device a description describes, or None."""
+    udns = _elements(_parse_xml(description_xml), "UDN")
+    return (udns[0].text or "").strip() if udns else None
+
+
 def _local(tag):
     return tag.rsplit("}", 1)[-1]
 
@@ -305,9 +348,20 @@ def _local(tag):
 # --------------------------------------------------------------------------- network I/O
 
 def ssdp_discover(st, timeout=6.0, addr=SSDP_ADDR):
-    """M-SEARCH for one UDN; returns (sender host, LOCATION). Re-sends every second."""
-    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
-           'MAN: "ssdp:discover"\r\nMX: 2\r\nST: %s\r\n\r\n' % st).encode()
+    """Multicast M-SEARCH for one UDN; returns (sender host, LOCATION). Re-sends every second."""
+    return _m_search(st, addr, "239.255.255.250:1900", 2, timeout)
+
+
+def ssdp_unicast(st, addr, timeout):
+    """Unicast M-SEARCH for one UDN to one device at addr (host, port); returns (sender host,
+    LOCATION). UPnP 1.1 devices answer a unicast search at once; MX 1 keeps an older one
+    that waits up to MX seconds before it answers from waiting long."""
+    return _m_search(st, addr, "%s:%d" % addr, 1, timeout)
+
+
+def _m_search(st, addr, host_header, mx, timeout):
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: %s\r\n"
+           'MAN: "ssdp:discover"\r\nMX: %d\r\nST: %s\r\n\r\n' % (host_header, mx, st)).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
@@ -330,6 +384,58 @@ def ssdp_discover(st, timeout=6.0, addr=SSDP_ADDR):
                 return sender[0], headers["location"]
     finally:
         sock.close()
+
+
+def resolve_ipv4(host):
+    """The IPv4 address of a host name (or the address itself)."""
+    return socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+
+
+class SsdpLocator:
+    """Finds the Raumfeld host (by the speaker's UDN) and zone renderers by multicast SSDP."""
+
+    def __init__(self, discover, speaker_udn):
+        self.discover = discover
+        self.speaker_udn = speaker_udn
+
+    def api_host(self):
+        return self.discover(self.speaker_udn)[0]
+
+    def renderer(self, zone):
+        return self.discover(zone)
+
+    def forget(self):
+        pass  # every api_host() searches afresh
+
+
+class HostLocator:
+    """RAUMFELD_HOST: the Raumfeld host at a configured name or address. A name is resolved
+    once and again after forget() (a request to the host failed); zone renderers, which
+    the host serves, are found by a unicast M-SEARCH to it, answered in milliseconds,
+    instead of a multicast one. Only answers from the host itself count."""
+
+    def __init__(self, host, resolve=resolve_ipv4, search=ssdp_unicast, ssdp_port=SSDP_PORT):
+        self.host = host
+        self.resolve = resolve
+        self.search = search
+        self.ssdp_port = ssdp_port
+        self._address = None
+
+    def api_host(self):
+        if self._address is None:
+            self._address = self.resolve(self.host)
+        return self._address
+
+    def renderer(self, zone):
+        address = self.api_host()
+        sender, location = self.search(zone, (address, self.ssdp_port), timeout=UNICAST_SEARCH_S)
+        if sender != address:
+            raise RaumfeldError("SSDP answer for %r came from %r, not from the Raumfeld host %r"
+                                % (zone, sender, address))
+        return sender, location
+
+    def forget(self):
+        self._address = None
 
 
 def _parse_headers(text):
@@ -438,29 +544,46 @@ def soap_call(control_url, action, args):
 _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
 
 
-# What one inspection of the room found; control/status are None unless the room is active in a zone.
-_Room = namedtuple("_Room", "api zone power control status")
+# What one inspection of the room found; status is None unless the room is active in a zone.
+_Room = namedtuple("_Room", "api zone power status")
 
 
 class Controller:
-    """Drives the Raumfeld room. Taking over rediscovers everything via SSDP, because
-    host IPs change and the zone renderer comes and goes; the frequent `check` reuses
-    the last discovery until it fails or the zone changes."""
+    """Drives the Raumfeld room. Where to reach it is cached: the host's API address (found
+    via the locator: SSDP by the speaker's UDN, or RAUMFELD_HOST) and the zone renderer's
+    control URL by zone UDN. A request that fails on a cached address finds that device
+    again and is sent once more; a new zone UDN finds its renderer. So with a valid cache
+    a takeover sends no SSDP at all. A host that doesn't know our room, or a renderer
+    description naming another UDN, is an error: never a wrong device."""
 
-    def __init__(self, config, discover, api_port=RAUMFELD_API_PORT, sleep=time.sleep,
+    def __init__(self, config, locator, api_port=RAUMFELD_API_PORT, sleep=time.sleep,
                  zone_wait_s=10.0, zone_poll_s=0.5, clock=time.monotonic):
         self.config = config
-        self.discover = discover
+        self.locator = locator
         self.api_port = api_port
         self.sleep = sleep
         self.clock = clock
         self.zone_polls = int(zone_wait_s / zone_poll_s)
         self.zone_poll_s = zone_poll_s
         self._api = None
-        self._control = None  # (zone UDN, AVTransport control URL)
+        self._zone = None  # UDN of the zone of the last takeover or look
+        self._control = None  # its AVTransport control URL, None until found
         # The URI the zone held when the last takeover (not a re-takeover) set up our
         # stream; "" if none (standby, no zone, nothing loaded).
         self._source_before = ""
+
+    def warm_up(self):
+        """Find the host and the room's zone renderer before the first cast, so that cast
+        finds them cached. Nothing found is no error: the first cast looks again."""
+        try:
+            zone = zone_of_room(self._get_zones(), self.config.room_udn)
+            if zone is not None:
+                self._zone_control(zone)
+        except _ERRORS as e:
+            log.warning("Raumfeld room not found yet (%r); the first cast looks again", e)
+            return
+        log.info("Raumfeld host at %s, zone renderer %s", self._api,
+                 self._control or "none (the room has no zone)")
 
     def ensure_playing(self, wake=True, retake=False):
         """Make the room play our stream; returns the decision taken. With wake=False
@@ -492,37 +615,32 @@ class Controller:
             log.info("zone %r was on %s; the cast takes over", room.zone, source)
 
         room_param = quote(self.config.room_udn, safe="")
-        zone, control = room.zone, room.control
+        zone = room.zone
         if wake:
             http_get(room.api + "leaveStandby?roomUDN=" + room_param)
             if room.power != "ACTIVE":
                 # What was seen before the wake may belong to a speaker still shutting down.
-                zone, control = self._wait_awake(room.api, had_zone=zone is not None), None
+                zone = self._wait_awake(room.api, had_zone=zone is not None)
         zone = zone or self._connect_zone(room.api, room_param)
-        control = control or self._zone_control(zone, reuse=False)
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
                     if self.config.stream_metadata else "")
-        soap_call(control, "SetAVTransportURI",
-                  [("CurrentURI", self.config.stream_url), ("CurrentURIMetaData", metadata)])
-        soap_call(control, "Play", [("Speed", "1")])
+        self._zone_soap(zone, "SetAVTransportURI",
+                        [("CurrentURI", self.config.stream_url), ("CurrentURIMetaData", metadata)])
+        self._zone_soap(zone, "Play", [("Speed", "1")])
         log.info("zone %r now plays %s", zone, self.config.stream_url)
         return decision
 
     def check(self):
         """Read-only look at the room: the judge_speaker verdict."""
-        try:
-            room = self._inspect(reuse=True)
-        except Exception:
-            # The device may have moved; find it again next time.
-            self._api = self._control = None
-            raise
+        room = self._inspect()
         return judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
 
     def renderer_state(self):
         """Transport state of the zone renderer of the last takeover or look, e.g. PLAYING
         or STOPPED, with NOTHING_LOADED, PREVIOUS_SOURCE or ANOTHER_SOURCE appended unless
         it holds our stream. Only the renderer is asked: right after a wake the room's power
-        state in getZones may still lag behind."""
+        state in getZones may still lag behind. Asked often (the start gate), so a failure
+        is just raised: the next takeover or look finds the renderer again."""
         control = self._known_control()
         state = soap_call(control, "GetTransportInfo", []).get("CurrentTransportState", "")
         state = state[:MAX_STATE_LEN]  # device-supplied, and it ends up in log lines
@@ -543,34 +661,65 @@ class Controller:
         control = self._known_control()
         soap_call(control, "Stop", [])
         soap_call(control, "Play", [("Speed", "1")])
-        log.info("zone %r restarted (Stop, Play)", self._control[0])
+        log.info("zone %r restarted (Stop, Play)", self._zone)
 
     def _known_control(self):
         if self._control is None:
             raise RaumfeldError("no zone renderer known yet")
-        return self._control[1]
+        return self._control
 
-    def _inspect(self, reuse=False):
-        if not (reuse and self._api):
-            host, _location = self.discover(self.config.speaker_udn)
-            self._api = "http://%s:%d/" % (host, self.api_port)
-        api = self._api
-        zones = http_get(api + "getZones")
+    def _inspect(self):
+        zones = self._get_zones()
         zone = zone_of_room(zones, self.config.room_udn)
         power = room_power_state(zones, self.config.room_udn)
         # A room in standby (or without zone) plays nothing; don't query a sleeping renderer.
         if zone is None or power != "ACTIVE":
-            return _Room(api, zone, power, None, None)
-        control = self._zone_control(zone, reuse)
-        info = soap_call(control, "GetTransportInfo", [])
-        media = soap_call(control, "GetMediaInfo", [])
+            return _Room(self._api, zone, power, None)
+        info = self._zone_soap(zone, "GetTransportInfo", [])
+        media = self._zone_soap(zone, "GetMediaInfo", [])
         status = ZoneStatus(info.get("CurrentTransportState", ""), media.get("CurrentURI", ""))
-        return _Room(api, zone, power, control, status)
+        return _Room(self._api, zone, power, status)
 
-    def _zone_control(self, zone, reuse):
-        if not (reuse and self._control and self._control[0] == zone):
-            self._control = (zone, self._control_url(zone))
-        return self._control[1]
+    def _get_zones(self):
+        """getZones from the host's cached API address. If that fails, the host is looked
+        for again (SSDP, or resolving RAUMFELD_HOST again) and asked once more."""
+        for attempt in (1, 2):
+            cached = self._api is not None
+            try:
+                if not cached:
+                    self._api = "http://%s:%d/" % (self.locator.api_host(), self.api_port)
+                zones = http_get(self._api + "getZones")
+                if not room_listed(zones, self.config.room_udn):
+                    raise RaumfeldError("the Raumfeld host at %r does not know room %r"
+                                        % (self._api, self.config.room_udn))
+                return zones
+            except _ERRORS:
+                self._api = None
+                self.locator.forget()
+                if not cached or attempt == 2:
+                    raise
+                log.info("Raumfeld host did not answer as expected at its cached address; "
+                         "looking for it again")
+
+    def _zone_soap(self, zone, action, args):
+        """A SOAP request to the zone's renderer at its cached control URL. If that fails,
+        the renderer is looked for again and the request sent once more."""
+        for attempt in (1, 2):
+            cached = self._zone == zone and self._control is not None
+            try:
+                return soap_call(self._zone_control(zone), action, args)
+            except _ERRORS:
+                self._control = None
+                if not cached or attempt == 2:
+                    raise
+                log.info("zone renderer %r did not answer at its cached address; looking for "
+                         "it again", zone)
+
+    def _zone_control(self, zone):
+        if self._zone != zone or self._control is None:
+            self._zone, self._control = zone, None
+            self._control = self._control_url(zone)
+        return self._control
 
     def _wait_awake(self, api, had_zone):
         """The room's zone once getZones reports the room ACTIVE (and, if it had one before
@@ -613,9 +762,13 @@ class Controller:
         raise RaumfeldError("room did not appear in a zone after connectRoomToZone")
 
     def _control_url(self, zone):
-        host, location = self.discover(zone)
+        host, location = self.locator.renderer(zone)
         check_device_url(location, host)
-        return check_device_url(avtransport_control_url(http_get(location), location), host)
+        description = http_get(location)
+        udn = device_udn(description)
+        if udn != zone:
+            raise RaumfeldError("device at %r has UDN %r, not the zone's %r" % (location, udn, zone))
+        return check_device_url(avtransport_control_url(description, location), host)
 
 
 # --------------------------------------------------------------------------- MPD
@@ -1320,7 +1473,10 @@ def main(env=None):
     if "IDLE_MINUTES" in env:
         log.warning("IDLE_MINUTES is ignored: the Raumfeld's own auto power-off puts the room "
                     "into standby")
-    controller = Controller(config, ssdp_discover)
+    locator = (HostLocator(config.raumfeld_host) if config.raumfeld_host
+               else SsdpLocator(ssdp_discover, config.speaker_udn))
+    controller = Controller(config, locator)
+    controller.warm_up()
     follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds,
                         start_gate_seconds=config.start_gate_seconds)
     try:

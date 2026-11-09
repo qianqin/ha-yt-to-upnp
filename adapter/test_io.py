@@ -679,6 +679,23 @@ class SsdpTest(unittest.TestCase):
         self.assertEqual(ra.ssdp_discover(SPEAKER_UDN, timeout=3, addr=addr),
                          ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
 
+    def test_unicast_search_names_the_host_and_is_answered(self):
+        addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
+        started = time.monotonic()
+        self.assertEqual(ra.ssdp_unicast(SPEAKER_UDN, addr, timeout=3),
+                         ("127.0.0.1", "http://127.0.0.1:2/desc.xml"))
+        self.assertLess(time.monotonic() - started, 0.5)  # no multicast MX wait
+        msg = self.received[0]
+        self.assertTrue(msg.startswith("M-SEARCH * HTTP/1.1\r\n"))
+        self.assertIn("HOST: %s:%d\r\n" % addr, msg)
+        self.assertIn("ST: %s\r\n" % SPEAKER_UDN, msg)
+        self.assertIn("MX: 1\r\n", msg)
+
+    def test_unicast_search_without_an_answer_times_out(self):
+        addr = self.responder([])
+        with self.assertRaises(ra.DeviceNotFound):
+            ra.ssdp_unicast(SPEAKER_UDN, addr, timeout=0.3)
+
     def test_not_found_times_out(self):
         addr = self.responder([])
         started = time.monotonic()

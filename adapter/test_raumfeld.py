@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 import raumfeld_adapter as ra
 from fakes import (LINE_IN_URI, NEW_ZONE_UDN, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN,
-                   FakeDiscovery, FakeRaumfeld)
+                   FakeDiscovery, FakeRaumfeld, FakeSsdpResponder)
 from test_speaker_yield import assert_speaker_left_alone
 
 OTHER_URI = "http://radio.invalid/live.mp3"
@@ -30,7 +30,8 @@ class ControllerTest(unittest.TestCase):
             "STREAM_METADATA": "1" if self.metadata else "0",
         })
         self.now = 1000.0  # sleeping moves the controller's clock on
-        self.ctl = ra.Controller(config, self.discover, api_port=self.rf.port,
+        self.ctl = ra.Controller(config, ra.SsdpLocator(self.discover, SPEAKER_UDN),
+                                 api_port=self.rf.port,
                                  sleep=self.sleep, zone_wait_s=10, zone_poll_s=0.5,
                                  clock=lambda: self.now)
 
@@ -82,8 +83,8 @@ class ControllerTest(unittest.TestCase):
         self.assertLess(last_look, first_soap)  # nothing sent to a room still asleep
         self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
 
-    def test_wake_resolves_zone_and_renderer_afresh(self):
-        # Whatever was known before the wake may belong to a speaker still shutting down.
+    def test_a_room_waking_in_another_zone_uses_that_zones_renderer(self):
+        # The zone seen before the wake may belong to a speaker still shutting down.
         self.rf.wake_after_polls = 1
         self.rf.zone_after_wake = NEW_ZONE_UDN
         self.ctl.ensure_playing()
@@ -265,15 +266,17 @@ class ControllerTest(unittest.TestCase):
         self.ctl.check()
         self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, NEW_ZONE_UDN])
 
-    def test_check_rediscovers_after_an_error(self):
+    def test_a_failing_cached_renderer_is_discovered_again_at_once(self):
         self.rf.power = "ACTIVE"
         self.ctl.check()
         self.rf.fail_paths.add("AVTransport")
         with self.assertRaises(ra.RaumfeldError):
             self.ctl.check()
+        # The cached address failed, so the renderer was found again and asked once more.
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, ZONE_UDN])
         self.rf.fail_paths.clear()
         self.ctl.check()
-        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN] * 2)
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN] + [ZONE_UDN] * 3)
 
     def test_renderer_state_names_the_state_and_flags_another_source(self):
         self.rf.power = "ACTIVE"
@@ -444,11 +447,78 @@ class ControllerTest(unittest.TestCase):
             self.ctl.ensure_playing()
         self.assertEqual(len(self.rf.requests), 1)
 
-    def test_takeover_rediscovers_every_time(self):
+    # -- discovery is cached: the host by its API address, the zone renderer by zone UDN
+
+    def test_takeover_reuses_the_cached_discovery(self):
         self.ctl.ensure_playing()
         self.ctl.ensure_playing()
-        self.assertEqual(self.discover.searches.count(SPEAKER_UDN), 2)
-        self.assertEqual(self.discover.searches.count(ZONE_UDN), 2)
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+
+    def test_warm_up_finds_host_and_renderer_so_a_cast_needs_no_discovery(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.ctl.warm_up()  # at adapter start; the room is in standby
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertEqual(self.rf.soap_actions(), [])  # nothing sent to a sleeping renderer
+        self.assertEqual(self.rf.api_calls(), ["getZones"])
+        self.ctl.ensure_playing()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])  # no SSDP
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_warm_up_that_finds_nothing_is_logged_not_raised(self):
+        self.discover.speaker_present = False
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.ctl.warm_up()
+        self.discover.speaker_present = True
+        self.ctl.ensure_playing()  # the first cast looks again
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_a_moved_renderer_is_discovered_again_and_the_takeover_goes_on(self):
+        self.rf.power = "ACTIVE"
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.ctl.warm_up()
+        self.rf.control_url = "AVTransport/moved"  # the cached control URL now fails
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, ZONE_UDN])
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_a_new_zone_is_discovered_the_old_ones_renderer_is_not_used(self):
+        self.ctl.ensure_playing()
+        self.rf.zone_udn = NEW_ZONE_UDN
+        self.rf.transport_state = "STOPPED"
+        self.ctl.ensure_playing()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, NEW_ZONE_UDN])
+
+    def test_a_failing_host_is_found_again_and_asked_once_more(self):
+        self.ctl.ensure_playing()
+        real_get, failed = ra.http_get, []
+
+        def get(url, *args):
+            if url.endswith("getZones") and not failed:
+                failed.append(url)
+                raise ConnectionRefusedError("host moved")
+            return real_get(url, *args)
+
+        with mock.patch.object(ra, "http_get", get):
+            self.assertEqual(self.ctl.ensure_playing(), ra.ALREADY_PLAYING)
+        self.assertEqual(failed, [self.rf.base + "/getZones"])
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, SPEAKER_UDN])
+
+    def test_a_host_that_does_not_know_our_room_is_an_error_never_a_takeover(self):
+        self.rf.room_listed = False  # a wrong host
+        for action in (self.ctl.ensure_playing, self.ctl.check):
+            with self.subTest(action=action.__name__), \
+                    self.assertRaisesRegex(ra.RaumfeldError, "room"):
+                action()
+        self.assertEqual(set(self.rf.api_calls()), {"getZones"})  # no wake, no new zone
+        self.assertEqual(self.rf.soap_actions(), [])
+
+    def test_a_renderer_description_of_another_device_is_refused(self):
+        self.rf.power = "ACTIVE"
+        self.rf.description_udn = NEW_ZONE_UDN
+        with self.assertRaisesRegex(ra.RaumfeldError, "UDN"):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
 
     def test_metadata_is_escaped_didl_in_soap_body(self):
         self.ctl.ensure_playing()
@@ -470,6 +540,97 @@ class ControllerWithoutMetadataTest(ControllerTest):
         self.assertEqual(args["CurrentURIMetaData"], "")
 
 
+class ControllerWithHostTest(unittest.TestCase):
+    """RAUMFELD_HOST: the host API is reached directly, the zone renderer found by a
+    unicast M-SEARCH to the host; UDNs are still verified."""
+
+    HOST = "raumfeld-host.invalid"
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.ssdp = FakeSsdpResponder(self.rf)
+        self.addCleanup(self.ssdp.close)
+        self.resolved = []
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN, "RAUMFELD_HOST": self.HOST,
+                                     "STREAM_URL": STREAM_URL})
+        self.locator = ra.HostLocator(config.raumfeld_host, resolve=self.resolve,
+                                      ssdp_port=self.ssdp.port)
+        self.ctl = ra.Controller(config, self.locator, api_port=self.rf.port,
+                                 sleep=lambda s: None)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def resolve(self, name):
+        self.resolved.append(name)
+        return "127.0.0.1"
+
+    def test_cast_reaches_the_host_directly_and_finds_the_renderer_by_unicast(self):
+        self.ctl.ensure_playing()
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertEqual(self.resolved, [self.HOST])
+        self.assertEqual(len(self.ssdp.received), 1)
+        search = self.ssdp.received[0]
+        self.assertTrue(search.startswith("M-SEARCH * HTTP/1.1\r\n"))
+        self.assertIn("HOST: 127.0.0.1:%d\r\n" % self.ssdp.port, search)
+        self.assertIn("ST: %s\r\n" % ZONE_UDN, search)
+        self.rf.transport_state = "STOPPED"
+        self.ctl.ensure_playing()  # cached: no DNS, no SSDP
+        self.assertEqual(self.resolved, [self.HOST])
+        self.assertEqual(len(self.ssdp.received), 1)
+
+    def test_warm_up_resolves_and_finds_the_renderer(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.ctl.warm_up()
+        self.assertEqual((self.resolved, len(self.ssdp.received)), ([self.HOST], 1))
+
+    def test_the_name_is_resolved_again_after_a_failure(self):
+        self.ctl.ensure_playing()
+        real_get, failed = ra.http_get, []
+
+        def get(url, *args):
+            if url.endswith("getZones") and not failed:
+                failed.append(url)
+                raise ConnectionRefusedError("host moved")
+            return real_get(url, *args)
+
+        with mock.patch.object(ra, "http_get", get):
+            self.ctl.check()
+        self.assertEqual(self.resolved, [self.HOST, self.HOST])
+
+    def test_a_wrong_host_is_an_error_never_a_takeover(self):
+        self.ctl.ensure_playing()
+        self.rf.room_listed = False  # the name now points at another Raumfeld host
+        self.rf.requests.clear()
+        with self.assertRaisesRegex(ra.RaumfeldError, "room"):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.rf.api_calls(), ["getZones", "getZones"])  # asked again, fresh
+        self.assertEqual(self.resolved, [self.HOST] * 2)  # resolved again for the retry
+        self.assertEqual(self.rf.soap_actions(), [])
+
+    def test_a_renderer_of_another_device_is_refused(self):
+        self.rf.power = "ACTIVE"
+        self.rf.description_udn = NEW_ZONE_UDN
+        with self.assertRaisesRegex(ra.RaumfeldError, "UDN"):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
+
+    def test_an_answer_from_another_address_is_refused(self):
+        locator = ra.HostLocator(self.HOST, resolve=self.resolve,
+                                 search=lambda st, addr, timeout: ("127.0.0.9", "http://x/"))
+        with self.assertRaisesRegex(ra.RaumfeldError, "127.0.0.9"):
+            locator.renderer(ZONE_UDN)
+
+    def test_no_unicast_answer_is_device_not_found(self):
+        self.rf.power = "ACTIVE"
+        self.ssdp.silent = True
+        with mock.patch.object(ra, "UNICAST_SEARCH_S", 0.3), \
+                self.assertRaises(ra.DeviceNotFound):
+            self.ctl.ensure_playing()
+        self.assertEqual(self.rf.soap_actions(), [])
+
+
 class RendererRestartTest(unittest.TestCase):
     """Scenario: a zone renderer stuck in TRANSITIONING (it dropped the stream) is brought
     back with Stop then Play on the zone it was last seen in; a plain Play does not help."""
@@ -481,8 +642,8 @@ class RendererRestartTest(unittest.TestCase):
         config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
                                      "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
                                      "STREAM_URL": STREAM_URL})
-        self.ctl = ra.Controller(config, self.discover, api_port=self.rf.port,
-                                 sleep=lambda s: None)
+        self.ctl = ra.Controller(config, ra.SsdpLocator(self.discover, SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
 
     def test_restart_sends_stop_then_play_to_the_checked_zone(self):
         self.rf.power = "ACTIVE"

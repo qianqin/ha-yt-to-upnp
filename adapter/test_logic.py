@@ -22,6 +22,11 @@ def no_logs(test, name, level):
     test.assertEqual(captured.output, [sentinel])
 
 
+def no_network():
+    """main() looks for the room before it follows MPD; tests never reach the LAN."""
+    return mock.patch.object(ra.Controller, "warm_up")
+
+
 REQUIRED = {
     "RAUMFELD_ROOM_UDN": ROOM_UDN,
     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
@@ -94,12 +99,40 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaises(ra.ConfigError):
                 ra.Config.from_env(dict(REQUIRED, **{key: value}))
 
+    def test_raumfeld_host_is_optional(self):
+        self.assertIsNone(ra.Config.from_env(REQUIRED).raumfeld_host)
+        self.assertIsNone(ra.Config.from_env(dict(REQUIRED, RAUMFELD_HOST=" ")).raumfeld_host)
+
+    def test_raumfeld_host_takes_an_ipv4_address_or_a_dns_name(self):
+        for host in ("192.0.2.10", "raumfeld-host", "raumfeld-host.local", "host.example.org"):
+            with self.subTest(host=host):
+                c = ra.Config.from_env(dict(REQUIRED, RAUMFELD_HOST=" %s " % host))
+                self.assertEqual(c.raumfeld_host, host)
+
+    def test_with_raumfeld_host_the_speaker_udn_is_not_needed(self):
+        env = {"RAUMFELD_ROOM_UDN": ROOM_UDN, "STREAM_URL": STREAM_URL,
+               "RAUMFELD_HOST": "raumfeld-host.local"}
+        self.assertIsNone(ra.Config.from_env(env).speaker_udn)
+        with self.assertRaisesRegex(ra.ConfigError, "RAUMFELD_SPEAKER_UDN"):
+            ra.Config.from_env(dict(env, RAUMFELD_SPEAKER_UDN="speaker"))  # still checked
+        del env["RAUMFELD_HOST"]
+        with self.assertRaisesRegex(ra.ConfigError, "RAUMFELD_SPEAKER_UDN"):
+            ra.Config.from_env(env)
+
+    def test_invalid_raumfeld_host(self):
+        for host in ("http://192.0.2.10", "192.0.2.10:47365", "host/path", "a b", "-host",
+                     "host-", "host..local", "999.0.2.10", "192.0.2", "::1", "[::1]",
+                     "host\r\nX: 1", "a" * 64 + ".local", ("a" * 60 + ".") * 5 + "local"):
+            with self.subTest(host=host), \
+                    self.assertRaisesRegex(ra.ConfigError, "RAUMFELD_HOST"):
+                ra.Config.from_env(dict(REQUIRED, RAUMFELD_HOST=host))
+
     def test_idle_minutes_is_no_longer_a_setting(self):
         c = ra.Config.from_env(dict(REQUIRED, IDLE_MINUTES="soon"))  # ignored, not validated
         self.assertFalse(hasattr(c, "idle_seconds"))
 
     def test_main_warns_that_idle_minutes_is_ignored(self):
-        with mock.patch.object(ra, "run") as run, \
+        with mock.patch.object(ra, "run") as run, no_network(), \
                 mock.patch.object(ra.logging, "basicConfig"), \
                 self.assertLogs("raumfeld_adapter", "WARNING") as logs:
             code = ra.main(env=dict(REQUIRED, IDLE_MINUTES="5"))
@@ -109,16 +142,34 @@ class ConfigTest(unittest.TestCase):
                             for r in logs.records), logs.output)
 
     def test_main_passes_the_timing_settings_to_the_follower(self):
-        with mock.patch.object(ra, "run") as run, mock.patch.object(ra.logging, "basicConfig"):
+        with mock.patch.object(ra, "run") as run, no_network(), \
+                mock.patch.object(ra.logging, "basicConfig"):
             ra.main(env=dict(REQUIRED, START_GATE_SECONDS="12", STUCK_SECONDS="25"))
         follower = run.call_args[0][0]
         self.assertEqual((follower.start_gate_seconds, follower.stuck_seconds), (12, 25))
 
     def test_main_does_not_warn_without_idle_minutes(self):
-        with mock.patch.object(ra, "run"), mock.patch.object(ra.logging, "basicConfig"), \
+        with mock.patch.object(ra, "run"), no_network(), \
+                mock.patch.object(ra.logging, "basicConfig"), \
                 self.assertLogs("raumfeld_adapter", "INFO") as logs:
             ra.main(env=dict(REQUIRED))
         self.assertFalse(any("IDLE_MINUTES" in m for m in logs.output), logs.output)
+
+    def test_main_finds_the_room_before_following_mpd(self):
+        order = []
+        with mock.patch.object(ra, "run", lambda *a, **k: order.append("run")), \
+                mock.patch.object(ra.Controller, "warm_up", lambda self: order.append("warm_up")), \
+                mock.patch.object(ra.logging, "basicConfig"):
+            ra.main(env=dict(REQUIRED))
+        self.assertEqual(order, ["warm_up", "run"])
+
+    def test_main_locates_by_ssdp_or_by_the_configured_host(self):
+        for env, kind in ((REQUIRED, ra.SsdpLocator),
+                          (dict(REQUIRED, RAUMFELD_HOST="raumfeld-host.local"), ra.HostLocator)):
+            with self.subTest(kind=kind.__name__), mock.patch.object(ra, "run") as run, \
+                    no_network(), mock.patch.object(ra.logging, "basicConfig"):
+                ra.main(env=env)
+            self.assertIsInstance(run.call_args[0][0].controller.locator, kind)
 
     def test_main_exits_nonzero_with_clear_message(self):
         err = io.StringIO()
