@@ -362,7 +362,7 @@ class HttpLimitsTest(unittest.TestCase):
 
         port = raw_server(self, trickle)
         started = time.monotonic()
-        with self.assertRaises(ra.RaumfeldError):
+        with self.assertRaises(ra.RequestTimeout):
             ra.http_get("http://127.0.0.1:%d/x" % port, deadline_s=0.5)
         self.assertLess(time.monotonic() - started, 2)
 

@@ -65,6 +65,10 @@ class RaumfeldError(Exception):
     """The Raumfeld system answered, but not in a way we can act on."""
 
 
+class RequestTimeout(RaumfeldError):
+    """An HTTP exchange ran past its deadline: the device didn't answer in time."""
+
+
 class DeviceNotFound(RaumfeldError):
     def __init__(self, udn):
         super().__init__("no SSDP answer for %r" % udn)
@@ -503,7 +507,7 @@ def _exchange(method, url, body, headers, deadline):
     parts = urlsplit(url)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RaumfeldError("%r: request deadline exceeded" % url)
+        raise RequestTimeout("%r: request deadline exceeded" % url)
     conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=remaining)
     expired = threading.Event()
     # http.client drops conn.sock after a "Connection: close" response while the body is
@@ -545,7 +549,7 @@ def _exchange(method, url, body, headers, deadline):
         return resp.status, resp.getheader("Location"), data
     except (OSError, http.client.HTTPException):
         if expired.is_set():
-            raise RaumfeldError("%r took longer than the request deadline" % url) from None
+            raise RequestTimeout("%r took longer than the request deadline" % url) from None
         raise
     finally:
         timer.cancel()
@@ -568,6 +572,9 @@ def soap_call(control_url, action, args):
 
 # Everything a misbehaving network or device can cause; the follow loop must survive it.
 _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
+# No answer at all (refused, reset, timed out): the device may have moved. Any answer, even
+# an HTTP error status, comes from a device at that address.
+_UNREACHABLE = (OSError, http.client.HTTPException, RequestTimeout)
 
 
 STATE_FILE_NAME = "raumfeld-adapter-state.json"
@@ -807,13 +814,15 @@ class Controller:
                          "looking for it again")
 
     def _zone_soap(self, zone, action, args):
-        """A SOAP request to the zone's renderer at its cached control URL. If that fails,
-        the renderer is looked for again and the request sent once more."""
+        """A SOAP request to the zone's renderer at its cached control URL. If the renderer
+        doesn't answer there, it is looked for again and the request sent once more. An
+        answer that is an error (e.g. a UPnP fault, HTTP 500) is raised as it is: the
+        renderer is where it was, and the request is not sent twice."""
         for attempt in (1, 2):
             cached = self._zone == zone and self._control is not None
             try:
                 return soap_call(self._zone_control(zone), action, args)
-            except _ERRORS:
+            except _UNREACHABLE:
                 self._control = None
                 if not cached or attempt == 2:
                     raise

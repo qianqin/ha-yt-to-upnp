@@ -270,17 +270,48 @@ class ControllerTest(unittest.TestCase):
         self.ctl.check()
         self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, NEW_ZONE_UDN])
 
-    def test_a_failing_cached_renderer_is_discovered_again_at_once(self):
+    def unreachable(self, error, times=1):
+        """soap_call fails with `error` (no answer from the device) for the next `times`
+        calls, then reaches the fake again."""
+        real, failures = ra.soap_call, []
+
+        def soap_call(url, action, args):
+            if len(failures) < times:
+                failures.append(url)
+                raise error
+            return real(url, action, args)
+
+        return mock.patch.object(ra, "soap_call", soap_call)
+
+    def test_a_renderer_unreachable_at_its_cached_address_is_discovered_again_at_once(self):
+        self.rf.power = "ACTIVE"
+        self.ctl.check()
+        errors = (ConnectionRefusedError("renderer moved"), socket.timeout("timed out"),
+                  ra.RequestTimeout("took longer than the request deadline"))
+        for n, error in enumerate(errors, 1):
+            with self.subTest(error=error):
+                with self.unreachable(error):
+                    self.ctl.check()  # answered after the new lookup
+                # The cached address failed, so the renderer was found again and asked once more.
+                self.assertEqual(self.discover.searches, [SPEAKER_UDN] + [ZONE_UDN] * (n + 1))
+        with self.unreachable(ConnectionRefusedError("gone"), times=2), \
+                self.assertRaises(ConnectionRefusedError):
+            self.ctl.check()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN] + [ZONE_UDN] * 5)
+
+    def test_a_soap_fault_from_the_cached_renderer_is_no_reason_to_look_for_it_again(self):
+        # The device answered (UPnP fault, HTTP 500): it is the right one, just unwilling.
         self.rf.power = "ACTIVE"
         self.ctl.check()
         self.rf.fail_paths.add("AVTransport")
-        with self.assertRaises(ra.RaumfeldError):
+        self.rf.requests.clear()
+        with self.assertRaisesRegex(ra.RaumfeldError, "HTTP 500"):
             self.ctl.check()
-        # The cached address failed, so the renderer was found again and asked once more.
-        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, ZONE_UDN])
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo"])  # not sent again
         self.rf.fail_paths.clear()
-        self.ctl.check()
-        self.assertEqual(self.discover.searches, [SPEAKER_UDN] + [ZONE_UDN] * 3)
+        self.ctl.check()  # the cached address is kept
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
 
     def test_renderer_state_names_the_state_and_flags_another_source(self):
         self.rf.power = "ACTIVE"
@@ -490,8 +521,8 @@ class ControllerTest(unittest.TestCase):
         self.rf.power = "ACTIVE"
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.ctl.warm_up()
-        self.rf.control_url = "AVTransport/moved"  # the cached control URL now fails
-        with self.assertLogs("raumfeld_adapter", "INFO"):
+        with self.unreachable(ConnectionRefusedError("renderer moved")), \
+                self.assertLogs("raumfeld_adapter", "INFO"):
             self.ctl.ensure_playing()
         self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN, ZONE_UDN])
         self.assertEqual(self.rf.transport_state, "PLAYING")
