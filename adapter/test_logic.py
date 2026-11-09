@@ -596,6 +596,10 @@ class StuckRendererTest(unittest.TestCase):
         self.assertEqual(self.f.take_mpd_requests(), [])
 
 
+# More renderer looks than the longest gate (START_GATE_MAX_S) can take.
+GATE_LOOKS = int(ra.START_GATE_MAX_S / ra.GATE_POLL_S) + 10
+
+
 class StartGateTest(unittest.TestCase):
     """The speaker needs seconds to wake and buffer: at a takeover the adapter holds MPD at
     the start of the song (pause 1) until the renderer plays our stream, then resumes it."""
@@ -633,7 +637,7 @@ class StartGateTest(unittest.TestCase):
     def gate_runs_out(self, level="INFO"):
         """Tick the held gate until it asks for pause 0; the logs of the way there."""
         with self.assertLogs("raumfeld_adapter", level) as logs:
-            for _ in range(200):
+            for _ in range(GATE_LOOKS):
                 self.advance(ra.GATE_POLL_S)
                 if self.f._requests:
                     break
@@ -664,6 +668,14 @@ class StartGateTest(unittest.TestCase):
         self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["renderer_state"] * 3)
         self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual from now on
         self.assertEqual(self.requests(), [])
+
+    def test_the_renderer_is_asked_every_quarter_second_during_the_gate(self):
+        # Every look costs two SOAP requests: at most 8 per second, for at most 60 s.
+        self.held()
+        self.assertEqual(self.f.seconds_until_deadline(), 0.25)
+        self.advance(0.25)
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "renderer_state"])
+        self.assertEqual(self.f.seconds_until_deadline(), 0.25)
 
     def test_own_pause_and_resume_are_not_followed_to_the_speaker(self):
         self.held()
@@ -975,7 +987,7 @@ class StartGateTest(unittest.TestCase):
 
     def until_restarted(self):
         with self.assertLogs("raumfeld_adapter", "INFO"):
-            for _ in range(200):
+            for _ in range(GATE_LOOKS):
                 self.advance(ra.GATE_POLL_S)
                 if "restart_renderer" in self.ctl.calls:
                     return
@@ -1002,7 +1014,7 @@ class StartGateTest(unittest.TestCase):
         self.held()
         self.ctl.fail = OSError("speaker unreachable")
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
-            for _ in range(200):
+            for _ in range(GATE_LOOKS):
                 gate = self.f._gate
                 self.assertLessEqual(self.f.deadline, gate.deadline)
                 self.assertLessEqual(gate.deadline, gate.started + ra.START_GATE_MAX_S)

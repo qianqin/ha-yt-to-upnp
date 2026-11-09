@@ -11,7 +11,7 @@ import unittest
 import raumfeld_adapter as ra
 from fakes import (LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN, FakeDiscovery,
                    FakeMpd, FakeRaumfeld, run_bounded)
-from test_logic import FakeClock
+from test_logic import GATE_LOOKS, FakeClock
 
 POLL_S = 5
 RADIO_URI = "http://radio.invalid/live.mp3"
@@ -462,7 +462,7 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
 
     def gate_until_released(self):
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
-            for _ in range(100):
+            for _ in range(GATE_LOOKS):
                 self.clock.now += ra.GATE_POLL_S
                 self.follower.tick()
                 requests = self.requests()
@@ -531,7 +531,7 @@ class GateRetakeoverScenarioTest(unittest.TestCase):
 
     def gate_until_requests(self):
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
-            for _ in range(100):
+            for _ in range(GATE_LOOKS):
                 self.clock.now += ra.GATE_POLL_S
                 self.follower.tick()
                 requests = self.requests()

@@ -784,7 +784,7 @@ STUCK_MAX_RESTARTS = 3
 # renderer plays our stream, at most START_GATE_S seconds; the renderer is asked every
 # GATE_POLL_S seconds meanwhile.
 START_GATE_S = 15
-GATE_POLL_S = 0.5
+GATE_POLL_S = 0.25
 # Highest START_GATE_SECONDS, and the hard bound on the hold however the gate is extended:
 # holding the song any longer only leaves the phone standing still.
 START_GATE_MAX_S = 60

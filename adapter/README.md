@@ -22,7 +22,7 @@ Raumfeld room play the receiver's MPD stream automatically.
   taken away), it first sends MPD `pause 1`, which holds the song at about 0:00;
   MPD's httpd output keeps streaming silence while paused (`always_on`), so the
   speaker can connect. Then it wakes the room and starts the stream as usual,
-  asks the zone renderer every 0.5 s whether it is `PLAYING` on `STREAM_URL`,
+  asks the zone renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL`,
   and sends `pause 0` as soon as it is. **Re-takeover:** if the renderer has not
   loaded or does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover
   returned (`STOPPED`, `NO_MEDIA_PRESENT`, no URI at all whatever its state, a
