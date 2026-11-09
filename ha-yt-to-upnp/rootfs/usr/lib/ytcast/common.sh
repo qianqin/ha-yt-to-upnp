@@ -69,5 +69,7 @@ ytcast_finish() {
     if [ "${code}" -ne 0 ]; then
         bashio::log.warning "${name} exited with code ${code}; restarting in 3 s"
         sleep 3
+    else
+        bashio::log.warning "${name} exited (code 0); restarting"
     fi
 }

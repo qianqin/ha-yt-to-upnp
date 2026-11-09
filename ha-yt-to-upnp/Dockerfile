@@ -1,13 +1,9 @@
 # Built by the Supervisor from the folder that scripts/build-ha-app.sh assembles:
 # everything under artefacts/ is prebuilt on the release machine, nothing is
-# compiled here. Supervisor 2026.04+ passes no BUILD_FROM, so the pinned base
-# image is the default (Debian bookworm: glibc for the receiver and Deno).
-ARG BUILD_FROM=ghcr.io/home-assistant/base-debian:bookworm-2026.10.3@sha256:ebb912a11616e3eda2d31204803587276e70bbb4e7f02a6c92dba5f43256b48d
-# hadolint ignore=DL3006
-FROM ${BUILD_FROM}
-
-ARG BUILD_VERSION=dev
-ARG BUILD_ARCH=amd64
+# compiled here. The base image is pinned by digest (Debian bookworm: glibc for
+# the receiver and Deno); Supervisor 2026.04+ passes no BUILD_FROM, and it adds
+# the io.hass.* labels itself.
+FROM ghcr.io/home-assistant/base-debian:bookworm-2026.10.3@sha256:ebb912a11616e3eda2d31204803587276e70bbb4e7f02a6c92dba5f43256b48d
 
 # hadolint ignore=DL3008
 RUN apt-get update \
@@ -28,8 +24,3 @@ COPY rootfs/ /
 RUN chmod 0755 /usr/local/bin/ytcast-lite /usr/local/bin/deno /etc/s6-overlay/scripts/*.sh \
         /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish \
     && chmod -R a+rX,go-w /opt/ytcast-adapter /opt/bgutil /usr/lib/ytcast /etc/ytcast
-
-LABEL \
-    io.hass.version="${BUILD_VERSION}" \
-    io.hass.type="app" \
-    io.hass.arch="${BUILD_ARCH}"
