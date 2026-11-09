@@ -16,8 +16,12 @@ if ! problem="$(python3 -I /usr/lib/ytcast/check_options.py /data/options.json)"
     bashio::exit.nok "${problem//\\/\\\\}; fix the app's configuration and start it again"
 fi
 
-# Persistent state under /data, private to the user of each service.
-mkdir -p /data/ytcast /data/mpd/music /data/mpd/playlists
+# Persistent state under /data, private to the user of each service (the adapter
+# also warns about a state directory others can write to).
+# shellcheck source=SCRIPTDIR/../../../usr/lib/ytcast/common.sh
+source /usr/lib/ytcast/common.sh
+mkdir -p /data/ytcast /data/mpd/music /data/mpd/playlists "${YTCAST_ADAPTER_STATE_DIR}"
 chown -R ytcast:ytcast /data/ytcast
 chown -R mpd: /data/mpd
-chmod 0700 /data/ytcast /data/mpd
+chown -R adapter:adapter "${YTCAST_ADAPTER_STATE_DIR}"
+chmod 0700 /data/ytcast /data/mpd "${YTCAST_ADAPTER_STATE_DIR}"

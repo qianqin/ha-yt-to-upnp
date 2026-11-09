@@ -14,16 +14,27 @@ stream_url="http://${stream_host}:8000/stream.mp3"
 
 # Plain assignments, so that set -e stops on a missing option.
 room_udn="$(ytcast_option raumfeld_room_udn)"
-speaker_udn="$(ytcast_option raumfeld_speaker_udn)"
 log_level="$(ytcast_log_level python)"
+# ADAPTER_STATE_DIR (made by ytcast-init) keeps the zone renderer's location
+# across restarts, so a restart needs no search.
 env=(
     PATH=/usr/bin:/bin HOME=/nonexistent
-    RAUMFELD_ROOM_UDN="${room_udn}" RAUMFELD_SPEAKER_UDN="${speaker_udn}"
+    RAUMFELD_ROOM_UDN="${room_udn}"
     STREAM_URL="${stream_url}"
     MPD_HOST="${YTCAST_MPD_HOST}" MPD_PORT="${YTCAST_MPD_PORT}"
     LOG_LEVEL="${log_level}"
+    ADAPTER_STATE_DIR="${YTCAST_ADAPTER_STATE_DIR}"
 )
-# Unset options keep the adapter's own defaults.
+# Unset options keep the adapter's own defaults. The start check made sure that
+# at least one of raumfeld_speaker_udn and raumfeld_host is set.
+if ytcast_has_option raumfeld_speaker_udn; then
+    speaker_udn="$(ytcast_option raumfeld_speaker_udn)"
+    env+=(RAUMFELD_SPEAKER_UDN="${speaker_udn}")
+fi
+if ytcast_has_option raumfeld_host; then
+    raumfeld_host="$(ytcast_option raumfeld_host)"
+    env+=(RAUMFELD_HOST="${raumfeld_host}")
+fi
 if ytcast_has_option start_gate_seconds; then
     start_gate_seconds="$(ytcast_option start_gate_seconds)"
     env+=(START_GATE_SECONDS="${start_gate_seconds}")
@@ -34,5 +45,5 @@ if ytcast_has_option stuck_seconds; then
 fi
 
 ytcast_wait_for_mpd
-bashio::log.info "Starting Raumfeld adapter (stream ${stream_url})"
+bashio::log.info "Starting Raumfeld adapter (stream ${stream_url}, Raumfeld host ${raumfeld_host:-by SSDP})"
 exec s6-setuidgid adapter env -i "${env[@]}" python3 -I /opt/ytcast-adapter/raumfeld_adapter.py

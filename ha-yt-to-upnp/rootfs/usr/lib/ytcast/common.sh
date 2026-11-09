@@ -6,6 +6,9 @@ readonly YTCAST_MPD_PORT=6600
 # Read directly rather than through bashio::config, which asks the Supervisor
 # API: the app needs no API access for its own options.
 readonly YTCAST_OPTIONS=/data/options.json
+# The adapter's state directory: made by ytcast-init, passed by the adapter's run.
+# shellcheck disable=SC2034
+readonly YTCAST_ADAPTER_STATE_DIR=/data/adapter
 
 # True if the option is set (not missing, null or empty).
 ytcast_has_option() {
