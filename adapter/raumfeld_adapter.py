@@ -893,7 +893,8 @@ class Controller:
 _MPD_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
-MpdStatus = namedtuple("MpdStatus", "state songid")  # songid is None without a current song
+# songid and elapsed (seconds into the song) are None without a current song.
+MpdStatus = namedtuple("MpdStatus", "state songid elapsed")
 
 # A lost connection names MPD's connection_timeout (60 s by default) only after at least
 # this much silence outside idle; after less it is far more likely an MPD restart or the
@@ -943,7 +944,13 @@ class MpdClient:
         fields = dict(line.partition(": ")[::2] for line in self._response())
         if "state" not in fields:
             raise MpdError("status without state")
-        return MpdStatus(fields["state"], fields.get("songid"))
+        elapsed = fields.get("elapsed")
+        if elapsed is not None:
+            try:
+                elapsed = float(elapsed)
+            except ValueError:
+                raise MpdError("status with invalid elapsed %r" % elapsed[:40]) from None
+        return MpdStatus(fields["state"], fields.get("songid"), elapsed)
 
     def pause(self):
         self._command("pause 1")
@@ -1072,6 +1079,15 @@ START_GATE_MAX_S = 60
 # the gate the stuck handling (STUCK_S) takes over.
 GATE_RETAKE_S = 5
 GATE_MAX_RETAKES = 2
+# The receiver's held hand-over: when MPD is paused as the song replaces the pre-roll silence,
+# the receiver runs `playid <song>; pause 1; deleteid <silence>`, so the song waits at 0:00 for
+# the adapter's pause 0. If that list ran just after our pause 0 landed on the silence, MPD
+# reports (pause, new songid) right after the gate; within AFTER_GATE_HANDOVER_S of it, with
+# the song at most HANDOVER_ELAPSED_S in, that is taken for the hand-over and pause 0 sent
+# again. Short on purpose: the receiver keeps the phone from pausing during the pre-roll, and
+# the phone can't pause a song it hasn't played yet so soon after the hand-over.
+AFTER_GATE_HANDOVER_S = 5
+HANDOVER_ELAPSED_S = 1.0
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
@@ -1168,8 +1184,9 @@ class Follower:
         # stopped: it never started, so nobody can have stopped it; one more takeover is
         # due before the speaker counts as taken away.
         self._unstarted = False
-        # (gate start, song, renderer played) of the last gate that ended on its first song
-        # (the pre-roll silence): the next song is logged as the cast start's song.
+        # (gate, when it ended) of the last gate our own pause 0 ended: the next MPD state may
+        # be the pre-roll's song (logged as the cast start's song) or the receiver's held
+        # hand-over of it (resumed again).
         self._after_gate = None
         self.pending = None
         self.deadline = None
@@ -1188,7 +1205,8 @@ class Follower:
         playback."""
         self.mpd_song = None
 
-    def on_mpd_state(self, state, songid=None):
+    def on_mpd_state(self, state, songid=None, elapsed=None):
+        """`elapsed`: seconds into the current song, None if MPD didn't say."""
         if songid is not None and (state, songid) == (self.mpd_state, self.mpd_song):
             # No change within this connection: the idle event of our own pause 0 after the
             # status read that already reported it, or a seek. Taken as a new start it would
@@ -1202,10 +1220,16 @@ class Follower:
             # The gate was ended by someone else; our own pause was no user pause.
             previous = "play"
         after_gate, self._after_gate = self._after_gate, None
-        if after_gate and state == "play" and previous == "play":
-            self._log_song_after_gate(after_gate, songid)
-        # A user change: a renderer stopped from now on is no longer ours to restart.
-        self._unstarted = False
+        if after_gate and self._held_handover(after_gate, state, previous, songid, elapsed):
+            return self._resume_handover(after_gate[0], songid)
+        preroll = after_gate is not None and self._preroll_song(after_gate[0], state, previous,
+                                                                songid)
+        if preroll and state == "play":
+            self._log_song_after_gate(after_gate[0], songid)
+        if not preroll:
+            # A user change: a renderer stopped from now on is no longer ours to restart.
+            # (The pre-roll's song is the receiver's doing, not the user's.)
+            self._unstarted = False
         if self.yielded:
             if previous != "pause" or state == "pause":
                 if state == "play":
@@ -1266,7 +1290,8 @@ class Follower:
         if state in ("play", "pause") and song != gate.song:
             self._gate_song_arrived(state, song)
             return True
-        if gate.phase == _PAUSING and state == "play":
+        if state == "play" and (gate.phase == _PAUSING or (
+                gate.phase == _HOLDING and PAUSE_PLAYER in self._requests)):
             # Our pause 1 is still to go out (requeued at a reconnect) and holds whatever
             # song MPD plays by then.
             return True
@@ -1293,14 +1318,20 @@ class Follower:
         gate = self._gate
         gate.song, gate.song_at = song, self.clock()
         at = gate.song_at - gate.started
-        if gate.phase == _RESUMING:
+        if gate.phase == _RESUMING and state == "play":
             log.info("start: song %r at +%.1f s, %s: no hold", song, at,
                      "speaker already playing" if gate.playing else "the gate gave up")
-            if state == "play":
-                # The speaker plays (or the gate gave up on it): MPD playing the new song is
-                # what our pause 0 was on its way to do.
-                self._gate = None
-                self._requests = [r for r in self._requests if r != RESUME_PLAYER]
+            # The speaker plays (or the gate gave up on it): MPD playing the new song is
+            # what our pause 0 was on its way to do.
+            self._gate = None
+            self._requests = [r for r in self._requests if r != RESUME_PLAYER]
+            return
+        if gate.phase == _RESUMING:
+            # The receiver's held hand-over ran just after our pause 0: resume the song too.
+            log.info("start: song %r at +%.1f s, held by the receiver as MPD resumed: "
+                     "resuming it", song, at)
+            if RESUME_PLAYER not in self._requests:
+                self._requests.append(RESUME_PLAYER)
             return
         log.info("start: song %r at +%.1f s, speaker not playing yet: held", song, at)
         if state == "play" and PAUSE_PLAYER not in self._requests:
@@ -1312,16 +1343,34 @@ class Follower:
         held = (" (song %r held %.1f s)" % (gate.song, now - gate.song_at)
                 if gate.song_at is not None else "")
         log.info("start: MPD resumed at +%.1f s%s", now - gate.started, held)
-        if gate.song_at is None:
-            self._after_gate = (gate.started, gate.song, gate.playing)
+        self._after_gate = (gate, now)
 
-    def _log_song_after_gate(self, after_gate, song):
-        started, first_song, playing = after_gate
-        at = self.clock() - started
-        # The receiver ends its pre-roll silence after 60 s; a later song is no cast start.
-        if song != first_song and at <= START_GATE_MAX_S:
-            log.info("start: song %r at +%.1f s, %s: no hold", song, at,
-                     "speaker already playing" if playing else "speaker not playing")
+    def _preroll_song(self, gate, state, previous, song):
+        """The pre-roll's song, replacing the silence after the gate that started on it. The
+        receiver ends its pre-roll silence after 60 s; a later song is no cast start."""
+        return (gate.song_at is None and previous == "play" and state in ("play", "pause")
+                and song != gate.song and self.clock() - gate.started <= START_GATE_MAX_S)
+
+    def _held_handover(self, after_gate, state, previous, song, elapsed):
+        gate, ended = after_gate
+        return (state == "pause" and previous == "play" and not self.yielded
+                and song is not None and song != gate.song
+                and elapsed is not None and elapsed <= HANDOVER_ELAPSED_S
+                and self.clock() - ended <= AFTER_GATE_HANDOVER_S)
+
+    def _resume_handover(self, gate, song):
+        """The receiver handed the song over held just after our pause 0 landed: the gate
+        carries on resuming, now with the song."""
+        gate.phase, gate.song, gate.song_at = _RESUMING, song, self.clock()
+        self._gate = gate
+        log.info("start: song %r at +%.1f s, held by the receiver after MPD resumed: "
+                 "resuming it", song, gate.song_at - gate.started)
+        if RESUME_PLAYER not in self._requests:
+            self._requests.append(RESUME_PLAYER)
+
+    def _log_song_after_gate(self, gate, song):
+        log.info("start: song %r at +%.1f s, %s: no hold", song, self.clock() - gate.started,
+                 "speaker already playing" if gate.playing else "speaker not playing")
 
     def _gate_take_over(self):
         self.wake = True
@@ -1330,7 +1379,8 @@ class Follower:
             stats = self.controller.last_takeover
             log.info("start: takeover returned at +%.1f s (wake wait %.1f s, %s)",
                      self.clock() - self._gate.started, stats.wake_s,
-                     "%d discoveries" % stats.lookups if stats.lookups
+                     "%d %s" % (stats.lookups, "discovery" if stats.lookups == 1
+                                else "discoveries") if stats.lookups
                      else "cached addresses, no discovery")
             self._give_time()
         else:

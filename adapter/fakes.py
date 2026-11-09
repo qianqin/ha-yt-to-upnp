@@ -311,7 +311,8 @@ class FakeSsdpResponder:
 
 class FakeMpd:
     """A scripted MPD server. Each accepted connection consumes one script:
-    a list of player states, each a state ("play") or a (state, songid) pair; the first
+    a list of player states, each a state ("play"), a (state, songid) pair (at 0:00) or a
+    (state, songid, elapsed) triple; the first
     answers the initial `status`, each following one is announced via `changed: player`
     to the next `idle player`.
     When a script is exhausted the server holds `idle` open until `noidle`
@@ -328,6 +329,10 @@ class FakeMpd:
         self.drop_on_first_pause = False  # lose the connection on the first `pause 1`
         # Like MPD's connection_timeout: hang up on a client silent this long outside `idle`.
         self.connection_timeout = None
+        # The receiver's held hand-over racing our `pause 0`: (songid, "now" | "next"). At the
+        # first `pause 0` MPD is paused at that song (0:00), seen at once ("now") or as the
+        # next player change after the one of our pause 0 ("next").
+        self.handover_on_resume = None
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -366,7 +371,7 @@ class FakeMpd:
         f = conn.makefile("rwb", buffering=0)
         try:
             f.write(b"OK MPD 0.23.5\n")
-            state, songid = _player(states.pop(0))
+            state, songid, elapsed = _player(states.pop(0))
             idling = False
             changed_by_client = False
             while True:
@@ -380,7 +385,8 @@ class FakeMpd:
                 cmd = line.decode().strip()
                 self.commands.append(cmd)
                 if cmd == "status":
-                    song = "" if songid is None else "song: 0\nsongid: %s\n" % songid
+                    song = ("" if songid is None else
+                            "song: 0\nsongid: %s\nelapsed: %.3f\n" % (songid, elapsed))
                     f.write(("volume: -1\nrepeat: 0\nstate: %s\n%sOK\n" % (state, song)).encode())
                 elif cmd == "pause 1" and self.drop_on_first_pause:
                     self.drop_on_first_pause = False
@@ -388,6 +394,13 @@ class FakeMpd:
                 elif cmd in ("pause 1", "pause 0"):
                     state = "pause" if cmd == "pause 1" else "play"
                     changed_by_client = True
+                    if cmd == "pause 0" and self.handover_on_resume:
+                        handover, when = self.handover_on_resume
+                        self.handover_on_resume = None
+                        if when == "now":
+                            state, songid, elapsed = "pause", handover, 0.0
+                        else:
+                            states.insert(0, ("pause", handover, 0.0))
                     f.write(b"OK\n")
                 elif cmd.startswith("sendmessage ") and self.message_subscribers:
                     if self.stop_on_message:
@@ -400,7 +413,7 @@ class FakeMpd:
                         changed_by_client = False
                         f.write(b"changed: player\nOK\n")
                     elif states:
-                        state, songid = _player(states.pop(0))
+                        state, songid, elapsed = _player(states.pop(0))
                         f.write(b"changed: player\nOK\n")
                     elif close_after:
                         return
@@ -416,7 +429,11 @@ class FakeMpd:
 
 
 def _player(entry):
-    return (entry, None) if isinstance(entry, str) else entry
+    """(state, songid, elapsed) of a script entry: a state, (state, songid) at 0:00, or
+    (state, songid, elapsed)."""
+    if isinstance(entry, str):
+        return entry, None, None
+    return (tuple(entry) + (0.0,))[:3]
 
 
 def run_bounded(test, follower, mpd, should_stop, sleep, limit_s=5):

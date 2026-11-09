@@ -40,9 +40,16 @@ class MpdClientTest(unittest.TestCase):
         self.addCleanup(mpd.close)
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
-        self.assertEqual(client.status(), ("play", "7"))
+        self.assertEqual(client.status(), ("play", "7", 0.0))
         client.wait_player(None)
-        self.assertEqual(client.status(), ("stop", None))  # no current song
+        self.assertEqual(client.status(), ("stop", None, None))  # no current song
+
+    def test_status_reports_how_far_into_the_song(self):
+        mpd = FakeMpd([[("pause", "7", 12.5)]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        self.assertEqual(client.status(), ("pause", "7", 12.5))
 
     def test_resume_sends_pause_0(self):
         mpd = FakeMpd([[("play", "7")]])
@@ -50,9 +57,9 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         client.pause()
-        self.assertEqual(client.status(), ("pause", "7"))
+        self.assertEqual(client.status()[:2], ("pause", "7"))
         client.resume()
-        self.assertEqual(client.status(), ("play", "7"))
+        self.assertEqual(client.status()[:2], ("play", "7"))
         self.assertEqual(mpd.commands, ["pause 1", "status", "pause 0", "status"])
 
     def test_non_positive_idle_timeout_is_rejected(self):
@@ -415,7 +422,7 @@ class RecordingFollower:
     def on_mpd_connected(self):
         self.connects = getattr(self, "connects", 0) + 1
 
-    def on_mpd_state(self, state, songid=None):
+    def on_mpd_state(self, state, songid=None, elapsed=None):
         self.states.append(state)
 
     def tick(self):
@@ -554,6 +561,38 @@ class RunLoopTest(unittest.TestCase):
                          ["pause 1", "pause 1", "pause 0"])
         self.assertEqual(ctl.calls.count("ensure_playing"), 1)
         self.assertNotIn("ensure_playing(no wake)", ctl.calls)
+
+    def gate_until_resumed(self, script, handover=None, resumes=1):
+        """run() with the start gate against FakeMpd(script); the renderer plays as soon as
+        it is asked. Returns the pause commands sent and the takeovers."""
+        ctl = RecordingController()
+        follower = ra.Follower(ctl, poll_seconds=5, start_gate_seconds=5)
+        mpd = FakeMpd([script])
+        mpd.handover_on_resume = handover
+        self.addCleanup(mpd.close)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            run_bounded(self, follower, mpd, sleep=lambda s: None,
+                        should_stop=lambda: mpd.commands.count("pause 0") >= resumes)
+        return [c for c in mpd.commands if c.startswith("pause")], ctl.calls
+
+    def test_song_handed_over_held_during_the_takeover_needs_no_extra_pause(self):
+        # The receiver saw MPD paused (our gate) and handed over held: (pause, new songid),
+        # read only after the takeover returned. One takeover, no extra pause 1.
+        pauses, calls = self.gate_until_resumed([("play", "1"), ("pause", "2", 0.0)])
+        self.assertEqual(pauses, ["pause 1", "pause 0"])
+        self.assertEqual(calls.count("ensure_playing"), 1)
+        self.assertNotIn("ensure_playing(no wake)", calls)
+
+    def test_song_handed_over_held_just_after_our_resume_is_resumed_again(self):
+        # The receiver read MPD paused, then our pause 0 went out, then its list paused MPD at
+        # the song: seen right after our pause 0 (the gate still resuming) or as the next
+        # event (the gate already ended on the silence).
+        for when in ("now", "next"):
+            with self.subTest(when=when):
+                pauses, calls = self.gate_until_resumed([("play", "1")], ("2", when), resumes=2)
+                self.assertEqual(pauses, ["pause 1", "pause 0", "pause 0"])
+                self.assertEqual(calls.count("ensure_playing"), 1)
+                self.assertNotIn("ensure_playing(no wake)", calls)
 
     def test_failed_takeover_in_the_gate_resumes_mpd_right_away(self):
         ctl = RecordingController()
