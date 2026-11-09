@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Smoke test of the assembled Home Assistant app folder: builds its image for
+# Smoke test of the assembled Home Assistant app folder: checks the option
+# validator against config.yaml (host, no Docker), builds the image for
 # linux/amd64 the way the Supervisor does (docker build of the folder with
 # BUILD_VERSION/BUILD_ARCH), runs it with test options and checks that all four
 # services come up and stay up, run as their own users, listen where they
-# should, and get the options as environment.
+# should, get the options as environment and cannot read the Supervisor token;
+# that the PoToken helper mints a token; and that an invalid option stops the
+# app with one clear error.
 #
-# Nothing reaches the LAN: the container runs on its own Docker bridge network
-# (no host networking, no published ports), so the receiver's SSDP and the
-# adapter's discovery stay inside it. The adapter finds no speaker there and
-# must keep running anyway.
+# Nothing is announced on the LAN: the container runs on its own Docker bridge
+# network (no host networking, no published ports), so the receiver's SSDP and
+# the adapter's discovery stay inside it. The adapter finds no speaker there and
+# must keep running anyway. The bridge network does NAT the container out to the
+# internet: the image build needs it (Debian packages), and so does the PoToken
+# check (POST /get_pot makes the helper fetch BotGuard from YouTube/Google
+# through its restricted Deno permissions).
 #
 # Everything created here (buildx builder and its cache, image, containers,
 # network, temp dir, a pulled buildkit image) is removed on exit.
@@ -60,6 +66,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+step "option validator matches config.yaml's schema (host)"
+python3 -I "$root/scripts/ha_options_test.py"
+
 step "build $PLATFORM image from $dir (version $version)"
 # A builder of its own keeps the build cache out of the default builder.
 builder="$run_id"
@@ -91,7 +100,7 @@ start_app() {
 # In-container checks, written in Python (the image has python3, not procps).
 # Prints PASS/FAIL lines; exits 1 if any check fails.
 cat > "$tmp/check.py" <<'PY'
-import json, os, pwd, socket, sys, time, urllib.request, wave
+import json, os, pwd, socket, subprocess, sys, time, urllib.error, urllib.request, wave
 
 mode = sys.argv[1]
 expect = json.loads(sys.argv[2])
@@ -101,6 +110,26 @@ def check(ok, what):
     print(("PASS " if ok else "FAIL ") + what)
     if not ok:
         failed.append(what)
+
+# Mints a PoToken for a placeholder content binding: the helper fetches BotGuard
+# from YouTube/Google within its --allow-net list. The token is not printed.
+if mode == "pot":
+    binding = "smoke-test-placeholder"
+    request = urllib.request.Request("http://127.0.0.1:4416/get_pot",
+                                     data=json.dumps({"content_binding": binding}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=240) as r:
+            status, body = r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        status, body = e.code, json.loads(e.read() or b"{}")
+    except Exception as e:
+        status, body = repr(e), {}
+    token = body.get("poToken") or ""
+    check(status == 200 and len(token) > 20 and body.get("contentBinding") == binding,
+          "PoToken helper mints a token on POST /get_pot (HTTP %s, %d chars%s)"
+          % (status, len(token), ", error %r" % body["error"][:200] if "error" in body else ""))
+    sys.exit(1 if failed else 0)
 
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -236,6 +265,18 @@ if mode == "full":
     check(st is not None and st.st_mode & 0o077 == 0 and user_of(st.st_uid) == "ytcast",
           "receiver keeps its config private under /data/ytcast")
 
+    # with-contenv keeps the container's environment in files; the services'
+    # users must not be able to read the Supervisor token from there.
+    envdir = "/run/s6/container_environment"
+    token_file = envdir + "/SUPERVISOR_TOKEN"
+    check(os.path.isfile(token_file) and os.stat(envdir).st_mode & 0o077 == 0,
+          "%s holds SUPERVISOR_TOKEN and is private to root" % envdir)
+    for user in sorted(set(users.values())):
+        r = subprocess.run(["/command/s6-setuidgid", user, "cat", token_file],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        check(r.returncode != 0 and b"smoke-test-dummy-token" not in r.stdout,
+              "%s cannot read %s (exit %d)" % (user, token_file, r.returncode))
+
 if "receiver" in pids:
     env = ps[pids["receiver"]][2]
     for key, value in expect.get("receiver_env", {}).items():
@@ -292,6 +333,12 @@ expect_main='{"cast_name": "Smoke Test",
 wait_for_checks "$main" full "$expect_main"
 first_pids="$(pids_of "$main")"
 
+step "run 1: PoToken helper mints a token (needs internet from the container)"
+docker exec "$main" python3 -I /tmp/check.py pot '{}' || {
+  echo "--- container log ($main)"; docker logs "$main" 2>&1 | tail -40
+  die "the PoToken helper did not mint a token"
+}
+
 step "services stay up for ${STABLE_S}s (no restart loop)"
 sleep "$STABLE_S"
 wait_for_checks "$main" full "$expect_main" >/dev/null
@@ -301,7 +348,7 @@ logs="$(docker logs "$main" 2>&1)"
 grep -q "Starting Raumfeld adapter" <<<"$logs" || die "adapter start not logged"
 grep -q "DeviceNotFound" <<<"$logs" || die "adapter did not log the missing speaker"
 echo "PASS adapter logged the missing speaker and kept running"
-if grep -E "exited with code|Traceback" <<<"$logs"; then die "a service failed (see above)"; fi
+if grep -E "exited with code|exited \(code|Traceback" <<<"$logs"; then die "a service failed (see above)"; fi
 echo "PASS no service exit or traceback in the log"
 echo "--- container log excerpt (run 1)"
 grep -E "Starting|\[init\]|SSDP|DIAL server|raumfeld_adapter|WARN|ERROR" <<<"$logs" | cut -c1-200 | head -40
@@ -315,5 +362,28 @@ start_app "$second" '{"cast_name": "Smoke Test 2",
 wait_for_checks "$second" env '{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
   "adapter_env": {"STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "LOG_LEVEL": "WARNING"},
   "adapter_env_absent": ["START_GATE_SECONDS", "STUCK_SECONDS"]}'
+
+step "run 3: an invalid option stops the app with one clear error"
+bad="$run_id-bad"
+start_app "$bad" '{"cast_name": "Bad <name>",
+  "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+  "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
+  "log_level": "info"}'
+deadline=$((SECONDS + 60))
+until [ "$(docker inspect -f '{{.State.Status}}' "$bad")" = exited ]; do
+  [ "$SECONDS" -lt "$deadline" ] || { docker logs "$bad" 2>&1 | tail -40; die "the app did not stop within 60s"; }
+  sleep 2
+done
+bad_logs="$(docker logs "$bad" 2>&1)"
+bad_code="$(docker inspect -f '{{.State.ExitCode}}' "$bad")"
+echo "--- container log (run 3)"
+cut -c1-200 <<<"$bad_logs"
+[ "$bad_code" != 0 ] || die "the app stopped with exit code 0"
+echo "PASS the app stopped (exit code $bad_code), no restart loop"
+[ "$(grep -c "option 'cast_name' is invalid" <<<"$bad_logs")" = 1 ] || die "no single error naming cast_name"
+grep -qF 'must match ^[^<>&"\x00-\x1f]{1,60}$' <<<"$bad_logs" || die "the error does not show the rule as written"
+echo "PASS one error names the invalid option and shows its rule"
+if grep -E "Starting " <<<"$bad_logs"; then die "a service started on invalid options"; fi
+echo "PASS no service started"
 
 step "smoke test passed"
