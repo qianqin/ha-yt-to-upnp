@@ -476,11 +476,11 @@ expect_fatal "$run_id-link" '{"cast_name": "Smoke Test",
   "/data/adapter is a symbolic link; remove it and start the app again" adapter
 # The link's target in the stopped container must be untouched: still root's
 # world-writable sticky /tmp, not the adapter's 0700 directory.
-tmp_entry="$(docker cp "$run_id-link:/tmp" - | tar -tvf - | head -1)" || true
-case "$tmp_entry" in
-  drwxrwxrwt*root*) ;;
-  *) die "the link's target /tmp was changed: $tmp_entry" ;;
-esac
-echo "PASS the link's target was left alone ($tmp_entry)"
+tmp_entry="$(docker cp "$run_id-link:/tmp" - | python3 -I -c 'import io, sys, tarfile
+# Read it all, so docker cp never writes into a closed pipe.
+m = tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read())).next()
+print("mode %o uid %d gid %d" % (m.mode, m.uid, m.gid))')"
+[ "$tmp_entry" = "mode 1777 uid 0 gid 0" ] || die "the link's target /tmp was changed: $tmp_entry"
+echo "PASS the link's target was left alone (/tmp: $tmp_entry)"
 
 step "smoke test passed"
