@@ -576,6 +576,7 @@ class Controller:
         # stream; "" if none (standby, no zone, nothing loaded).
         self._source_before = ""
         self._lookups = 0  # devices looked for so far
+        self._wake_s = 0.0  # the current takeover's wait for the room to wake
         self.last_takeover = TakeoverStats(wake_s=0.0, lookups=0)
 
     def warm_up(self):
