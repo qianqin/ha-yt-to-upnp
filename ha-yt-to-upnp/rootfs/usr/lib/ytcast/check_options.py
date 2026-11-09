@@ -18,7 +18,13 @@ import sys
 SCHEMA = {
     "cast_name": 'match(^[^<>&"\\x00-\\x1f]{1,60}$)',
     "raumfeld_room_udn": "match(^uuid:[0-9A-Za-z-]{1,64}$)",
-    "raumfeld_speaker_udn": "match(^uuid:[0-9A-Za-z-]{1,64}$)",
+    "raumfeld_speaker_udn": "match(^uuid:[0-9A-Za-z-]{1,64}$)?",
+    "raumfeld_host": (
+        "match(^(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}"
+        "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+        "|(?=.{1,253}$)(?=[0-9.]*[A-Za-z-])[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+        "(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$)?"
+    ),
     "stream_host": "match(^[0-9A-Za-z.-]{1,253}$)?",
     "start_gate_seconds": "int(0,60)?",
     "stuck_seconds": "int(1,300)?",
@@ -44,14 +50,22 @@ def _rule_problem(rule, value):
     return "must be one of %s" % ", ".join(arg.split("|"))
 
 
+def _is_set(options, name):
+    return options.get(name) not in (None, "")
+
+
 def problem(options):
     """The first problem with the options as one line, or None if they are valid."""
     if not isinstance(options, dict):
         return "options are not a JSON object"
+    # The adapter finds the Raumfeld host by the speaker's UDN unless it is given
+    # the host; config.yaml's schema can't express this condition.
+    if not _is_set(options, "raumfeld_speaker_udn") and not _is_set(options, "raumfeld_host"):
+        return "option 'raumfeld_speaker_udn' is required when raumfeld_host is not set"
     for name, rule in SCHEMA.items():
         optional = rule.endswith("?")
         value = options.get(name)
-        if value is None or value == "":
+        if not _is_set(options, name):
             if optional:
                 continue
             return "option '%s' is required but not set" % name

@@ -1,5 +1,5 @@
 name: YouTube to UPnP
-version: "0.1.0"
+version: "0.2.0"
 slug: yt_to_upnp
 description: >-
   YouTube Music cast receiver (DIAL + Lounge API) that plays through MPD's
@@ -23,7 +23,12 @@ schema:
   # The receiver writes the name unescaped into its DIAL device description.
   cast_name: 'match(^[^<>&"\x00-\x1f]{1,60}$)'
   raumfeld_room_udn: match(^uuid:[0-9A-Za-z-]{1,64}$)
-  raumfeld_speaker_udn: match(^uuid:[0-9A-Za-z-]{1,64}$)
+  # Required unless raumfeld_host is set; the schema can't say so, the start
+  # check (rootfs/usr/lib/ytcast/check_options.py) does.
+  raumfeld_speaker_udn: match(^uuid:[0-9A-Za-z-]{1,64}$)?
+  # The adapter's RAUMFELD_HOST rules: an IPv4 address (digits and dots only must
+  # be one) or a DNS name; no port, scheme or path.
+  raumfeld_host: 'match(^(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|(?=.{1,253}$)(?=[0-9.]*[A-Za-z-])[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$)?'
   stream_host: match(^[0-9A-Za-z.-]{1,253}$)?
   start_gate_seconds: int(0,60)?
   stuck_seconds: int(1,300)?

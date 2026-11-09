@@ -28,6 +28,18 @@ VALID = {
     "log_level": "info",
 }
 
+# raumfeld_host as the adapter takes it (adapter/raumfeld_adapter.py, _raumfeld_host):
+# an IPv4 address (a value of digits and dots must be one; no leading zeros) or a
+# DNS name of 1-63 character labels, 253 characters at most.
+GOOD_HOSTS = ["192.0.2.20", "0.0.0.0", "255.255.255.255", "raumfeld-host.local", "speaker",
+              "a" * 63, ".".join(["a" * 63] * 3) + "." + "a" * 61, "1-2.3", "x1.example",
+              "1.2.3.4.example", "9host"]
+BAD_HOSTS = ["256.1.1.1", "1.2.3", "1.2.3.4.5", "01.2.3.4", "1..2.3", "192.0.2.20.",
+             "host:47365", "http://host", "host/path", "a b", "-host", "host-", "a.-b", "a_b",
+             "a" * 64, "x.", ".x", ".".join(["a" * 63] * 4), "h\u00f6st", "1.2.3.4/24"]
+# The adapter strips surrounding whitespace; the option must not have any.
+PADDED_HOSTS = [" host", "host\n", "192.0.2.20 "]
+
 
 def config_schema():
     """The schema block of config.yaml as {option: type string}."""
@@ -60,6 +72,23 @@ class SchemaInStep(unittest.TestCase):
         self.assertEqual(check_options.SCHEMA, config_schema())
 
 
+class AdapterAgreesOnRaumfeldHost(unittest.TestCase):
+    def test_option_accepts_exactly_what_the_adapter_accepts(self):
+        sys.path.insert(0, os.path.join(ROOT, "adapter"))
+        try:
+            import raumfeld_adapter
+        finally:
+            sys.path.pop(0)
+        for host in GOOD_HOSTS + BAD_HOSTS:
+            try:
+                raumfeld_adapter._raumfeld_host({"RAUMFELD_HOST": host})
+                adapter_ok = True
+            except raumfeld_adapter.ConfigError:
+                adapter_ok = False
+            option_ok = problem(dict(VALID, raumfeld_host=host)) is None
+            self.assertEqual(option_ok, adapter_ok, host)
+
+
 class Valid(unittest.TestCase):
     def test_required_options_only(self):
         self.assertIsNone(problem(VALID))
@@ -74,6 +103,18 @@ class Valid(unittest.TestCase):
             options = dict(VALID, stream_host=unset, start_gate_seconds=None)
             self.assertIsNone(problem(options))
 
+    def test_raumfeld_host(self):
+        for host in GOOD_HOSTS:
+            self.assertIsNone(problem(dict(VALID, raumfeld_host=host)), host)
+
+    def test_raumfeld_host_makes_the_speaker_udn_optional(self):
+        for unset in (None, ""):
+            options = dict(VALID, raumfeld_host="192.0.2.20", raumfeld_speaker_udn=unset)
+            self.assertIsNone(problem(options))
+        options = dict(VALID, raumfeld_host="192.0.2.20")
+        del options["raumfeld_speaker_udn"]
+        self.assertIsNone(problem(options))
+
     def test_bounds(self):
         self.assertIsNone(problem(dict(VALID, start_gate_seconds=60, stuck_seconds=1)))
         self.assertIsNone(problem(dict(VALID, cast_name="x" * 60)))
@@ -87,12 +128,33 @@ class Invalid(unittest.TestCase):
 
     def test_missing_required(self):
         for key in VALID:
+            if key == "raumfeld_speaker_udn":
+                continue
             for unset in (None, ""):
                 options = dict(VALID, **{key: unset})
                 self.assertProblem(options, key)
             options = dict(VALID)
             del options[key]
             self.assertProblem(options, key)
+
+    def test_speaker_udn_required_without_raumfeld_host(self):
+        for unset in (None, ""):
+            for host in (None, ""):
+                message = problem(dict(VALID, raumfeld_speaker_udn=unset, raumfeld_host=host))
+                self.assertIsNotNone(message)
+                self.assertIn("'raumfeld_speaker_udn'", message)
+                self.assertIn("raumfeld_host", message)
+        options = dict(VALID)
+        del options["raumfeld_speaker_udn"]
+        self.assertProblem(options, "raumfeld_speaker_udn")
+
+    def test_speaker_udn_checked_with_raumfeld_host(self):
+        self.assertProblem(dict(VALID, raumfeld_host="192.0.2.20", raumfeld_speaker_udn="uuid:"),
+                           "raumfeld_speaker_udn")
+
+    def test_raumfeld_host_rejects_what_the_adapter_rejects(self):
+        for bad in BAD_HOSTS + PADDED_HOSTS + [5]:
+            self.assertProblem(dict(VALID, raumfeld_host=bad), "raumfeld_host")
 
     def test_cast_name(self):
         for bad in ("a<b", "a>b", "a&b", 'a"b', "a\nb", "a\tb", "a\x00b", "x" * 61, "name\n", 5):
@@ -130,6 +192,14 @@ class CommandLine(unittest.TestCase):
                 f.write(content)
             return subprocess.run([sys.executable, "-I", CHECKER, path],
                                   capture_output=True, text=True)
+
+    def test_missing_speaker_udn_without_raumfeld_host_exits_1(self):
+        options = dict(VALID)
+        del options["raumfeld_speaker_udn"]
+        r = self.run_checker(json.dumps(options))
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(len(r.stdout.splitlines()), 1)
+        self.assertIn("'raumfeld_speaker_udn'", r.stdout)
 
     def test_valid_options_exit_0_silently(self):
         r = self.run_checker(json.dumps(VALID))
