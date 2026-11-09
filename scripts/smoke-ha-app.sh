@@ -268,9 +268,11 @@ if mode == "full":
           "receiver keeps its config private under /data/ytcast")
 
     # The pre-roll's endless silence, fetched by MPD at http://localhost:8008/silence.
-    # curl ends it after 2 s (exit 28); what arrived must be zero samples.
+    # It is not paced, so curl reads it at a capped rate and ends it after 2 s
+    # (exit 28); what arrived must be zero samples.
     def silence(host):
-        r = subprocess.run(["curl", "-sS", "--max-time", "2", "-o", "/tmp/silence.raw",
+        r = subprocess.run(["curl", "-sS", "--max-time", "2", "--limit-rate", "256k",
+                            "-o", "/tmp/silence.raw",
                             "-w", "%{http_code} %{content_type}",
                             "http://%s:8008/silence" % host],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
