@@ -169,7 +169,9 @@ multicast and the Raumfeld's UPnP).
 
 ### Build the folder
 
-From the repository root, on a clean, committed tree:
+From the repository root; `ha-yt-to-upnp/` must be committed (the script
+refuses uncommitted or untracked changes there and takes the folder from
+`HEAD` with `git archive`):
 
 ```sh
 scripts/build-ha-app.sh                      # receiver 7a699f5, adapter 556d421
@@ -181,19 +183,20 @@ The result is `dist/ha-yt-to-upnp/` (gitignored): the app folder files plus
 
 | Artefact | Built from | Verified by |
 | --- | --- | --- |
-| `ytcast-lite` | receiver at `--receiver-ref`, `git archive` into a temp dir, `cargo build --locked --release --target x86_64-unknown-linux-gnu` in a temporary `rust:<channel>-bookworm` container (`--platform linux/amd64`, `protoc` installed in it) | `Cargo.lock` (`--locked`), ELF x86-64 check |
+| `ytcast-lite` | receiver at `--receiver-ref`, `git archive` into a temp dir, `cargo build --locked --release --target x86_64-unknown-linux-gnu` in a temporary `rust:1.99.1-bookworm` container pinned by digest (`--platform linux/amd64`; `protoc` from Debian bookworm installed in it, not pinned, its version recorded) | `Cargo.lock` (`--locked`), the receiver's `rust-toolchain.toml` channel must equal the image's (`RUST_CHANNEL`), ELF x86-64 check |
 | `adapter/raumfeld_adapter.py` | `adapter/raumfeld_adapter.py` at `--adapter-ref` (stdlib only) | git commit |
 | `deno` | Deno 2.9.8 release zip for `x86_64-unknown-linux-gnu` | SHA-256 pinned in the script |
-| `bgutil/` | bgutil-ytdlp-pot-provider server at commit `26475e9` (tag 2.0.2), `npm ci --omit=dev --ignore-scripts` and `deno cache --frozen src/main.ts` in a temporary pinned `node` container (`--platform linux/amd64`), Deno cache under `bgutil/.deno` for the image path `/opt/bgutil` | commit hash, `package-lock.json` integrity hashes, `deno.lock` |
-| `BUILD-INFO` | resolved commits, images and SHA-256 of every artefact | |
+| `bgutil/` | bgutil-ytdlp-pot-provider server at commit `26475e9` (tag 2.0.2), `npm ci --omit=dev --ignore-scripts` and `deno cache --frozen src/main.ts` in a temporary pinned `node` container (`--platform linux/amd64`), Deno cache under `bgutil/.deno` for the image path `/opt/bgutil` | commit hash, `package-lock.json` integrity hashes, `deno.lock`; no native build output (`*.node`, `node_modules/canvas/build`) |
+| `BUILD-INFO` | `HEAD` commit of the app folder, resolved commits, build images with digests, `protoc` version and SHA-256 of every artefact | |
 
 The script fails closed on any checksum or commit mismatch, refuses to replace
 an `--out` folder that is not a previous build, and removes its temp dir,
 containers, the target volume and every image it had to pull. The amd64 Rust
 build runs emulated on Apple Silicon and takes a while.
 
-The app folder files are copied from the working tree (tracked files only);
-`BUILD-INFO` records `git describe --dirty`, so build from a committed tree.
+To move to another Rust release, update `RUST_CHANNEL` and `RUST_IMAGE`
+(`docker buildx imagetools inspect rust:<channel>-bookworm` shows the index
+digest) together with the receiver's `rust-toolchain.toml`.
 
 ### Smoke test
 
@@ -201,24 +204,36 @@ The app folder files are copied from the working tree (tracked files only);
 scripts/smoke-ha-app.sh                      # tests dist/ha-yt-to-upnp
 ```
 
-It builds the image from the assembled folder for `linux/amd64` the way the
-Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
+It first runs `scripts/ha_options_test.py` on the host: the option check the
+app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
+exactly the schema in `config.yaml` and accepts and rejects the right values.
+Then it builds the image from the assembled folder for `linux/amd64` the way
+the Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
 `config.yaml`, `BUILD_ARCH=amd64`) in a buildx builder of its own, and runs it
 on a temporary Docker bridge network: **no host networking and no published
-ports**, so nothing is announced on the LAN. With test options (placeholder
-UDNs, cast name `Smoke Test`) it checks that MPD answers on `127.0.0.1:6600`
-(and not on the container's address); while MPD plays a generated second of
-silence (MPD opens its httpd output only when it plays) the stream answers on
-port 8000 as `audio/mpeg`; the receiver serves its DIAL device description on
-8008 with the configured name; the PoToken helper answers `/ping` on
-`127.0.0.1:4416` only; every service runs as its own non-root user and does
-not get the (dummy) `SUPERVISOR_TOKEN` the container is started with; the
-options arrive as the expected environment (auto-detected and explicit
-`stream_host`, unset optional timings); the adapter logs that it finds no
-speaker and keeps running; and no service restarts within 20 s. The checks run
-in the container through `docker exec --privileged` (reading other users'
-`/proc` entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it removes the containers, network, image, builder (with its
-cache) and the buildkit image if it pulled it.
+ports**, so nothing is announced on the LAN. The bridge network does reach the
+internet through Docker's NAT, and the smoke test needs that: for the image
+build (Debian packages) and for the PoToken check below.
+
+With test options (placeholder UDNs, cast name `Smoke Test`) it checks that
+MPD answers on `127.0.0.1:6600` (and not on the container's address); while
+MPD plays a generated second of silence (MPD opens its httpd output only when
+it plays) the stream answers on port 8000 as `audio/mpeg`; the receiver
+serves its DIAL device description on 8008 with the configured name; the
+PoToken helper answers `/ping` on `127.0.0.1:4416` only and mints a token on
+`POST /get_pot` for a placeholder content binding (this fetches BotGuard from
+YouTube/Google through the helper's restricted Deno permissions); every
+service runs as its own non-root user, does not get the (dummy)
+`SUPERVISOR_TOKEN` the container is started with and cannot read it from
+`/run/s6/container_environment`; the options arrive as the expected
+environment (auto-detected and explicit `stream_host`, unset optional
+timings); the adapter logs that it finds no speaker and keeps running; no
+service restarts within 20 s; and an invalid `cast_name` stops the app with
+one error naming the option, before any service starts. The checks run in the
+container through `docker exec --privileged` (reading other users' `/proc`
+entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it
+removes the containers, network, image, builder (with its cache) and the
+buildkit image if it pulled it.
 
 Run `shellcheck` on the scripts if it is installed:
 
@@ -264,5 +279,17 @@ as a whole.
    rebuilds the image and restarts the app. Options and `/data` are kept.
    Without a version bump, use **Rebuild** on the app's page instead.
 
-Rollback: build the previous commit's folder (same refs as recorded in its
-`BUILD-INFO`) with a version above the broken one, copy it and update.
+Rollback: revert the broken change in a new commit (`git revert`) that also
+bumps `version` above the broken one and adds a `CHANGELOG.md` entry, build
+the folder from that commit with the receiver and adapter refs of the last
+good `BUILD-INFO`, run the smoke test, copy it and update.
+
+### Open follow-ups
+
+- MPD's control port has no password (see the app's `DOCS.md`, Known
+  limitations). Adding one needs password support in the receiver (`MPD_HOST`
+  / `MPD_PASSWORD`) and in the adapter; then the app can generate a random
+  password under `/data` at first start and set `password` and
+  `default_permissions ""` in MPD's configuration.
+- The receiver writes `cast_name` unescaped into its DIAL device description;
+  the schema forbids `<`, `>`, `&` and `"` until it escapes the name.
