@@ -17,11 +17,22 @@ if ! problem="$(python3 -I /usr/lib/ytcast/check_options.py /data/options.json)"
 fi
 
 # Persistent state under /data, private to the user of each service (the adapter
-# also warns about a state directory others can write to).
+# also warns about a state directory others can write to). Only the directories
+# are set up: the services create their own files in them. A symlink in their
+# place would make the chown and chmod below act on whatever it points to.
 # shellcheck source=SCRIPTDIR/../../../usr/lib/ytcast/common.sh
 source /usr/lib/ytcast/common.sh
-mkdir -p /data/ytcast /data/mpd/music /data/mpd/playlists "${YTCAST_ADAPTER_STATE_DIR}"
-chown -R ytcast:ytcast /data/ytcast
-chown -R mpd: /data/mpd
-chown -R adapter:adapter "${YTCAST_ADAPTER_STATE_DIR}"
-chmod 0700 /data/ytcast /data/mpd "${YTCAST_ADAPTER_STATE_DIR}"
+state_dir() {
+    local dir="$1" owner="$2"
+    if [ -L "${dir}" ]; then
+        bashio::exit.nok "${dir} is a symbolic link; remove it and start the app again"
+    fi
+    mkdir -p "${dir}"
+    chown "${owner}:" "${dir}"  # and its login group
+    chmod 0700 "${dir}"
+}
+state_dir /data/ytcast ytcast
+state_dir /data/mpd mpd
+state_dir /data/mpd/music mpd
+state_dir /data/mpd/playlists mpd
+state_dir "${YTCAST_ADAPTER_STATE_DIR}" adapter
