@@ -85,12 +85,14 @@ network="$run_id"
 docker network create "$network" >/dev/null
 
 # Starts a container with the given options.json (copied in before the start,
-# as the Supervisor provides /data/options.json).
+# as the Supervisor provides /data/options.json). An optional third argument
+# names an entry under /data to put there as a symbolic link to /tmp.
 start_app() {
-  local name="$1" options="$2"
+  local name="$1" options="$2" link="${3:-}"
   containers="$containers $name"
   mkdir -p "$tmp/$name/data"
   printf '%s\n' "$options" > "$tmp/$name/data/options.json"
+  [ -z "$link" ] || ln -s /tmp "$tmp/$name/data/$link"
   # The Supervisor puts its token into every app's environment; the services
   # must not get it.
   docker create --name "$name" --platform "$PLATFORM" --network "$network" \
@@ -102,7 +104,7 @@ start_app() {
 # In-container checks, written in Python (the image has python3, not procps).
 # Prints PASS/FAIL lines; exits 1 if any check fails.
 cat > "$tmp/check.py" <<'PY'
-import json, os, pwd, socket, subprocess, sys, time, urllib.error, urllib.request, wave
+import json, os, pwd, socket, stat, subprocess, sys, time, urllib.error, urllib.request, wave
 
 mode = sys.argv[1]
 expect = json.loads(sys.argv[2])
@@ -291,10 +293,14 @@ if mode == "full":
     check(answer.startswith("403") and not body,
           "receiver refuses /silence on %s:8008 (%s)" % (ip, answer))
 
-    st = os.stat("/data/adapter") if os.path.isdir("/data/adapter") else None
-    check(st is not None and st.st_mode & 0o777 == 0o700 and user_of(st.st_uid) == "adapter",
-          "/data/adapter exists, mode 0700, owned by adapter (%s)"
-          % ((oct(st.st_mode & 0o777), user_of(st.st_uid)) if st else "missing",))
+    for path, owner in (("/data/adapter", "adapter"), ("/data/ytcast", "ytcast"),
+                        ("/data/mpd", "mpd"), ("/data/mpd/music", "mpd"),
+                        ("/data/mpd/playlists", "mpd")):
+        st = os.lstat(path) if os.path.lexists(path) else None
+        ok = st is not None and stat.S_ISDIR(st.st_mode)
+        check(ok and st.st_mode & 0o777 == 0o700 and user_of(st.st_uid) == owner,
+              "%s is a directory, mode 0700, owned by %s (%s)"
+              % (path, owner, (oct(st.st_mode & 0o777), user_of(st.st_uid)) if ok else "missing"))
 
     # with-contenv keeps the container's environment in files; the services'
     # users must not be able to read the Supervisor token from there.
@@ -426,8 +432,8 @@ echo "PASS no service exit, configuration error or traceback in the log"
 # Starts the app with invalid options; it must stop (no restart loop) with one
 # FATAL line naming the option, before any service starts.
 expect_fatal() {
-  local name="$1" options="$2" message="$3" deadline=$((SECONDS + 60)) logs code
-  start_app "$name" "$options"
+  local name="$1" options="$2" message="$3" link="${4:-}" deadline=$((SECONDS + 60)) logs code
+  start_app "$name" "$options" "$link"
   until [ "$(docker inspect -f '{{.State.Status}}' "$name")" = exited ]; do
     [ "$SECONDS" -lt "$deadline" ] || { docker logs "$name" 2>&1 | tail -40; die "the app did not stop within 60s"; }
     sleep 2
@@ -462,5 +468,19 @@ step "run 5: neither raumfeld_speaker_udn nor raumfeld_host stops the app with o
 expect_fatal "$run_id-nohost" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "log_level": "info"}' "option 'raumfeld_speaker_udn' is required when raumfeld_host is not set"
+
+step "run 6: a symbolic link at /data/adapter stops the app with one clear error"
+expect_fatal "$run_id-link" '{"cast_name": "Smoke Test",
+  "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+  "raumfeld_host": "192.0.2.20", "log_level": "info"}' \
+  "/data/adapter is a symbolic link; remove it and start the app again" adapter
+# The link's target in the stopped container must be untouched: still root's
+# world-writable sticky /tmp, not the adapter's 0700 directory.
+tmp_entry="$(docker cp "$run_id-link:/tmp" - | tar -tvf - | head -1)" || true
+case "$tmp_entry" in
+  drwxrwxrwt*root*) ;;
+  *) die "the link's target /tmp was changed: $tmp_entry" ;;
+esac
+echo "PASS the link's target was left alone ($tmp_entry)"
 
 step "smoke test passed"
