@@ -472,6 +472,16 @@ class ControllerTest(unittest.TestCase):
         self.ctl.ensure_playing()  # the first cast looks again
         self.assertEqual(self.rf.transport_state, "PLAYING")
 
+    def test_takeover_reports_its_wake_wait_and_discoveries(self):
+        self.rf.wake_after_polls = 2
+        self.ctl.ensure_playing()
+        self.assertEqual(self.ctl.last_takeover,
+                         ra.TakeoverStats(wake_s=2 * ra.WAKE_POLL_S, lookups=2))
+        self.rf.power, self.rf.transport_state = "MANUAL_STANDBY", "STOPPED"
+        self.ctl.ensure_playing()  # everything cached now
+        self.assertEqual(self.ctl.last_takeover,
+                         ra.TakeoverStats(wake_s=2 * ra.WAKE_POLL_S, lookups=0))
+
     def test_a_moved_renderer_is_discovered_again_and_the_takeover_goes_on(self):
         self.rf.power = "ACTIVE"
         with self.assertLogs("raumfeld_adapter", "INFO"):

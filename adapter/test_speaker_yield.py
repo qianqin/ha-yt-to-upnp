@@ -480,7 +480,9 @@ class StartGateScenarioTest(unittest.TestCase):
         self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
         self.follower.on_mpd_state("play", "1")  # our pause 0
         self.rf.requests.clear()
-        self.follower.on_mpd_state("play", "2")  # the song arrives; the stream goes on
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.follower.on_mpd_state("play", "2")  # the song arrives; the stream goes on
+        self.assertTrue(any("speaker already playing" in m for m in logs.output), logs.output)
         self.assertEqual(self.follower.take_mpd_requests(), [])  # no pause: no gate
         self.assertIsNone(self.follower._gate)
         self.assertNotIn("leaveStandby", self.rf.api_calls())

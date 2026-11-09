@@ -544,6 +544,10 @@ def soap_call(control_url, action, args):
 _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
 
 
+# What the last takeover took: its wait for the room to wake, and how many devices it had to
+# look for (SSDP, or resolving RAUMFELD_HOST) instead of finding them cached.
+TakeoverStats = namedtuple("TakeoverStats", "wake_s lookups")
+
 # What one inspection of the room found; status is None unless the room is active in a zone.
 _Room = namedtuple("_Room", "api zone power status")
 
@@ -571,6 +575,8 @@ class Controller:
         # The URI the zone held when the last takeover (not a re-takeover) set up our
         # stream; "" if none (standby, no zone, nothing loaded).
         self._source_before = ""
+        self._lookups = 0  # devices looked for so far
+        self.last_takeover = TakeoverStats(wake_s=0.0, lookups=0)
 
     def warm_up(self):
         """Find the host and the room's zone renderer before the first cast, so that cast
@@ -593,6 +599,13 @@ class Controller:
         before the last takeover is left alone and OTHER_SOURCE returned: someone chose
         it since. The source before the takeover is taken over again: the speaker
         dropped our takeover."""
+        lookups, self._wake_s = self._lookups, 0.0
+        try:
+            return self._ensure_playing(wake, retake)
+        finally:
+            self.last_takeover = TakeoverStats(self._wake_s, self._lookups - lookups)
+
+    def _ensure_playing(self, wake, retake):
         room = self._inspect()
         if not wake:
             verdict = judge_speaker(room.power, room.zone, room.status, self.config.stream_url)
@@ -620,7 +633,9 @@ class Controller:
             http_get(room.api + "leaveStandby?roomUDN=" + room_param)
             if room.power != "ACTIVE":
                 # What was seen before the wake may belong to a speaker still shutting down.
+                woken = self.clock()
                 zone = self._wait_awake(room.api, had_zone=zone is not None)
+                self._wake_s = self.clock() - woken
         zone = zone or self._connect_zone(room.api, room_param)
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
                     if self.config.stream_metadata else "")
@@ -687,6 +702,7 @@ class Controller:
             cached = self._api is not None
             try:
                 if not cached:
+                    self._lookups += 1
                     self._api = "http://%s:%d/" % (self.locator.api_host(), self.api_port)
                 zones = http_get(self._api + "getZones")
                 if not room_listed(zones, self.config.room_udn):
@@ -718,6 +734,7 @@ class Controller:
     def _zone_control(self, zone):
         if self._zone != zone or self._control is None:
             self._zone, self._control = zone, None
+            self._lookups += 1
             self._control = self._control_url(zone)
         return self._control
 
@@ -982,6 +999,8 @@ class _Gate:
         self.retakes = 0
         self.restarted = False  # a renderer TRANSITIONING on our stream was restarted
         self.seen = "not asked yet"  # the last renderer state, for the timeout warning
+        self.song_at = None  # when another song (the pre-roll's song) arrived
+        self.playing = False  # the gate ended because the renderer plays
 
     def fits(self, now, wake_s):
         """A takeover starting now, after a wake wait of wake_s, still has GATE_RETAKE_S
@@ -1049,6 +1068,9 @@ class Follower:
         # stopped: it never started, so nobody can have stopped it; one more takeover is
         # due before the speaker counts as taken away.
         self._unstarted = False
+        # (gate start, song, renderer played) of the last gate that ended on its first song
+        # (the pre-roll silence): the next song is logged as the cast start's song.
+        self._after_gate = None
         self.pending = None
         self.deadline = None
         self.mpd_state = None
@@ -1079,6 +1101,9 @@ class Follower:
                 return
             # The gate was ended by someone else; our own pause was no user pause.
             previous = "play"
+        after_gate, self._after_gate = self._after_gate, None
+        if after_gate and state == "play" and previous == "play":
+            self._log_song_after_gate(after_gate, songid)
         # A user change: a renderer stopped from now on is no longer ours to restart.
         self._unstarted = False
         if self.yielded:
@@ -1149,6 +1174,7 @@ class Follower:
             return True  # ours (an event that arrives late), or a phone pause we can't tell apart
         if gate.phase == _RESUMING and state == "play" and song == gate.song:
             self._gate = None  # our pause 0 landed
+            self._log_resumed(gate)
             return True
         log.info("MPD changed during the start gate (%r, song %r); leaving it as it is",
                  state, song)
@@ -1165,25 +1191,47 @@ class Follower:
         start of the new song never undoes what the user did, and the room is already being
         taken over."""
         gate = self._gate
-        gate.song = song
-        at = self.clock() - gate.started
+        gate.song, gate.song_at = song, self.clock()
+        at = gate.song_at - gate.started
         if gate.phase == _RESUMING:
-            log.info("start: song %r at +%.1f s; the gate is ending, no hold", song, at)
+            log.info("start: song %r at +%.1f s, %s: no hold", song, at,
+                     "speaker already playing" if gate.playing else "the gate gave up")
             if state == "play":
                 # The speaker plays (or the gate gave up on it): MPD playing the new song is
                 # what our pause 0 was on its way to do.
                 self._gate = None
                 self._requests = [r for r in self._requests if r != RESUME_PLAYER]
             return
-        log.info("start: song %r at +%.1f s; held until the speaker plays", song, at)
+        log.info("start: song %r at +%.1f s, speaker not playing yet: held", song, at)
         if state == "play" and PAUSE_PLAYER not in self._requests:
             # MPD went to play the song: hold it at its start until the speaker plays.
             self._requests.append(PAUSE_PLAYER)
+
+    def _log_resumed(self, gate):
+        now = self.clock()
+        held = (" (song %r held %.1f s)" % (gate.song, now - gate.song_at)
+                if gate.song_at is not None else "")
+        log.info("start: MPD resumed at +%.1f s%s", now - gate.started, held)
+        if gate.song_at is None:
+            self._after_gate = (gate.started, gate.song, gate.playing)
+
+    def _log_song_after_gate(self, after_gate, song):
+        started, first_song, playing = after_gate
+        at = self.clock() - started
+        # The receiver ends its pre-roll silence after 60 s; a later song is no cast start.
+        if song != first_song and at <= START_GATE_MAX_S:
+            log.info("start: song %r at +%.1f s, %s: no hold", song, at,
+                     "speaker already playing" if playing else "speaker not playing")
 
     def _gate_take_over(self):
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
+            stats = self.controller.last_takeover
+            log.info("start: takeover returned at +%.1f s (wake wait %.1f s, %s)",
+                     self.clock() - self._gate.started, stats.wake_s,
+                     "%d discoveries" % stats.lookups if stats.lookups
+                     else "cached addresses, no discovery")
             self._give_time()
         else:
             # The takeover failed and is retried later; never keep the phone waiting for it.
@@ -1211,7 +1259,8 @@ class Follower:
             gate.deadline = max(gate.deadline, min(gate.taken + 2 * GATE_RETAKE_S,
                                                    gate.started + START_GATE_MAX_S))
         if gate.seen == "PLAYING":  # our stream: renderer_state flags any other source
-            log.info("speaker plays; resuming MPD after %.1f s", now - gate.started)
+            gate.playing = True
+            log.info("start: speaker plays at +%.1f s; resuming MPD", now - gate.started)
             self._end_gate()
         elif gate.seen in _OTHER_SOURCE_PLAYING:
             # Someone chose another source during the gate: it is not ours to override.

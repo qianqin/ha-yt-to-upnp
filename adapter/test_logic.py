@@ -359,6 +359,7 @@ class RecordingController:
         self.renderer_s = 0
         self.retake_decision = None  # what a re-takeover finds, if not self.decision
         self.takeover_times = []  # clock at the start of each takeover
+        self.last_takeover = ra.TakeoverStats(wake_s=0.0, lookups=0)
 
     def ensure_playing(self, wake=True, retake=False):
         self.calls.append("ensure_playing(retake)" if retake else
@@ -1278,6 +1279,62 @@ class StartGateTest(unittest.TestCase):
                 self.assertEqual(self.requests(), [])  # no pause 1, and pause 0 is moot
                 self.assertNotIn("ensure_playing(no wake)", self.ctl.calls)
                 self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual
+
+    # -- what a cast start took, phase by phase (INFO)
+
+    def start_lines(self, output):
+        return [m.split(":", 2)[2] for m in output if ":start: " in m]
+
+    def test_a_cast_start_is_logged_phase_by_phase(self):
+        self.ctl.takeover_s = 2.5
+        self.ctl.last_takeover = ra.TakeoverStats(wake_s=2.1, lookups=0)
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.held("1")  # the pre-roll silence
+            self.clock.now += 0.5
+            self.f.on_mpd_state("play", "2")  # the song, 3.0 s after MPD started
+            self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+            self.f.on_mpd_state("pause", "2")
+            self.ctl.plays = True
+            self.advance(1.0)
+            self.released("2")
+        self.assertEqual(self.start_lines(logs.output), [
+            "start: takeover returned at +2.5 s (wake wait 2.1 s, cached addresses, no discovery)",
+            "start: song '2' at +3.0 s, speaker not playing yet: held",
+            "start: speaker plays at +4.0 s; resuming MPD",
+            "start: MPD resumed at +4.0 s (song '2' held 1.0 s)",
+        ])
+
+    def test_a_takeover_that_had_to_discover_says_so(self):
+        self.ctl.last_takeover = ra.TakeoverStats(wake_s=0.0, lookups=2)
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.held()
+        self.assertEqual(self.start_lines(logs.output), [
+            "start: takeover returned at +0.0 s (wake wait 0.0 s, 2 discoveries)"])
+
+    def test_a_song_after_the_gate_is_logged_with_the_speaker_already_playing(self):
+        self.held("1")
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.released("1")
+        self.clock.now = 1006.0
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("play", "2")
+        self.assertEqual(self.start_lines(logs.output), [
+            "start: song '2' at +6.0 s, speaker already playing: no hold"])
+        self.assertEqual(self.requests(), [])
+        with no_logs(self, "raumfeld_adapter", logging.INFO):
+            self.f.on_mpd_state("play", "3")  # a later song is no cast start
+
+    def test_a_song_long_after_the_gate_is_no_cast_start(self):
+        self.held("1")
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.released("1")
+        self.clock.now += ra.START_GATE_MAX_S + 1  # no pre-roll silence lasts that long
+        with no_logs(self, "raumfeld_adapter", logging.INFO):
+            self.f.on_mpd_state("play", "2")
 
     def test_user_skipping_during_the_gate_is_held_too(self):
         # Holding at the start of the new song never undoes what the user did.
