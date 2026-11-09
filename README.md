@@ -129,6 +129,8 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.99.1-bookworm bash -c \
 
 Before a release, run `scripts/release-check.sh`; see [docs/DEVOPS.md](docs/DEVOPS.md).
 
+To run it as a Home Assistant app (receiver, MPD, PoToken helper and Raumfeld adapter in one local app, built on the release machine), see [`ha-yt-to-upnp/DOCS.md`](ha-yt-to-upnp/DOCS.md) and the section *Home Assistant app* in [docs/DEVOPS.md](docs/DEVOPS.md).
+
 ## Architecture
 
 | File | Lines | Purpose |

@@ -1,7 +1,8 @@
 # DevOps
 
-There is no runtime deployment target yet. Packaging as a Home Assistant app
-comes later; its container image will also be built locally.
+The runtime deployment target is a Home Assistant **local app**, built on the
+release machine and copied to the Home Assistant host; see
+[Home Assistant app](#home-assistant-app) below. No image registry is used.
 
 There is no hosted pipeline. Every check runs locally: natively on macOS
 (Apple Silicon) and in a temporary Linux container for platform coverage.
@@ -152,3 +153,116 @@ The push to `master` succeeded, `git ls-remote origin master` matches the
 local commit, and `scripts/release-check.sh` exited 0 on that commit (macOS
 build and tests, Linux container build and tests, `cargo audit`, adapter
 tests). There is no pipeline to watch.
+
+## Home Assistant app
+
+The app folder `ha-yt-to-upnp/` (Home Assistant app layout: `config.yaml`,
+`Dockerfile`, s6-overlay services under `rootfs/`, `DOCS.md`) is completed by
+prebuilt artefacts and installed as a **local app**: the Supervisor builds its
+image on the Home Assistant host from the copied folder. That build only
+installs Debian packages (`mpd`, `python3`) on the pinned base image and copies
+files; nothing is compiled or fetched from GitHub on the host. There are no
+GitHub Actions and no image registry.
+
+Target: Home Assistant OS on x86-64 (`amd64`), host networking (SSDP/DIAL
+multicast and the Raumfeld's UPnP).
+
+### Build the folder
+
+From the repository root, on a clean, committed tree:
+
+```sh
+scripts/build-ha-app.sh                      # receiver 7a699f5, adapter 556d421
+scripts/build-ha-app.sh --receiver-ref <ref> --adapter-ref <ref> --out <dir>
+```
+
+The result is `dist/ha-yt-to-upnp/` (gitignored): the app folder files plus
+`artefacts/`:
+
+| Artefact | Built from | Verified by |
+| --- | --- | --- |
+| `ytcast-lite` | receiver at `--receiver-ref`, `git archive` into a temp dir, `cargo build --locked --release --target x86_64-unknown-linux-gnu` in a temporary `rust:<channel>-bookworm` container (`--platform linux/amd64`, `protoc` installed in it) | `Cargo.lock` (`--locked`), ELF x86-64 check |
+| `adapter/raumfeld_adapter.py` | `adapter/raumfeld_adapter.py` at `--adapter-ref` (stdlib only) | git commit |
+| `deno` | Deno 2.9.8 release zip for `x86_64-unknown-linux-gnu` | SHA-256 pinned in the script |
+| `bgutil/` | bgutil-ytdlp-pot-provider server at commit `26475e9` (tag 2.0.2), `npm ci --omit=dev --ignore-scripts` and `deno cache --frozen src/main.ts` in a temporary pinned `node` container (`--platform linux/amd64`), Deno cache under `bgutil/.deno` for the image path `/opt/bgutil` | commit hash, `package-lock.json` integrity hashes, `deno.lock` |
+| `BUILD-INFO` | resolved commits, images and SHA-256 of every artefact | |
+
+The script fails closed on any checksum or commit mismatch, refuses to replace
+an `--out` folder that is not a previous build, and removes its temp dir,
+containers, the target volume and every image it had to pull. The amd64 Rust
+build runs emulated on Apple Silicon and takes a while.
+
+The app folder files are copied from the working tree (tracked files only);
+`BUILD-INFO` records `git describe --dirty`, so build from a committed tree.
+
+### Smoke test
+
+```sh
+scripts/smoke-ha-app.sh                      # tests dist/ha-yt-to-upnp
+```
+
+It builds the image from the assembled folder for `linux/amd64` the way the
+Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
+`config.yaml`, `BUILD_ARCH=amd64`) in a buildx builder of its own, and runs it
+on a temporary Docker bridge network: **no host networking and no published
+ports**, so nothing is announced on the LAN. With test options (placeholder
+UDNs, cast name `Smoke Test`) it checks that MPD answers on `127.0.0.1:6600`
+(and not on the container's address); while MPD plays a generated second of
+silence (MPD opens its httpd output only when it plays) the stream answers on
+port 8000 as `audio/mpeg`; the receiver serves its DIAL device description on
+8008 with the configured name; the PoToken helper answers `/ping` on
+`127.0.0.1:4416` only; every service runs as its own non-root user and does
+not get the (dummy) `SUPERVISOR_TOKEN` the container is started with; the
+options arrive as the expected environment (auto-detected and explicit
+`stream_host`, unset optional timings); the adapter logs that it finds no
+speaker and keeps running; and no service restarts within 20 s. The checks run
+in the container through `docker exec --privileged` (reading other users'
+`/proc` entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it removes the containers, network, image, builder (with its
+cache) and the buildkit image if it pulled it.
+
+Run `shellcheck` on the scripts if it is installed:
+
+```sh
+shellcheck scripts/*.sh
+shellcheck -x -s bash ha-yt-to-upnp/rootfs/usr/lib/ytcast/common.sh \
+  ha-yt-to-upnp/rootfs/etc/s6-overlay/scripts/*.sh \
+  ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/run ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/finish
+```
+
+### Copy to the Home Assistant host
+
+Over SSH (the Terminal & SSH app maps the `/addons` share); `<ha-host>` is the
+Home Assistant host:
+
+```sh
+tar -C dist -cf - ha-yt-to-upnp | ssh root@<ha-host> \
+  'rm -rf /addons/ha-yt-to-upnp && tar -xf - -C /addons'
+```
+
+The Samba share app works as well: replace the folder `addons/ha-yt-to-upnp`
+as a whole.
+
+### Install
+
+1. Stop any other instance of the receiver on the LAN (only one device may
+   use the cast name).
+2. Settings → Apps → App store → ⋮ → **Check for updates**. The app appears
+   under **Local apps** (slug `local_yt_to_upnp`).
+3. Install it. The Supervisor builds the image on the host (a few minutes:
+   Debian packages).
+4. Configuration tab: set `cast_name`, `raumfeld_room_udn`,
+   `raumfeld_speaker_udn` (see `DOCS.md`), save, start. Check the log for the
+   four `Starting ...` lines.
+
+### Update
+
+1. Bump `version` in `ha-yt-to-upnp/config.yaml`, add a `CHANGELOG.md` entry,
+   commit.
+2. Build the folder and run the smoke test (above).
+3. Copy the folder to the host (above).
+4. App store → ⋮ → **Check for updates**; the app offers **Update**, which
+   rebuilds the image and restarts the app. Options and `/data` are kept.
+   Without a version bump, use **Rebuild** on the app's page instead.
+
+Rollback: build the previous commit's folder (same refs as recorded in its
+`BUILD-INFO`) with a version above the broken one, copy it and update.
