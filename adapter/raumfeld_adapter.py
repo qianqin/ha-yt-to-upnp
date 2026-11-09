@@ -877,9 +877,11 @@ class Follower:
     away. A renderer someone made play another source than the one before the takeover
     ends the gate at once: it yields (MPD stays paused, the cast is released). Its own
     pause and resume are not followed; a failed takeover lets MPD play at once and is
-    retried after PLAY_RETRY_S without the gate. A stop or another song during the gate is
-    the user's doing and is never undone; a pause from the phone during the gate can't be
-    told apart from ours (MPD is already paused, nothing changes), so it is undone."""
+    retried after PLAY_RETRY_S without the gate. Another song during the gate (the
+    receiver's song replacing its pre-roll silence, or a skip) is held at its start too,
+    the gate carrying on; a stop during the gate is the user's doing and is never undone;
+    a pause from the phone during the gate can't be told apart from ours (MPD is already
+    paused, nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
                  stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S):
@@ -983,6 +985,9 @@ class Follower:
             gate.phase, gate.song = _HOLDING, song
             self._gate_take_over()
             return True
+        if state in ("play", "pause") and song != gate.song:
+            self._gate_song_arrived(state, song)
+            return True
         if gate.phase == _PAUSING and state == "play":
             # Our pause 1 is still to go out (requeued at a reconnect) and holds whatever
             # song MPD plays by then.
@@ -999,6 +1004,28 @@ class Follower:
         if self.pending == _GATE:
             self.pending = None
         return False
+
+    def _gate_song_arrived(self, state, song):
+        """Another song during the gate: normally the receiver's song replacing its pre-roll
+        silence (MPD goes from the silence straight to the song, no stop), or a skip from
+        the phone. The gate carries on with it, timing and counters unchanged: holding at the
+        start of the new song never undoes what the user did, and the room is already being
+        taken over."""
+        gate = self._gate
+        gate.song = song
+        at = self.clock() - gate.started
+        if gate.phase == _RESUMING:
+            log.info("start: song %r at +%.1f s; the gate is ending, no hold", song, at)
+            if state == "play":
+                # The speaker plays (or the gate gave up on it): MPD playing the new song is
+                # what our pause 0 was on its way to do.
+                self._gate = None
+                self._requests = [r for r in self._requests if r != RESUME_PLAYER]
+            return
+        log.info("start: song %r at +%.1f s; held until the speaker plays", song, at)
+        if state == "play" and PAUSE_PLAYER not in self._requests:
+            # MPD went to play the song: hold it at its start until the speaker plays.
+            self._requests.append(PAUSE_PLAYER)
 
     def _gate_take_over(self):
         self.wake = True

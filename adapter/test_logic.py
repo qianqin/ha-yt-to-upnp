@@ -1129,34 +1129,117 @@ class StartGateTest(unittest.TestCase):
         self.assertNotIn("renderer_state", self.ctl.calls)
         self.assertNotIn("ensure_playing(retake)", self.ctl.calls)  # no retake either
 
-    def test_song_change_during_the_gate_is_not_overridden_and_does_not_wake(self):
-        for state in ("play", "pause"):
-            with self.subTest(state=state):
-                self.setUp()
-                self.held()
-                with self.assertLogs("raumfeld_adapter", "INFO"):
-                    self.f.on_mpd_state(state, "2")  # the phone skipped to the next song
-                self.ctl.plays = True
-                for _ in range(4):
-                    self.advance(5)
-                self.assertEqual(self.requests(), [])
-                self.assertEqual(self.ctl.calls.count("ensure_playing"), 1)
-                self.assertNotIn("ensure_playing(retake)", self.ctl.calls)
+    # -- the receiver's pre-roll: the gate starts on silence, the song replaces it (MPD goes
+    # play(silence) -> play(song), a new songid, no stop)
 
-    def test_song_change_while_our_resume_is_on_its_way_ends_the_gate(self):
-        self.held()
+    def gate_fields(self):
+        g = self.f._gate
+        return (g.phase, g.started, g.deadline, g.taken, g.retakes, g.restarted)
+
+    def test_song_arriving_during_the_gate_is_held_and_the_gate_carries_on(self):
+        self.held("1")  # the pre-roll silence
+        self.advance(ra.GATE_POLL_S)
+        gate, fields = self.f._gate, self.gate_fields()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")  # the song replaces the silence
+        self.assertIs(self.f._gate, gate)
+        self.assertEqual(gate.song, "2")
+        self.assertEqual(self.gate_fields(), fields)  # same timing and counters
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held at ~0:00 again
+        self.f.on_mpd_state("pause", "2")  # run() reports our pause 1
+        self.assertEqual(self.requests(), [])
+        # Not a takeover: no wake, no song-change takeover, the source before is kept.
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "renderer_state"])
         self.ctl.plays = True
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.advance(ra.GATE_POLL_S)
-        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
-        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
-            self.f.on_mpd_state("play", "2")  # the phone skipped right as pause 0 landed
-        # MPD-supplied values are logged with %r.
-        self.assertTrue(any("MPD changed during the start gate ('play', song '2')" in m
-                            for m in logs.output), logs.output)
+        self.released("2")
         self.assertIsNone(self.f._gate)
-        self.assertEqual(self.ctl.calls[-1], "ensure_playing(no wake)")  # a song change
         self.assertEqual(self.requests(), [])
+        self.assertEqual(self.ctl.calls, ["ensure_playing"] + ["renderer_state"] * 2)
+
+    def test_song_arriving_while_mpd_is_paused_needs_no_new_pause(self):
+        self.held("1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "2")
+        self.assertEqual(self.f._gate.song, "2")
+        self.assertEqual(self.requests(), [])
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.released("2")
+        self.assertIsNone(self.f._gate)
+
+    def test_song_arriving_before_our_pause_lands_is_held_by_it(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # sent ...
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")  # ... but the song's playid came after it
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # so pause again
+        self.assertEqual(self.ctl.calls, [])
+        self.f.on_mpd_state("pause", "2")
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.assertEqual(self.f._gate.phase, ra._HOLDING)
+
+    def test_song_arriving_while_our_pause_still_waits_to_go_out_is_not_paused_twice(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.f.requeue_mpd_requests(self.requests())  # lost connection before pause 1 went out
+        self.f.on_mpd_connected()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+
+    def test_song_arriving_keeps_the_retakes_and_the_unstarted_takeover(self):
+        self.held("1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            while "ensure_playing(retake)" not in self.ctl.calls:
+                self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.f._gate.retakes, 1)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")
+        self.assertEqual(self.f._gate.retakes, 1)
+        self.f.on_mpd_state("pause", "2")
+        self.requests()
+        self.gate_runs_out("WARNING")
+        self.released("2")
+        self.assertTrue(self.f._unstarted)
+
+    def test_song_arriving_while_our_resume_is_on_its_way_ends_the_gate_and_plays(self):
+        self.held("1")
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        resume = self.requests()
+        self.assertEqual(resume, [ra.RESUME_PLAYER])
+        for sent in (True, False):
+            with self.subTest(resume_sent=sent):
+                if not sent:
+                    self.setUp()
+                    self.held("1")
+                    self.ctl.plays = True
+                    with self.assertLogs("raumfeld_adapter", "INFO"):
+                        self.advance(ra.GATE_POLL_S)
+                with self.assertLogs("raumfeld_adapter", "INFO"):
+                    self.f.on_mpd_state("play", "2")  # the speaker plays: the song may too
+                self.assertIsNone(self.f._gate)
+                self.assertEqual(self.requests(), [])  # no pause 1, and pause 0 is moot
+                self.assertNotIn("ensure_playing(no wake)", self.ctl.calls)
+                self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual
+
+    def test_user_skipping_during_the_gate_is_held_too(self):
+        # Holding at the start of the new song never undoes what the user did.
+        self.held("1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        self.f.on_mpd_state("pause", "2")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "3")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        self.assertEqual(self.f._gate.song, "3")
+        self.assertEqual(self.ctl.calls.count("ensure_playing"), 1)
 
     def test_stop_before_our_pause_lands_drops_the_pause(self):
         with self.assertLogs("raumfeld_adapter", "INFO"):
@@ -1180,7 +1263,10 @@ class StartGateTest(unittest.TestCase):
                 self.f.on_mpd_connected()
                 gate, deadline = self.f._gate, self.f.deadline
                 self.clock.now += 3  # a gate opened now would have a later deadline
-                with no_logs(self, "raumfeld_adapter", logging.INFO):
+                # Another song is the pre-roll's song arriving: logged, held all the same.
+                logs = (no_logs(self, "raumfeld_adapter", logging.INFO) if song == "1" else
+                        self.assertLogs("raumfeld_adapter", "INFO"))
+                with logs:
                     self.f.on_mpd_state("play", song)
                 self.assertIs(self.f._gate, gate)
                 self.assertEqual(self.f.deadline, deadline)

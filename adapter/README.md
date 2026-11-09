@@ -55,9 +55,21 @@ Raumfeld room play the receiver's MPD stream automatically.
   is no new start. That rule applies within one MPD connection: after a
   reconnect the first state is followed afresh (a restarted MPD reuses song
   ids). The adapter's own pause is not followed to the speaker (no AVTransport
-  `Pause`, no "taken away"). If MPD stops or switches to another song (MPD
-  `songid`) during the gate, that was the user (or the receiver) and the adapter
-  does not unpause. **Limit:** a pause from the phone during the gate can't be
+  `Pause`, no "taken away"). **Pre-roll:** the receiver starts MPD on endless
+  silence at the DIAL launch (see the main README), so the gate normally starts
+  on the silence and the song replaces it later, MPD going from playing the
+  silence straight to playing the song (a new `songid`, no stop). If that
+  happens during the gate, the gate carries on with the song: the adapter sends
+  `pause 1` again if MPD went to play, so the song too is held at about 0:00
+  until the speaker plays, with the gate's timing and re-takeover count
+  unchanged and without a new takeover. A skip from the phone during the gate
+  is held the same way (holding at the start of the new song undoes nothing).
+  If the song arrives while the adapter's `pause 0` is on its way, the speaker
+  already plays: the gate ends and MPD plays the song. If the song arrives after
+  the gate (the speaker already plays the silence), there is no gate and no
+  takeover: the stream just goes on with the song. If MPD stops during the gate
+  (the phone, or the receiver ending the silence after 60 s), the adapter does
+  not unpause. **Limit:** a pause from the phone during the gate can't be
   told apart from the adapter's own pause (MPD is already paused, so nothing
   changes), and is undone when the gate opens. Song changes and resumes while
   the adapter owns the room are not gated: the speaker already plays the stream.

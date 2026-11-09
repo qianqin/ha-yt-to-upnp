@@ -433,6 +433,58 @@ class StartGateScenarioTest(unittest.TestCase):
             self.gate_tick()  # the fake renderer plays right after Play
         self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
 
+    # -- the receiver's pre-roll: MPD starts on silence at the DIAL launch; the song
+    # replaces it (play -> play, a new songid, no stop)
+
+    def silence_held_over_line_in(self):
+        self.rf.power = "ACTIVE"
+        self.rf.transport_state = "PLAYING"
+        self.rf.current_uri = LINE_IN_URI
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")  # the silence
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.PAUSE_PLAYER])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")
+
+    def test_song_replacing_the_silence_during_the_gate_is_held_without_a_new_takeover(self):
+        self.rf.stuck = True  # the renderer is still connecting and buffering
+        self.silence_held_over_line_in()
+        self.rf.requests.clear()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "2")  # the song arrives
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.PAUSE_PLAYER])
+        self.follower.on_mpd_state("pause", "2")
+        self.assertEqual(self.rf.api_calls(), [])  # no wake, no look at the room
+        self.assertEqual(self.rf.soap_actions(), [])  # no SetAVTransportURI, no Play
+        self.gate_tick()
+        self.assertEqual(self.follower.take_mpd_requests(), [])
+        with self.rf.lock:
+            self.rf.transport_state = "PLAYING"
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.gate_tick()
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "2")
+        self.assertEqual(self.follower.take_mpd_requests(), [])
+        self.assertNotIn("SetAVTransportURI", self.rf.soap_actions())
+        # A takeover from line-in remembered line-in as the source before: a song change
+        # routed through a takeover would have overwritten it with our stream.
+        self.assertEqual(self.follower.controller._source_before, LINE_IN_URI)
+
+    def test_song_after_the_gate_opened_on_silence_plays_at_once(self):
+        self.silence_held_over_line_in()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.gate_tick()  # the renderer plays the silence
+        self.assertEqual(self.follower.take_mpd_requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")  # our pause 0
+        self.rf.requests.clear()
+        self.follower.on_mpd_state("play", "2")  # the song arrives; the stream goes on
+        self.assertEqual(self.follower.take_mpd_requests(), [])  # no pause: no gate
+        self.assertIsNone(self.follower._gate)
+        self.assertNotIn("leaveStandby", self.rf.api_calls())
+        self.assertNotIn("SetAVTransportURI", self.rf.soap_actions())
+        self.assertNotIn("Play", self.rf.soap_actions())
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
 
 class GateRetakeoverScenarioTest(unittest.TestCase):
     """Scenario (live incident): the user switches the speaker off and casts again a few

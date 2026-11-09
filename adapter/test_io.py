@@ -531,6 +531,30 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(ctl.calls[:3], ["mpd sent: ['pause 1']", "ensure_playing", "renderer_state"])
         self.assertEqual([c for c in mpd.commands if c.startswith("pause")], ["pause 1", "pause 0"])
 
+    def test_song_replacing_the_preroll_silence_in_the_gate_is_paused_again(self):
+        # MPD starts on the receiver's silence; the song replaces it (play, new songid)
+        # while the speaker still connects. It is held too, and resumed once the speaker
+        # plays, with one takeover only.
+        ctl = RecordingController()
+        ctl.plays = False
+        follower = ra.Follower(ctl, poll_seconds=5, start_gate_seconds=5)
+        mpd = FakeMpd([[("play", "1"), ("play", "2")]])
+        self.addCleanup(mpd.close)
+        real_state = ctl.renderer_state
+
+        def renderer_state():
+            ctl.plays = mpd.commands.count("pause 1") >= 2  # plays once the song is held
+            return real_state()
+
+        ctl.renderer_state = renderer_state
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            run_bounded(self, follower, mpd, sleep=lambda s: None,
+                        should_stop=lambda: "pause 0" in mpd.commands)
+        self.assertEqual([c for c in mpd.commands if c.startswith("pause")],
+                         ["pause 1", "pause 1", "pause 0"])
+        self.assertEqual(ctl.calls.count("ensure_playing"), 1)
+        self.assertNotIn("ensure_playing(no wake)", ctl.calls)
+
     def test_failed_takeover_in_the_gate_resumes_mpd_right_away(self):
         ctl = RecordingController()
         ctl.fail = OSError("speaker unreachable")
