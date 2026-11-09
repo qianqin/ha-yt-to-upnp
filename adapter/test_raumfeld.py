@@ -632,6 +632,18 @@ class ControllerWithHostTest(unittest.TestCase):
         self.assertEqual(self.resolved, [self.HOST])
         self.assertEqual(len(self.ssdp.received), 1)
 
+    def test_takeover_counts_resolving_the_name_and_the_renderer_search_as_lookups(self):
+        self.ctl.ensure_playing()
+        self.assertEqual(self.ctl.last_takeover.lookups, 2)
+
+    def test_an_ipv4_address_as_raumfeld_host_is_no_lookup(self):
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN, "RAUMFELD_HOST": "127.0.0.1",
+                                     "STREAM_URL": STREAM_URL})
+        locator = ra.HostLocator(config.raumfeld_host, group=("127.0.0.1", self.ssdp.port))
+        ctl = ra.Controller(config, locator, api_port=self.rf.port, sleep=lambda s: None)
+        ctl.ensure_playing()
+        self.assertEqual(ctl.last_takeover.lookups, 1)  # the renderer search only
+
     def test_warm_up_resolves_and_finds_the_renderer(self):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.ctl.warm_up()

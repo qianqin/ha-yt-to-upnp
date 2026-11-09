@@ -16,16 +16,17 @@ this module sends no RenderingControl requests at all.
 import errno
 import http.client
 import ipaddress
+import json
 import logging
 import math
 import os
 import re
 import socket
-import json
+import stat
 import sys
 import tempfile
-import time
 import threading
+import time
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from collections import namedtuple
@@ -421,6 +422,8 @@ def resolve_ipv4(host):
 class SsdpLocator:
     """Finds the Raumfeld host (by the speaker's UDN) and zone renderers by multicast SSDP."""
 
+    looks_up_api_host = True  # every api_host() is a search
+
     def __init__(self, discover, speaker_udn):
         self.discover = discover
         self.speaker_udn = speaker_udn
@@ -448,6 +451,8 @@ class HostLocator:
 
     def __init__(self, host, resolve=resolve_ipv4, group=SSDP_ADDR):
         self.host = host
+        # An IPv4 address needs no lookup; a name is resolved.
+        self.looks_up_api_host = not _is_ipv4(host)
         self.resolve = resolve
         self.group = group
         self._address = None
@@ -466,6 +471,14 @@ class HostLocator:
 
     def forget(self):
         self._address = None
+
+
+def _is_ipv4(text):
+    try:
+        ipaddress.IPv4Address(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _parse_headers(text):
@@ -798,7 +811,7 @@ class Controller:
             cached = self._api is not None
             try:
                 if not cached:
-                    self._lookups += 1
+                    self._lookups += self.locator.looks_up_api_host
                     self._api = "http://%s:%d/" % (self.locator.api_host(), self.api_port)
                 zones = http_get(self._api + "getZones")
                 if not room_listed(zones, self.config.room_udn):
