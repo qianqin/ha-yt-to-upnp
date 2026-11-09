@@ -1,10 +1,13 @@
 """Feature: Raumfeld follows the cast -- Controller against a fake Raumfeld host."""
 
+import errno
 import json
+import logging
 import os
 import socket
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -13,6 +16,7 @@ import xml.etree.ElementTree as ET
 import raumfeld_adapter as ra
 from fakes import (LINE_IN_URI, NEW_ZONE_UDN, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN,
                    FakeDiscovery, FakeRaumfeld, FakeSsdpResponder)
+from test_logic import no_logs
 from test_speaker_yield import assert_speaker_left_alone
 
 OTHER_URI = "http://radio.invalid/live.mp3"
@@ -791,7 +795,13 @@ class StoredRendererTest(unittest.TestCase):
                         json.dumps(self.entry("file:///etc/passwd")),
                         # The location must be on the stored host, like a discovery's.
                         json.dumps(self.entry("http://192.0.2.1:%d/zone.xml" % self.rf.port)),
-                        "x" * (ra.STATE_MAX_BYTES + 1)):
+                        "x" * (ra.STATE_MAX_BYTES + 1),
+                        # A valid entry, only too large ...
+                        json.dumps(self.entry(self.rf.base + "/zone.xml?" + "a" * ra.STATE_MAX_BYTES)),
+                        # ... also where what fits in the limit would parse on its own.
+                        json.dumps(self.entry()) + " " * ra.STATE_MAX_BYTES,
+                        # Nested deeper than the JSON parser recurses, yet within the size.
+                        "[" * 2000 + "]" * 2000):
             with self.subTest(content=content[:40]):
                 self.discover.searches.clear()
                 self.store(content)
@@ -799,6 +809,93 @@ class StoredRendererTest(unittest.TestCase):
                 self.assertTrue(any("state" in m for m in output), output)
                 self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
                 self.assertEqual(self.stored(), self.entry())  # replaced by what was found
+
+    def stored_fetched(self):
+        return [p for m, p, a, b in self.rf.requests if p.endswith("?stored")]
+
+    def test_in_ssdp_mode_a_stored_host_off_the_lan_is_never_fetched(self):
+        # The first is reachable and describes our zone; only its host is a name, which no
+        # SSDP sender is. The second is an address outside the LAN.
+        for host in ("localhost", "8.8.8.8"):
+            with self.subTest(host=host):
+                self.rf.requests.clear()
+                self.discover.searches.clear()
+                self.store(self.entry("http://%s:%d/zone.xml?stored" % (host, self.rf.port),
+                                      host=host))
+                output = self.warm_up(self.controller())
+                self.assertTrue(any("state" in m for m in output), output)
+                self.assertEqual(self.stored_fetched(), [])
+                self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+                self.assertEqual(self.stored(), self.entry())
+
+    def test_a_symlinked_state_file_is_ignored_with_a_warning(self):
+        target = os.path.join(self.dir, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump(self.entry(), f)
+        os.symlink(target, self.path)
+        output = self.warm_up(self.controller(), "WARNING")
+        self.assertTrue(any("state" in m for m in output), output)
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertFalse(os.path.islink(self.path))  # replaced by a file of our own
+        self.assertEqual(self.stored(), self.entry())
+
+    def test_a_state_file_that_is_no_regular_file_is_ignored_without_blocking(self):
+        os.mkfifo(self.path)  # opening a FIFO for reading would block until a writer comes
+        ctl, output = self.controller(), []
+        runner = threading.Thread(target=lambda: output.extend(self.warm_up(ctl, "WARNING")),
+                                  daemon=True)
+        runner.start()
+        runner.join(5)
+        if runner.is_alive():
+            unblock_fifo(self.path)
+            runner.join(2)
+            self.fail("the state blocked on a FIFO")
+        self.assertTrue(any("regular" in m for m in output), output)
+        self.assertEqual(self.stored(), self.entry())
+
+    def test_a_state_dir_writable_by_others_is_warned_about(self):
+        self.store(self.entry())
+        for mode in (0o770, 0o707):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.dir, mode)
+                self.addCleanup(os.chmod, self.dir, 0o700)
+                output = self.warm_up(self.controller(), "WARNING")
+                self.assertTrue(any("writable" in m and self.dir in m for m in output), output)
+
+    def test_a_private_state_dir_is_not_warned_about(self):
+        self.store(self.entry())
+        os.chmod(self.dir, 0o755)
+        with no_logs(self, "raumfeld_adapter", logging.WARNING):
+            self.controller().warm_up()
+
+    def test_a_failed_write_leaves_the_old_file_intact_and_no_temporary(self):
+        old = self.entry(zone=NEW_ZONE_UDN)  # of another zone: the search runs and saves
+        self.store(old)
+        real_dump = json.dump
+
+        def dump(obj, f):
+            f.write(json.dumps(obj)[:10])  # part of the new entry is written ...
+            raise OSError(errno.ENOSPC, "No space left on device")  # ... then the disk is full
+
+        with mock.patch.object(ra.json, "dump", dump):
+            output = self.warm_up(self.controller(), "WARNING")
+        self.assertTrue(any("could not write" in m for m in output), output)
+        self.assertEqual(self.stored(), old)
+        self.assertEqual(os.listdir(self.dir), [ra.STATE_FILE_NAME])
+        self.assertIs(json.dump, real_dump)
+
+    def test_the_new_file_is_renamed_over_the_old_one_from_the_same_directory(self):
+        real_replace, replaced = os.replace, []
+
+        def replace(src, dst):
+            replaced.append((src, dst))
+            return real_replace(src, dst)
+
+        with mock.patch.object(ra.os, "replace", replace):
+            self.warm_up(self.controller())
+        self.assertEqual(len(replaced), 1)
+        src, dst = replaced[0]
+        self.assertEqual((os.path.dirname(src), dst), (self.dir, self.path))
 
     def test_an_unwritable_directory_is_logged_and_the_adapter_goes_on(self):
         self.path = os.path.join(self.dir, "missing", ra.STATE_FILE_NAME)
@@ -829,6 +926,17 @@ class StoredRendererTest(unittest.TestCase):
         self.assertEqual(searched, [ZONE_UDN])
         self.assertEqual(self.stored(), self.entry())
 
+    def test_with_raumfeld_host_a_stored_renderer_on_another_host_is_never_fetched(self):
+        # Reachable and describing our zone; only its host is not RAUMFELD_HOST's address.
+        self.store(self.entry("http://localhost:%d/zone.xml?stored" % self.rf.port,
+                              host="localhost"))
+        searched = []
+        output = self.warm_up(self.host_controller(searched))
+        self.assertTrue(any("state" in m for m in output), output)
+        self.assertEqual(self.stored_fetched(), [])
+        self.assertEqual(searched, [ZONE_UDN])
+        self.assertEqual(self.stored(), self.entry())
+
     def test_with_raumfeld_host_a_stored_renderer_on_it_is_used_without_a_search(self):
         self.store(self.entry())
         searched = []
@@ -837,6 +945,10 @@ class StoredRendererTest(unittest.TestCase):
         ctl.ensure_playing()
         self.assertEqual(searched, [])
         self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_warm_up_logs_the_renderer_control_url_quoted(self):
+        output = self.warm_up(self.controller())
+        self.assertTrue(any("'%s/AVTransport/ctrl'" % self.rf.base in m for m in output), output)
 
     def test_without_a_state_dir_nothing_is_written(self):
         config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
@@ -847,6 +959,36 @@ class StoredRendererTest(unittest.TestCase):
                             api_port=self.rf.port, sleep=lambda s: None)
         self.warm_up(ctl)
         self.assertEqual(os.listdir(self.dir), [])
+
+
+def unblock_fifo(path):
+    """Open the other end of a FIFO that a regression blocks on (reading or writing)."""
+    for flags in (os.O_RDONLY | os.O_NONBLOCK, os.O_WRONLY | os.O_NONBLOCK):
+        try:
+            os.close(os.open(path, flags))
+        except OSError:
+            pass  # no reader for a non-blocking writer: nothing waits on that end
+
+
+class LocatorAcceptsTest(unittest.TestCase):
+    """Which host a stored renderer location may be on."""
+
+    def test_with_raumfeld_host_only_its_address(self):
+        locator = ra.HostLocator("raumfeld-host.invalid", resolve=lambda name: "192.168.1.5")
+        self.assertTrue(locator.accepts("192.168.1.5"))
+        for host in ("192.168.1.6", "raumfeld-host.invalid", "localhost", ""):
+            with self.subTest(host=host):
+                self.assertFalse(locator.accepts(host))
+
+    def test_in_ssdp_mode_an_ipv4_address_on_the_lan(self):
+        locator = ra.SsdpLocator(lambda st: None, SPEAKER_UDN)
+        for host in ("192.168.1.5", "10.0.0.2", "172.16.0.9", "169.254.3.4", "127.0.0.1"):
+            with self.subTest(host=host):
+                self.assertTrue(locator.accepts(host))
+        for host in ("8.8.8.8", "0.0.0.0", "255.255.255.255", "239.255.255.250", "localhost",
+                     "raumfeld.example", "::1", "192.168.1.5 ", ""):
+            with self.subTest(host=host):
+                self.assertFalse(locator.accepts(host))
 
 
 class RendererRestartTest(unittest.TestCase):

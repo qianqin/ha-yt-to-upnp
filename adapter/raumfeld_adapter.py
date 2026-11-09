@@ -438,7 +438,14 @@ class SsdpLocator:
         pass  # every api_host() searches afresh
 
     def accepts(self, host):
-        return True  # any device on the LAN; its description's UDN decides
+        """A stored renderer's host must be what an SSDP sender is: an IPv4 address on the
+        LAN (private or link-local). Its description's UDN decides the rest."""
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ValueError:
+            return False
+        return ((address.is_private or address.is_link_local)
+                and not (address.is_unspecified or address.is_reserved or address.is_multicast))
 
 
 class HostLocator:
@@ -598,36 +605,57 @@ class StateFile:
     """The zone renderer's location, kept across adapter restarts so a restart needs no
     search: {"zone_udn", "host", "location"} (the description URL). Nothing secret. Written
     atomically (a temporary file in the same directory, renamed over the old one), mode
-    0600. A file that can't be read or doesn't hold a valid location is ignored with a
-    warning; a location is checked like a discovered one (plain http on its host)."""
+    0600. A file that can't be read, isn't a regular file (a symlink, a FIFO) or doesn't hold
+    a valid location is ignored with a warning; a location is checked like a discovered one
+    (plain http on its host). A directory others may write to is warned about: whoever can
+    write there chooses which renderer location the adapter tries first."""
 
     def __init__(self, path):
         self.path = path
 
     def load(self):
+        self._warn_if_shared()
         try:
-            with open(self.path, "rb") as f:
-                data = f.read(STATE_MAX_BYTES + 1)
+            # No symlinks; non-blocking so a FIFO can't hold the adapter up at start.
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return None
         except OSError as e:
             log.warning("ignoring the adapter state %s: %r", self.path, e)
             return None
         try:
-            if len(data) > STATE_MAX_BYTES:
-                raise ValueError("larger than %d bytes" % STATE_MAX_BYTES)
-            entry = json.loads(data.decode("utf-8"))
-            if not isinstance(entry, dict):
-                raise ValueError("not a JSON object")
-            zone, host, location = (entry.get(k) for k in ("zone_udn", "host", "location"))
-            if not all(isinstance(v, str) for v in (zone, host, location)):
-                raise ValueError("zone_udn, host and location must be strings")
-            if not UDN_RE.fullmatch(zone):
-                raise ValueError("invalid zone UDN %r" % zone)
-            check_device_url(location, host)
-        except (ValueError, RaumfeldError) as e:
-            log.warning("ignoring the adapter state %s: %s", self.path, e)
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise ValueError("not a regular file")
+                return self._parse(f.read(STATE_MAX_BYTES + 1))
+        except (OSError, ValueError, RaumfeldError, RecursionError) as e:
+            log.warning("ignoring the adapter state %s: %r", self.path, e)
             return None
+
+    def _warn_if_shared(self):
+        directory = os.path.dirname(self.path)
+        try:
+            mode = os.stat(directory).st_mode
+        except OSError:
+            return  # a missing directory shows when the state is written
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            log.warning("the adapter state directory %s is writable by group or others; "
+                        "make it private to the adapter (chmod go-w)", directory)
+
+    @staticmethod
+    def _parse(data):
+        """The entry a state file holds; raises ValueError or RaumfeldError if none."""
+        if len(data) > STATE_MAX_BYTES:
+            raise ValueError("larger than %d bytes" % STATE_MAX_BYTES)
+        entry = json.loads(data.decode("utf-8"))
+        if not isinstance(entry, dict):
+            raise ValueError("not a JSON object")
+        zone, host, location = (entry.get(k) for k in ("zone_udn", "host", "location"))
+        if not all(isinstance(v, str) for v in (zone, host, location)):
+            raise ValueError("zone_udn, host and location must be strings")
+        if not UDN_RE.fullmatch(zone):
+            raise ValueError("invalid zone UDN %r" % zone)
+        check_device_url(location, host)
         return {"zone_udn": zone, "host": host, "location": location}
 
     def save(self, entry):
@@ -697,7 +725,7 @@ class Controller:
         except _ERRORS as e:
             log.warning("Raumfeld room not found yet (%r); the first cast looks again", e)
             return
-        log.info("Raumfeld host at %s, zone renderer %s", self._api,
+        log.info("Raumfeld host at %s, zone renderer %r", self._api,
                  self._control or "none (the room has no zone)")
 
     def ensure_playing(self, wake=True, retake=False):
