@@ -47,16 +47,18 @@ Raumfeld room play the receiver's MPD stream automatically.
     UDN, host address, description URL; nothing secret), atomically (temporary
     file, rename) with mode 0600. At start it is tried first: if its description
     still names the zone and it is on an acceptable host (with `RAUMFELD_HOST` that
-    host's address; without it an IPv4 address on the LAN, private or link-local,
-    as an SSDP sender is), no search is needed. Otherwise, or for another zone,
-    the search runs and the file is updated. A file that can't be read, is not a
-    regular file (a symlink or a FIFO is not opened through), is larger than
-    4 KiB or holds no valid location (plain `http://` on its stored host) is
+    host's address; without it an IPv4 address on the LAN as an SSDP sender is:
+    `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` or link-local `169.254.0.0/16`,
+    never loopback or `0.0.0.0/8`), no search is needed. Otherwise, or for another
+    zone, the search runs and the file is updated. A file that can't be read, is
+    not a regular file (a symlink or a FIFO is not opened through), is larger
+    than 4 KiB or holds no valid location (plain `http://` on its stored host) is
     ignored with a warning. A state directory writable by group or others is
     warned about at start: whoever can write there chooses the location the
-    adapter tries first (still checked as above). Make it private to the adapter; a file that can't be written is logged and the
-    adapter goes on with its in-memory cache. Without `ADAPTER_STATE_DIR` nothing
-    is written. The host itself is still found by SSDP without `RAUMFELD_HOST`.
+    adapter tries first (still checked as above); make it private to the
+    adapter. A file that can't be written is logged and the adapter goes on with
+    its in-memory cache. Without `ADAPTER_STATE_DIR` nothing is written. The host
+    itself is still found by SSDP without `RAUMFELD_HOST`.
   - Either way: a host whose `getZones` doesn't list `RAUMFELD_ROOM_UDN` is an
     error (a wrong host), and a renderer description whose `UDN` is not the zone
     UDN is refused: never a wrong device. If nothing is found at start, that is
@@ -128,7 +130,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   is taken for the receiver's held hand-over and resumed too. The window is short
   on purpose: the receiver keeps the phone from pausing during the pre-roll, and
   right after the hand-over the phone can't have paused a song it hasn't played
-  yet; any other pause is left alone. If the song arrives after the gate while
+  yet; any other pause is left alone, as is a paused new song after a gate in
+  which a song already replaced the silence (a hand-over only replaces the
+  silence). If the song arrives after the gate while
   MPD plays (the speaker already plays the silence), there is no gate and no
   takeover: the stream just goes on with the song. If MPD stops during the gate
   (the phone, or the receiver ending the silence after 60 s), the adapter does
@@ -159,9 +163,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   source play by then, the speaker counts as taken away). A renderer seen
   playing or `TRANSITIONING` since, or any change in MPD (pause, stop, another
   song; not the pre-roll's song replacing the silence, which is the receiver's
-  doing, within 60 s of the gate's start), drops that exception, so a user who stops the speaker later is still
-  respected. If the speaker counts as taken away while MPD is playing or paused,
-  the adapter:
+  doing, within 60 s of the gate's start), drops that exception, so a user who
+  stops the speaker later is still respected. If the speaker counts as taken
+  away while MPD is playing or paused, the adapter:
   1. sends MPD `pause 1` if MPD is playing (never `stop`: the receiver reads an
      MPD stop as the end of the track and plays the next one),
   2. sends `sendmessage ytcast release` once, which tells the receiver to end the
