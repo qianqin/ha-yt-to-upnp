@@ -71,7 +71,8 @@ impl PreRoll {
     /// Play a song. A running pre-roll hands over without stopping MPD: the
     /// song is added behind the silence, played, and the silence removed, so
     /// MPD goes from play straight to play (`clear` would show the speaker
-    /// adapter a stopped player in between). Returns how long the silence
+    /// adapter a stopped player in between); a silence the adapter holds
+    /// paused hands over to a song held paused. Returns how long the silence
     /// played, or `None` if there was no pre-roll.
     pub async fn play_song(
         &mut self,
@@ -86,7 +87,7 @@ impl PreRoll {
             mpd.play().await?;
             return Ok(None);
         };
-        if let Err(e) = hand_over(mpd, song_url).await {
+        if let Err(e) = hand_over(mpd, song_url, active.silence_id).await {
             // Without this the silence would play on, with no timeout left.
             if let Err(stop_err) = mpd.stop().await {
                 tracing::warn!("[preroll] failed hand-over: stopping MPD failed: {stop_err}");
@@ -95,10 +96,6 @@ impl PreRoll {
                 tracing::warn!("[preroll] failed hand-over: clearing MPD failed: {clear_err}");
             }
             return Err(e);
-        }
-        if let Err(e) = mpd.deleteid(active.silence_id).await {
-            // The song is playing; a leftover silence only sits in the queue.
-            tracing::warn!("[preroll] could not remove the silence: {e}");
         }
         let waited = active.since.elapsed();
         tracing::info!(
@@ -139,10 +136,31 @@ impl PreRoll {
     }
 }
 
-/// Add the song behind the silence and play it.
-async fn hand_over(mpd: &mut MpdClient, song_url: &str) -> mpd::Result<()> {
+/// Add the song behind the silence, make it the current song and remove the
+/// silence. A silence the speaker adapter holds (MPD paused while it wakes the
+/// speaker) hands over to a held song: `playid` alone would start the song
+/// unheld, and a stream cannot be rewound. Within one command list MPD plays
+/// none of it; the adapter then resumes it at its start.
+async fn hand_over(mpd: &mut MpdClient, song_url: &str, silence_id: u32) -> mpd::Result<()> {
+    let held = mpd.status().await?.state == "pause";
     let song_id = mpd.addid(song_url).await?;
-    mpd.playid(song_id).await
+    if held {
+        tracing::info!("[preroll] silence held by the speaker adapter: the song waits paused");
+        mpd.command_list(&[format!("playid {song_id}"), "pause 1".to_owned()]).await?;
+    } else {
+        mpd.playid(song_id).await?;
+    }
+    remove_silence(mpd, silence_id).await;
+    Ok(())
+}
+
+/// Remove the silence once the song is current. Not part of the command
+/// list: a silence that is already gone must not fail the song's hand-over.
+async fn remove_silence(mpd: &mut MpdClient, silence_id: u32) {
+    if let Err(e) = mpd.deleteid(silence_id).await {
+        // The song is current; a leftover silence only sits in the queue.
+        tracing::warn!("[preroll] could not remove the silence: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +199,9 @@ mod tests {
 
         const SILENCE: &str = "http://localhost:8008/silence";
         const SONG: &str = "http://localhost:8008/stream/aaaaaaaaaaa";
+        const PLAYING: &str = "state: play\nsong: 0\nsongid: 5\nOK\n";
+        /// The speaker adapter's start gate holds the silence while it wakes the speaker.
+        const HELD: &str = "state: pause\nsong: 0\nsongid: 5\nOK\n";
 
         async fn client(
             script: Vec<(&'static str, &'static str)>,
@@ -245,6 +266,7 @@ mod tests {
         async fn song_replaces_the_silence_without_stopping_mpd() {
             let mut preroll = started().await;
             let (mut mpd, server) = client(vec![
+                ("status", PLAYING),
                 ("addid", "Id: 6\nOK\n"),
                 ("playid", "OK\n"),
                 ("deleteid", "OK\n"),
@@ -259,6 +281,7 @@ mod tests {
             assert_eq!(
                 server.await.unwrap(),
                 vec![
+                    "status",
                     "addid \"http://localhost:8008/stream/aaaaaaaaaaa\"",
                     "playid 6",
                     "deleteid 5"
@@ -267,9 +290,108 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_held_silence_hands_over_to_a_held_song_in_one_command_list() {
+            // The adapter paused MPD while it wakes the speaker. A plain playid
+            // would start the song unheld (and a stream can't be rewound), so
+            // the song is selected and paused within one command list: MPD
+            // plays none of it and the adapter resumes it at its start.
+            let mut preroll = started().await;
+            let (mut mpd, server) = client(vec![
+                ("status", HELD),
+                ("addid", "Id: 6\nOK\n"),
+                ("command_list_begin", ""),
+                ("playid 6", ""),
+                ("pause 1", ""),
+                ("command_list_end", "OK\n"),
+                ("deleteid", "OK\n"),
+            ])
+            .await;
+
+            assert!(preroll.play_song(&mut mpd, SONG).await.unwrap().is_some());
+            assert!(!preroll.is_active());
+            drop(mpd);
+            assert_eq!(
+                server.await.unwrap(),
+                vec![
+                    "status",
+                    "addid \"http://localhost:8008/stream/aaaaaaaaaaa\"",
+                    "command_list_begin",
+                    "playid 6",
+                    "pause 1",
+                    "command_list_end",
+                    "deleteid 5"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_held_hand_over_ends_the_pre_roll_and_its_silence() {
+            let mut preroll = started().await;
+            let (mut mpd, server) = client(vec![
+                ("status", HELD),
+                ("addid", "Id: 6\nOK\n"),
+                ("command_list_begin", ""),
+                ("playid 6", ""),
+                ("pause 1", ""),
+                ("command_list_end", "ACK [50@0] {playid} boom\n"),
+                ("stop", "OK\n"),
+                ("clear", "OK\n"),
+            ])
+            .await;
+            let err = preroll.play_song(&mut mpd, SONG).await.unwrap_err();
+            assert!(err.to_string().contains("{playid} boom"), "{err}");
+            assert!(!preroll.is_active());
+            drop(mpd);
+            let seen = server.await.unwrap();
+            assert_eq!(seen[seen.len() - 2..], ["stop", "clear"]);
+        }
+
+        #[tokio::test]
+        async fn a_held_song_survives_a_silence_that_is_already_gone() {
+            // In the command list, a failing deleteid would come after playid
+            // and pause 1 ran, and its ACK would send a correctly held song
+            // into stop + clear. Removed on its own, it only warns.
+            let mut preroll = started().await;
+            let (mut mpd, server) = client(vec![
+                ("status", HELD),
+                ("addid", "Id: 6\nOK\n"),
+                ("command_list_begin", ""),
+                ("playid 6", ""),
+                ("pause 1", ""),
+                ("command_list_end", "OK\n"),
+                ("deleteid", "ACK [50@0] {deleteid} No such song\n"),
+            ])
+            .await;
+            assert!(preroll.play_song(&mut mpd, SONG).await.unwrap().is_some());
+            assert!(!preroll.is_active());
+            drop(mpd);
+            let seen = server.await.unwrap();
+            assert_eq!(seen.last().unwrap(), "deleteid 5");
+            assert!(!seen.iter().any(|c| c == "stop" || c == "clear"), "{seen:?}");
+        }
+
+        #[tokio::test]
+        async fn a_failed_status_read_fails_the_hand_over() {
+            // Held or not is unknown: neither hand-over is safe.
+            let mut preroll = started().await;
+            let (mut mpd, server) = client(vec![
+                ("status", "ACK [5@0] {status} boom\n"),
+                ("stop", "OK\n"),
+                ("clear", "OK\n"),
+            ])
+            .await;
+            let err = preroll.play_song(&mut mpd, SONG).await.unwrap_err();
+            assert!(err.to_string().contains("{status} boom"), "{err}");
+            assert!(!preroll.is_active());
+            drop(mpd);
+            assert_eq!(server.await.unwrap(), vec!["status", "stop", "clear"]);
+        }
+
+        #[tokio::test]
         async fn song_plays_even_if_the_silence_is_already_gone() {
             let mut preroll = started().await;
             let (mut mpd, _server) = client(vec![
+                ("status", PLAYING),
                 ("addid", "Id: 6\nOK\n"),
                 ("playid", "OK\n"),
                 ("deleteid", "ACK [50@0] {deleteid} No such song\n"),
@@ -285,6 +407,7 @@ mod tests {
             // MPD stopped, or the silence would play on with no timeout.
             let mut preroll = started().await;
             let (mut mpd, server) = client(vec![
+                ("status", PLAYING),
                 ("addid", "ACK [50@0] {addid} No such directory\n"),
                 ("stop", "OK\n"),
                 ("clear", "OK\n"),
@@ -296,7 +419,7 @@ mod tests {
             drop(mpd);
             assert_eq!(
                 server.await.unwrap(),
-                vec!["addid \"http://localhost:8008/stream/aaaaaaaaaaa\"", "stop", "clear"]
+                vec!["status", "addid \"http://localhost:8008/stream/aaaaaaaaaaa\"", "stop", "clear"]
             );
         }
 
@@ -304,6 +427,7 @@ mod tests {
         async fn failed_play_of_the_song_ends_the_silence_too() {
             let mut preroll = started().await;
             let (mut mpd, server) = client(vec![
+                ("status", PLAYING),
                 ("addid", "Id: 6\nOK\n"),
                 ("playid", "ACK [50@0] {playid} boom\n"),
                 ("stop", "ACK [50@0] {stop} also broken\n"),
@@ -317,7 +441,7 @@ mod tests {
             drop(mpd);
             assert_eq!(
                 server.await.unwrap(),
-                vec!["addid \"http://localhost:8008/stream/aaaaaaaaaaa\"", "playid 6", "stop", "clear"]
+                vec!["status", "addid \"http://localhost:8008/stream/aaaaaaaaaaa\"", "playid 6", "stop", "clear"]
             );
         }
 
@@ -350,6 +474,7 @@ mod tests {
 
             let mut preroll = started().await;
             let (mut mpd, _server) = client(vec![
+                ("status", PLAYING),
                 ("addid", "Id: 6\nOK\n"),
                 ("playid", "OK\n"),
                 ("deleteid", "OK\n"),

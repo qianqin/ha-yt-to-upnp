@@ -253,6 +253,18 @@ mod real {
             Ok(())
         }
 
+        /// Run `commands` as one command list: MPD executes them in one go,
+        /// before it serves any other client or plays on, and stops at the
+        /// first failing one, whose ACK is returned.
+        pub async fn command_list(&mut self, commands: &[String]) -> Result<()> {
+            if commands.iter().any(|c| c.contains('\n') || c.contains('\r')) {
+                return Err(MpdError::Protocol("command contains a line break".into()));
+            }
+            let list = format!("command_list_begin\n{}\ncommand_list_end", commands.join("\n"));
+            self.command(&list).await?;
+            Ok(())
+        }
+
         pub async fn play(&mut self) -> Result<()> {
             self.command("play").await?;
             Ok(())
@@ -514,6 +526,11 @@ mod mock {
             Ok(())
         }
 
+        pub async fn command_list(&mut self, commands: &[String]) -> Result<()> {
+            tracing::info!("[mock-mpd] command list: {}", commands.join("; "));
+            Ok(())
+        }
+
         pub async fn pause(&mut self) -> Result<()> {
             tracing::info!("[mock-mpd] pause");
             Ok(())
@@ -693,6 +710,40 @@ mod tests {
             }
             drop(mpd);
             assert!(server.await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn command_list_is_sent_as_one_batch_with_one_reply() {
+            let (port, server) = fake_mpd(vec![
+                ("command_list_begin", ""),
+                ("playid 6", ""),
+                ("pause 1", ""),
+                ("command_list_end", "OK\n"),
+                ("status", "state: pause\nOK\n"),
+            ])
+            .await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            mpd.command_list(&["playid 6".into(), "pause 1".into()]).await.unwrap();
+            // The connection is in step: the next reply is the status's.
+            assert_eq!(mpd.status().await.unwrap().state, "pause");
+            drop(mpd);
+            assert_eq!(
+                server.await.unwrap(),
+                vec!["command_list_begin", "playid 6", "pause 1", "command_list_end", "status"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failing_command_in_the_list_fails_the_list() {
+            let (port, _server) = fake_mpd(vec![
+                ("command_list_begin", ""),
+                ("playid 6", ""),
+                ("command_list_end", "ACK [50@0] {playid} No such song\n"),
+            ])
+            .await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            let err = mpd.command_list(&["playid 6".into()]).await.unwrap_err();
+            assert!(matches!(err, MpdError::Ack(ref m) if m.contains("{playid}")), "{err}");
         }
 
         #[tokio::test]

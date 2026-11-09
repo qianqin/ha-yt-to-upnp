@@ -454,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if plan.check_song_end {
                     if let Ok(status) = mpd_client.status().await {
-                        if status.state == "stop" {
+                        if song_ended(&status) {
                             play_started = false;
 
                             let failure = dial_state.take_stream_failure(&current_video_id(&playlist));
@@ -930,6 +930,13 @@ fn release_action(has_remote: bool, playlist: &PlaylistState) -> ReleaseAction {
     }
 }
 
+/// Only a stopped player ends a song. A pause is no end: neither the phone's
+/// nor the speaker adapter's, which holds a song handed over from a held
+/// pre-roll until the speaker plays.
+fn song_ended(status: &mpd::MpdStatus) -> bool {
+    status.state == "stop"
+}
+
 /// The 3 s position report is for a song the phone started, never the
 /// pre-roll silence.
 fn reports_position(play_started: bool, playlist: &PlaylistState) -> bool {
@@ -1267,6 +1274,14 @@ mod stop_tests {
         // Even if a stray resume from the phone set play_started.
         assert!(!idle_plan(player, true, true).check_song_end);
         assert!(!idle_plan(player, false, true).check_song_end);
+    }
+
+    #[test]
+    fn a_held_song_has_not_ended() {
+        let status = |state: &str| mpd::MpdStatus { state: state.into(), elapsed: Some(0.0), duration: None, volume: 50 };
+        assert!(!song_ended(&status("pause")));
+        assert!(!song_ended(&status("play")));
+        assert!(song_ended(&status("stop")));
     }
 
     #[test]
