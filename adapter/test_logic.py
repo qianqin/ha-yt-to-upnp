@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 import logging
 import time
 import unittest
@@ -126,6 +127,24 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(host=host), \
                     self.assertRaisesRegex(ra.ConfigError, "RAUMFELD_HOST"):
                 ra.Config.from_env(dict(REQUIRED, RAUMFELD_HOST=host))
+
+    def test_adapter_state_dir_is_optional_and_must_be_absolute(self):
+        self.assertIsNone(ra.Config.from_env(REQUIRED).state_dir)
+        self.assertEqual(ra.Config.from_env(dict(REQUIRED, ADAPTER_STATE_DIR=" /data ")).state_dir,
+                         "/data")
+        for value in ("data", "./data", "/data\nx"):
+            with self.subTest(value=value), \
+                    self.assertRaisesRegex(ra.ConfigError, "ADAPTER_STATE_DIR"):
+                ra.Config.from_env(dict(REQUIRED, ADAPTER_STATE_DIR=value))
+
+    def test_main_keeps_the_state_file_in_the_state_dir(self):
+        with mock.patch.object(ra, "run") as run, no_network(), \
+                mock.patch.object(ra.logging, "basicConfig"):
+            ra.main(env=dict(REQUIRED, ADAPTER_STATE_DIR="/data"))
+            ra.main(env=dict(REQUIRED))
+        with_dir, without = (c[0][0].controller.state for c in run.call_args_list)
+        self.assertEqual(with_dir.path, os.path.join("/data", ra.STATE_FILE_NAME))
+        self.assertIsNone(without)
 
     def test_idle_minutes_is_no_longer_a_setting(self):
         c = ra.Config.from_env(dict(REQUIRED, IDLE_MINUTES="soon"))  # ignored, not validated

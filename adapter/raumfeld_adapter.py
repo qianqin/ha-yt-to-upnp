@@ -21,7 +21,9 @@ import math
 import os
 import re
 import socket
+import json
 import sys
+import tempfile
 import time
 import threading
 import xml.etree.ElementTree as ET
@@ -109,9 +111,19 @@ def _raumfeld_host(env):
     return host
 
 
+def _state_dir(env):
+    """ADAPTER_STATE_DIR: an absolute directory for the adapter's state file. None if unset."""
+    path = env.get("ADAPTER_STATE_DIR", "").strip()
+    if not path:
+        return None
+    if not os.path.isabs(path) or any(ord(c) < 32 for c in path):
+        raise ConfigError("ADAPTER_STATE_DIR must be an absolute path, got %r" % path)
+    return path
+
+
 class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url stream_mime "
                                   "stream_metadata poll_seconds stuck_seconds start_gate_seconds "
-                                  "mpd_host mpd_port log_level")):
+                                  "mpd_host mpd_port log_level state_dir")):
     @classmethod
     def from_env(cls, env):
         raumfeld_host = _raumfeld_host(env)
@@ -170,6 +182,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url
             mpd_host=env.get("MPD_HOST", "localhost").strip(),
             mpd_port=mpd_port,
             log_level=log_level,
+            state_dir=_state_dir(env),
         )
 
 
@@ -410,6 +423,9 @@ class SsdpLocator:
     def forget(self):
         pass  # every api_host() searches afresh
 
+    def accepts(self, host):
+        return True  # any device on the LAN; its description's UDN decides
+
 
 class HostLocator:
     """RAUMFELD_HOST: the Raumfeld host at a configured name or address. A name is resolved
@@ -432,6 +448,10 @@ class HostLocator:
 
     def renderer(self, zone):
         return ssdp_from_host(zone, self.api_host(), HOST_SEARCH_S, self.group)
+
+    def accepts(self, host):
+        """A zone renderer must be on the configured host."""
+        return host == self.api_host()
 
     def forget(self):
         self._address = None
@@ -543,6 +563,63 @@ def soap_call(control_url, action, args):
 _ERRORS = (OSError, ValueError, http.client.HTTPException, RaumfeldError, ET.ParseError)
 
 
+STATE_FILE_NAME = "raumfeld-adapter-state.json"
+STATE_MAX_BYTES = 4096  # the file holds one zone UDN, an address and a URL
+
+
+class StateFile:
+    """The zone renderer's location, kept across adapter restarts so a restart needs no
+    search: {"zone_udn", "host", "location"} (the description URL). Nothing secret. Written
+    atomically (a temporary file in the same directory, renamed over the old one), mode
+    0600. A file that can't be read or doesn't hold a valid location is ignored with a
+    warning; a location is checked like a discovered one (plain http on its host)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path, "rb") as f:
+                data = f.read(STATE_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            log.warning("ignoring the adapter state %s: %r", self.path, e)
+            return None
+        try:
+            if len(data) > STATE_MAX_BYTES:
+                raise ValueError("larger than %d bytes" % STATE_MAX_BYTES)
+            entry = json.loads(data.decode("utf-8"))
+            if not isinstance(entry, dict):
+                raise ValueError("not a JSON object")
+            zone, host, location = (entry.get(k) for k in ("zone_udn", "host", "location"))
+            if not all(isinstance(v, str) for v in (zone, host, location)):
+                raise ValueError("zone_udn, host and location must be strings")
+            if not UDN_RE.fullmatch(zone):
+                raise ValueError("invalid zone UDN %r" % zone)
+            check_device_url(location, host)
+        except (ValueError, RaumfeldError) as e:
+            log.warning("ignoring the adapter state %s: %s", self.path, e)
+            return None
+        return {"zone_udn": zone, "host": host, "location": location}
+
+    def save(self, entry):
+        directory = os.path.dirname(self.path)
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")  # mode 0600
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(entry, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+        except OSError as e:
+            log.warning("could not write the adapter state %s: %r", self.path, e)
+
+
 # What the last takeover took: its wait for the room to wake, and how many devices it had to
 # look for (SSDP, or resolving RAUMFELD_HOST) instead of finding them cached.
 TakeoverStats = namedtuple("TakeoverStats", "wake_s lookups")
@@ -560,9 +637,11 @@ class Controller:
     description naming another UDN, is an error: never a wrong device."""
 
     def __init__(self, config, locator, api_port=RAUMFELD_API_PORT, sleep=time.sleep,
-                 zone_wait_s=10.0, zone_poll_s=0.5, clock=time.monotonic):
+                 zone_wait_s=10.0, zone_poll_s=0.5, clock=time.monotonic, state=None):
         self.config = config
         self.locator = locator
+        self.state = state  # a StateFile, or None: the cache lives in memory only
+        self._stored = None  # the renderer location loaded from the state, until tried
         self.api_port = api_port
         self.sleep = sleep
         self.clock = clock
@@ -580,7 +659,10 @@ class Controller:
 
     def warm_up(self):
         """Find the host and the room's zone renderer before the first cast, so that cast
-        finds them cached. Nothing found is no error: the first cast looks again."""
+        finds them cached. A renderer location kept in the state file is tried first.
+        Nothing found is no error: the first cast looks again."""
+        if self.state is not None:
+            self._stored = self.state.load()
         try:
             zone = zone_of_room(self._get_zones(), self.config.room_udn)
             if zone is not None:
@@ -779,7 +861,25 @@ class Controller:
         raise RaumfeldError("room did not appear in a zone after connectRoomToZone")
 
     def _control_url(self, zone):
+        """The zone renderer's control URL: from the stored location if there is one for this
+        zone (tried once) and it still describes the zone, otherwise from a search; a found
+        location is stored."""
+        stored, self._stored = self._stored, None
+        if stored is not None and stored["zone_udn"] == zone:
+            try:
+                if not self.locator.accepts(stored["host"]):
+                    raise RaumfeldError("%r is not the Raumfeld host" % stored["host"])
+                return self._describe(zone, stored["host"], stored["location"])
+            except _ERRORS as e:
+                log.info("zone renderer location from the adapter state not usable (%r); "
+                         "searching for it", e)
         host, location = self.locator.renderer(zone)
+        control = self._describe(zone, host, location)
+        if self.state is not None:
+            self.state.save({"zone_udn": zone, "host": host, "location": location})
+        return control
+
+    def _describe(self, zone, host, location):
         check_device_url(location, host)
         description = http_get(location)
         udn = device_udn(description)
@@ -1524,7 +1624,9 @@ def main(env=None):
                     "into standby")
     locator = (HostLocator(config.raumfeld_host) if config.raumfeld_host
                else SsdpLocator(ssdp_discover, config.speaker_udn))
-    controller = Controller(config, locator)
+    state = (StateFile(os.path.join(config.state_dir, STATE_FILE_NAME)) if config.state_dir
+             else None)
+    controller = Controller(config, locator, state=state)
     controller.warm_up()
     follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds,
                         start_gate_seconds=config.start_gate_seconds)

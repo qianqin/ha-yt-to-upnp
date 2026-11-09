@@ -1,7 +1,10 @@
 """Feature: Raumfeld follows the cast -- Controller against a fake Raumfeld host."""
 
+import json
 import os
 import socket
+import stat
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -649,6 +652,154 @@ class ControllerWithHostTest(unittest.TestCase):
                 self.assertRaises(ra.DeviceNotFound):
             self.ctl.ensure_playing()
         self.assertEqual(self.rf.soap_actions(), [])
+
+
+class StoredRendererTest(unittest.TestCase):
+    """ADAPTER_STATE_DIR: the zone renderer's location survives adapter restarts. At start it
+    is used first, without a search, when its description names the zone; otherwise the
+    search runs and the file is updated."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.discover = FakeDiscovery(self.rf)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.path = os.path.join(self.dir, ra.STATE_FILE_NAME)
+        self.config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                          "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                          "STREAM_URL": STREAM_URL,
+                                          "ADAPTER_STATE_DIR": self.dir})
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def controller(self, locator=None):
+        return ra.Controller(self.config, locator or ra.SsdpLocator(self.discover, SPEAKER_UDN),
+                             api_port=self.rf.port, sleep=lambda s: None,
+                             state=ra.StateFile(self.path))
+
+    def store(self, entry):
+        with open(self.path, "w") as f:
+            f.write(entry if isinstance(entry, str) else json.dumps(entry))
+
+    def stored(self):
+        with open(self.path) as f:
+            return json.load(f)
+
+    def entry(self, location=None, zone=ZONE_UDN, host="127.0.0.1"):
+        return {"zone_udn": zone, "host": host, "location": location or self.rf.base + "/zone.xml"}
+
+    def warm_up(self, ctl, level="INFO"):
+        with self.assertLogs("raumfeld_adapter", level) as logs:
+            ctl.warm_up()
+        return logs.output
+
+    def test_a_found_renderer_is_stored_atomically_and_privately(self):
+        self.warm_up(self.controller())
+        self.assertEqual(self.stored(), self.entry())
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        self.assertEqual(os.listdir(self.dir), [ra.STATE_FILE_NAME])  # no temporary left
+
+    def test_a_stored_renderer_is_used_at_start_without_a_search(self):
+        self.store(self.entry())
+        ctl = self.controller()
+        self.warm_up(ctl)
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN])  # the host only, no zone search
+        ctl.ensure_playing()
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN])
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_a_stored_renderer_that_does_not_answer_falls_back_to_the_search(self):
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        port = dead.getsockname()[1]
+        dead.close()  # nothing listens there now
+        self.store(self.entry("http://127.0.0.1:%d/zone.xml" % port))
+        self.warm_up(self.controller())
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertEqual(self.stored(), self.entry())  # updated
+
+    def test_a_stored_location_of_another_device_falls_back_to_the_search(self):
+        other = FakeRaumfeld()
+        self.addCleanup(other.close)
+        other.zone_udn = NEW_ZONE_UDN  # its description names another UDN
+        self.store(self.entry(other.base + "/zone.xml"))
+        self.warm_up(self.controller())
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertEqual(self.stored(), self.entry())
+        self.assertEqual(other.soap_actions(), [])
+
+    def test_a_stored_renderer_of_another_zone_is_not_used(self):
+        self.store(self.entry(zone=NEW_ZONE_UDN))
+        self.warm_up(self.controller())
+        self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+        self.assertEqual(self.stored(), self.entry())
+
+    def test_an_unusable_file_is_ignored_with_a_warning(self):
+        for content in ("not json", "[]", json.dumps({"zone_udn": ZONE_UDN}),
+                        json.dumps(dict(self.entry(), zone_udn="uuid:x\r\nST: ssdp:all")),
+                        json.dumps(dict(self.entry(), host=5)),
+                        json.dumps(self.entry("file:///etc/passwd")),
+                        # The location must be on the stored host, like a discovery's.
+                        json.dumps(self.entry("http://192.0.2.1:%d/zone.xml" % self.rf.port)),
+                        "x" * (ra.STATE_MAX_BYTES + 1)):
+            with self.subTest(content=content[:40]):
+                self.discover.searches.clear()
+                self.store(content)
+                output = self.warm_up(self.controller(), "WARNING")
+                self.assertTrue(any("state" in m for m in output), output)
+                self.assertEqual(self.discover.searches, [SPEAKER_UDN, ZONE_UDN])
+                self.assertEqual(self.stored(), self.entry())  # replaced by what was found
+
+    def test_an_unwritable_directory_is_logged_and_the_adapter_goes_on(self):
+        self.path = os.path.join(self.dir, "missing", ra.STATE_FILE_NAME)
+        ctl = self.controller()
+        output = self.warm_up(ctl, "WARNING")
+        self.assertTrue(any("state" in m for m in output), output)
+        ctl.ensure_playing()
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def host_controller(self, searched):
+        locator = ra.HostLocator("raumfeld-host.invalid", resolve=lambda name: "127.0.0.1",
+                                 group=("127.0.0.1", 9))
+
+        def renderer(zone):
+            searched.append(zone)
+            return "127.0.0.1", self.rf.base + "/zone.xml"
+
+        locator.renderer = renderer
+        return ra.Controller(self.config, locator, api_port=self.rf.port, sleep=lambda s: None,
+                             state=ra.StateFile(self.path))
+
+    def test_with_raumfeld_host_a_stored_renderer_must_be_on_that_host(self):
+        # Stored when the host had another address (or before RAUMFELD_HOST was set).
+        self.store(self.entry("http://127.0.0.9:%d/zone.xml" % self.rf.port, host="127.0.0.9"))
+        searched = []
+        output = self.warm_up(self.host_controller(searched))
+        self.assertTrue(any("state" in m for m in output), output)
+        self.assertEqual(searched, [ZONE_UDN])
+        self.assertEqual(self.stored(), self.entry())
+
+    def test_with_raumfeld_host_a_stored_renderer_on_it_is_used_without_a_search(self):
+        self.store(self.entry())
+        searched = []
+        ctl = self.host_controller(searched)
+        self.warm_up(ctl)
+        ctl.ensure_playing()
+        self.assertEqual(searched, [])
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+
+    def test_without_a_state_dir_nothing_is_written(self):
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.assertIsNone(config.state_dir)
+        ctl = ra.Controller(config, ra.SsdpLocator(self.discover, SPEAKER_UDN),
+                            api_port=self.rf.port, sleep=lambda s: None)
+        self.warm_up(ctl)
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 class RendererRestartTest(unittest.TestCase):
