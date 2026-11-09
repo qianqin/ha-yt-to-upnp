@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Assembles the Home Assistant app folder, ready to copy into the HA host's
-# /addons share: the files from ha-yt-to-upnp/ plus prebuilt artefacts for
+# /addons share: ha-yt-to-upnp/ as committed at HEAD plus prebuilt artefacts for
 # linux/amd64, so the Supervisor's build only installs Debian packages and
-# copies files. Every download is pinned and verified; any mismatch aborts.
+# copies files. The build images are pinned by digest, Deno by checksum,
+# bgutil by commit and lock files; any mismatch aborts. Not pinned: protoc
+# (Debian bookworm's protobuf-compiler, installed in the Rust container); its
+# version is recorded in BUILD-INFO.
 # Temporary directories, containers and volumes created here are always
 # removed, and so are images this script had to pull (images that were already
 # present are left alone).
@@ -11,6 +14,10 @@ set -euo pipefail
 # Pinned inputs. Update deliberately, re-verify, and note it in the CHANGELOG.
 readonly PLATFORM=linux/amd64
 readonly RUST_TARGET=x86_64-unknown-linux-gnu
+# Must equal the channel in the receiver's rust-toolchain.toml (checked below),
+# so rustup in the container downloads nothing.
+readonly RUST_CHANNEL=1.99.1
+readonly RUST_IMAGE="rust:${RUST_CHANNEL}-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c"
 readonly NODE_IMAGE="node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567"
 readonly DENO_VERSION=2.9.8
 readonly DENO_URL="https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-${RUST_TARGET}.zip"
@@ -55,6 +62,14 @@ for tool in docker git curl unzip shasum tar file; do
 done
 docker info >/dev/null 2>&1 || die "Docker daemon not running"
 
+# The app folder is taken from HEAD; uncommitted changes there would be silently
+# left out of the build, so refuse them.
+if [ -n "$(git status --porcelain --untracked-files=all -- ha-yt-to-upnp)" ]; then
+  git status --short --untracked-files=all -- ha-yt-to-upnp >&2
+  die "uncommitted or untracked changes in ha-yt-to-upnp/; commit them first"
+fi
+head_commit="$(git rev-parse --verify HEAD)"
+
 if [ -e "$out" ] && [ ! -f "$out/artefacts/BUILD-INFO" ] && [ -n "$(ls -A "$out")" ]; then
   die "$out exists and is not a previous build; refusing to replace it"
 fi
@@ -63,7 +78,7 @@ receiver_commit="$(git rev-parse --verify --quiet "${receiver_ref}^{commit}")" |
 adapter_commit="$(git rev-parse --verify --quiet "${adapter_ref}^{commit}")" || die "unknown adapter ref '$adapter_ref'"
 channel="$(git show "$receiver_commit:rust-toolchain.toml" | sed -n 's/^channel = "\(.*\)"$/\1/p')"
 [ -n "$channel" ] || die "no channel in rust-toolchain.toml at $receiver_commit"
-rust_image="rust:${channel}-bookworm"
+[ "$channel" = "$RUST_CHANNEL" ] || die "receiver $receiver_commit needs Rust $channel, the pinned image has $RUST_CHANNEL; update RUST_CHANNEL and RUST_IMAGE"
 
 run_id="ytcast-ha-build-$$"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ytcast-ha-build.XXXXXX")"
@@ -100,9 +115,9 @@ app="$tmp/app"
 art="$app/artefacts"
 mkdir -p "$art/adapter" "$tmp/dl" "$tmp/deno" "$tmp/receiver-src" "$tmp/receiver-out"
 
-step "receiver $receiver_commit ($rust_image, $PLATFORM, --release --locked)"
+step "receiver $receiver_commit ($RUST_IMAGE, $PLATFORM, --release --locked)"
 git archive "$receiver_commit" | tar -x -C "$tmp/receiver-src"
-ensure_image "$rust_image"
+ensure_image "$RUST_IMAGE"
 volumes="$volumes $run_id-target"
 docker volume create "$run_id-target" >/dev/null
 containers="$containers $run_id-receiver"
@@ -110,7 +125,8 @@ docker run --rm --name "$run_id-receiver" --platform "$PLATFORM" \
   -v "$tmp/receiver-src":/src:ro -w /src \
   -v "$run_id-target":/target -e CARGO_TARGET_DIR=/target \
   -v "$tmp/receiver-out":/out \
-  "$rust_image" bash -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null \
+  "$RUST_IMAGE" bash -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null \
+    && protoc --version > /out/protoc-version \
     && cargo build --locked --release --target $RUST_TARGET \
     && install -m 0755 /target/$RUST_TARGET/release/ytcast-lite /out/ytcast-lite"
 file_type="$(file -b "$tmp/receiver-out/ytcast-lite")"
@@ -119,6 +135,7 @@ case "$file_type" in
   *) die "receiver binary is not an x86-64 ELF: $file_type" ;;
 esac
 cp "$tmp/receiver-out/ytcast-lite" "$art/ytcast-lite"
+protoc_version="$(cat "$tmp/receiver-out/protoc-version")"
 
 step "adapter $adapter_commit"
 git show "$adapter_commit:adapter/raumfeld_adapter.py" > "$art/adapter/raumfeld_adapter.py"
@@ -153,21 +170,28 @@ docker run --rm --name "$run_id-bgutil" --platform "$PLATFORM" \
   "$NODE_IMAGE" bash -c "npm ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=warn \
     && deno cache --frozen src/main.ts"
 [ -d "$art/bgutil/node_modules" ] && [ -d "$art/bgutil/.deno" ] || die "bgutil install incomplete"
+# deno.json allows canvas' install script, but neither npm ci --ignore-scripts
+# nor deno cache runs it; a native addon here would mean that something did.
+native="$(find "$art/bgutil" \( -name '*.node' -o -path '*/node_modules/canvas/build' \) -print)"
+[ -z "$native" ] || die "bgutil contains native build output (an install script ran): $native"
 
-step "app folder (ha-yt-to-upnp/ at $(git describe --always --dirty))"
-git ls-files -z ha-yt-to-upnp | tar -c --null -T - -f - | tar -x -C "$tmp"
+step "app folder (ha-yt-to-upnp/ at $head_commit)"
+git archive "$head_commit" ha-yt-to-upnp | tar -x -C "$tmp"
 cp -R "$tmp/ha-yt-to-upnp/." "$app/"
 
 cat > "$art/BUILD-INFO" <<EOF
 built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-app folder: $(git describe --always --dirty)
-receiver: $receiver_commit ($rust_image, $RUST_TARGET, release, --locked)
+app folder: $head_commit (ha-yt-to-upnp/ via git archive)
+receiver: $receiver_commit ($RUST_TARGET, release, --locked)
+receiver build image: $RUST_IMAGE
+receiver protoc: $protoc_version (Debian bookworm protobuf-compiler)
 receiver sha256: $(sha256_of "$art/ytcast-lite")
 adapter: $adapter_commit (adapter/raumfeld_adapter.py)
 adapter sha256: $(sha256_of "$art/adapter/raumfeld_adapter.py")
 deno: $DENO_VERSION, zip sha256 $DENO_SHA256
 deno binary sha256: $(sha256_of "$art/deno")
 bgutil-ytdlp-pot-provider: $BGUTIL_COMMIT (npm ci --omit=dev --ignore-scripts in $NODE_IMAGE)
+bgutil native build output: none (no *.node, no node_modules/canvas/build)
 EOF
 
 step "output $out"
