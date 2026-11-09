@@ -1,0 +1,18 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# PoToken helper (bgutil-ytdlp-pot-provider on Deno), loopback only. Started with
+# an empty environment and the narrowest Deno permissions that still work; the
+# Deno cache was filled at build time, so nothing is fetched or written here.
+# Its stdout carries the generated tokens, so it is discarded.
+readonly app=/opt/bgutil
+
+bashio::log.info "Starting PoToken helper on 127.0.0.1:4416"
+cd "${app}" || bashio::exit.nok "missing ${app}"
+exec s6-setuidgid potoken env -i \
+    DENO_DIR="${app}/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 \
+    HOME=/nonexistent PATH=/usr/bin:/bin \
+    /usr/local/bin/deno run --no-prompt --frozen --cached-only \
+    --allow-net=127.0.0.1:4416,www.youtube.com:443,www.google.com:443,jnn-pa.googleapis.com:443 \
+    --allow-read="${app}/node_modules" --allow-env \
+    --deny-write --deny-run --deny-ffi --deny-sys --deny-import \
+    src/main.ts --host 127.0.0.1 --port 4416 >/dev/null

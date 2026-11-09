@@ -1,0 +1,4 @@
+# Home Assistant app repository metadata. The app is installed as a local app
+# for now (built folder copied to /addons); this file only matters if the
+# repository is ever added to Home Assistant as an app repository.
+name: ha-yt-to-upnp

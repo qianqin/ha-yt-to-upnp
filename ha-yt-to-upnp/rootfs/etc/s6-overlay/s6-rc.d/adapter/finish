@@ -1,0 +1,5 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# shellcheck source=SCRIPTDIR/../../../../usr/lib/ytcast/common.sh
+source /usr/lib/ytcast/common.sh
+ytcast_finish adapter "$1" "$2"

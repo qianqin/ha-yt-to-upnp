@@ -1,0 +1,7 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# Every service starts with an empty environment: the container's (with the
+# Supervisor token) is not passed on.
+bashio::log.info "Starting MPD (control 127.0.0.1:6600, stream on port 8000)"
+exec s6-setuidgid mpd env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+    mpd --no-daemon --stderr /etc/ytcast/mpd.conf

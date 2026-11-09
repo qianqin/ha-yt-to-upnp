@@ -1,0 +1,18 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# YouTube cast receiver: DIAL on port 8008, SSDP on 1900. No credentials are
+# stored: each cast brings its own token from the phone.
+# shellcheck source=SCRIPTDIR/../../../../usr/lib/ytcast/common.sh
+source /usr/lib/ytcast/common.sh
+set -e
+
+device_name="$(ytcast_option cast_name)"
+rust_log="$(ytcast_log_level rust)"
+
+ytcast_wait_for_mpd
+bashio::log.info "Starting receiver as '${device_name}' (DIAL on port 8008)"
+exec s6-setuidgid ytcast env -i PATH=/usr/bin:/bin HOME=/data/ytcast \
+    DEVICE_NAME="${device_name}" RUST_LOG="${rust_log}" \
+    MPD_HOST="${YTCAST_MPD_HOST}" MPD_PORT="${YTCAST_MPD_PORT}" \
+    YTCAST_DATA_DIR=/data/ytcast \
+    /usr/local/bin/ytcast-lite

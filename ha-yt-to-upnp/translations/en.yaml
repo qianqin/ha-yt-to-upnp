@@ -1,0 +1,30 @@
+configuration:
+  cast_name:
+    name: Cast name
+    description: >-
+      Name shown in the YouTube Music cast menu. Only one device on the LAN
+      may use it: stop any other instance of this receiver first.
+  raumfeld_room_udn:
+    name: Raumfeld room UDN
+    description: UPnP UDN of the Raumfeld room, e.g. uuid:00000000-0000-0000-0000-000000000001
+  raumfeld_speaker_udn:
+    name: Raumfeld speaker UDN
+    description: UPnP UDN of the speaker device that hosts the Raumfeld API.
+  stream_host:
+    name: Stream host
+    description: >-
+      Host name or IPv4 address the speaker uses to fetch the stream on port
+      8000. Leave empty to use the Home Assistant host's LAN IPv4 address.
+  start_gate_seconds:
+    name: Start gate (seconds)
+    description: >-
+      How long the song is held at its start while the speaker wakes (0-60,
+      0 turns it off). Default 15.
+  stuck_seconds:
+    name: Stuck renderer timeout (seconds)
+    description: >-
+      How long the speaker may hang while buffering before it is restarted
+      (1-300). Default 15.
+  log_level:
+    name: Log level
+    description: Log level of the receiver and the adapter.

@@ -1,0 +1,30 @@
+name: YouTube to UPnP
+version: "0.1.0"
+slug: yt_to_upnp
+description: >-
+  YouTube Music cast receiver (DIAL + Lounge API) that plays through MPD's
+  HTTP stream on a Teufel Raumfeld room via UPnP. Built locally, no image
+  registry.
+arch:
+  - amd64
+startup: application
+boot: auto
+stage: experimental
+# s6-overlay v3 (the base image's /init) needs Docker's own init disabled.
+init: false
+# SSDP/DIAL discovery and the Raumfeld's UPnP need multicast on the LAN.
+host_network: true
+options:
+  cast_name: YouTube to UPnP
+  raumfeld_room_udn: null
+  raumfeld_speaker_udn: null
+  log_level: info
+schema:
+  # The receiver writes the name unescaped into its DIAL device description.
+  cast_name: 'match(^[^<>&"\x00-\x1f]{1,60}$)'
+  raumfeld_room_udn: match(^uuid:[0-9A-Za-z-]{1,64}$)
+  raumfeld_speaker_udn: match(^uuid:[0-9A-Za-z-]{1,64}$)
+  stream_host: match(^[0-9A-Za-z.-]{1,253}$)?
+  start_gate_seconds: int(0,60)?
+  stuck_seconds: int(1,300)?
+  log_level: list(debug|info|warning|error)
