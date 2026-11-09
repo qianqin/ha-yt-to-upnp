@@ -706,7 +706,10 @@ mod tests {
             let (port, server) = fake_mpd(vec![]).await;
             let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
             for uri in ["http://x/\nstop", "http://x/\r"] {
-                assert!(mpd.addid(uri).await.is_err(), "{uri:?}");
+                let err = mpd.addid(uri).await.unwrap_err();
+                assert!(matches!(err, MpdError::Protocol(_)), "{uri:?}: {err}");
+                let err = mpd.add(uri).await.unwrap_err();
+                assert!(matches!(err, MpdError::Protocol(_)), "{uri:?}: {err}");
             }
             drop(mpd);
             assert!(server.await.unwrap().is_empty());
@@ -731,6 +734,19 @@ mod tests {
                 server.await.unwrap(),
                 vec!["command_list_begin", "playid 6", "pause 1", "command_list_end", "status"]
             );
+        }
+
+        #[tokio::test]
+        async fn command_list_refuses_a_command_with_a_line_break() {
+            // A line break would end the command and smuggle in the next one.
+            let (port, server) = fake_mpd(vec![]).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            for command in ["pause 1\nclear", "x\r"] {
+                let err = mpd.command_list(&["playid 6".into(), command.into()]).await.unwrap_err();
+                assert!(matches!(err, MpdError::Protocol(_)), "{command:?}: {err}");
+            }
+            drop(mpd);
+            assert!(server.await.unwrap().is_empty());
         }
 
         #[tokio::test]
@@ -828,12 +844,24 @@ mod tests {
 /// an `MpdClient` or `MpdIdleClient`.
 #[cfg(all(test, not(feature = "mock-mpd")))]
 pub(crate) mod fake {
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     /// Scripted in-process MPD: for each expected command, reply with the
     /// given response. Returns the commands it actually received.
     pub async fn fake_mpd(script: Vec<(&'static str, &'static str)>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        fake_mpd_within(script, Duration::from_secs(5)).await
+    }
+
+    /// `fake_mpd` that gives up on a command not sent within `wait`. A client
+    /// whose commands differ from the script can end up waiting on a reply
+    /// the script never sends while the script waits on its next command;
+    /// the server then panics, and its closed connection fails the client.
+    async fn fake_mpd_within(
+        script: Vec<(&'static str, &'static str)>,
+        wait: Duration,
+    ) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
@@ -842,9 +870,13 @@ pub(crate) mod fake {
             let mut rd = BufReader::new(rd);
             wr.write_all(b"OK MPD 0.23.5\n").await.unwrap();
             let mut seen = Vec::new();
-            for (_expected, reply) in script {
+            for (expected, reply) in script {
                 let mut line = String::new();
-                if rd.read_line(&mut line).await.unwrap() == 0 {
+                let read = tokio::time::timeout(wait, rd.read_line(&mut line)).await;
+                let Ok(read) = read else {
+                    panic!("fake MPD: no command within {wait:?}, expected {expected:?}; received so far: {seen:?}");
+                };
+                if read.unwrap() == 0 {
                     break;
                 }
                 seen.push(line.trim_end().to_owned());
@@ -853,5 +885,24 @@ pub(crate) mod fake {
             seen
         });
         (port, handle)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::mpd::MpdClient;
+
+        #[tokio::test]
+        async fn a_client_waiting_on_an_unscripted_reply_fails_instead_of_hanging() {
+            // The script expects a second command that never comes, and the
+            // client waits on a reply the script never sends.
+            let (port, server) =
+                fake_mpd_within(vec![("status", ""), ("next", "OK\n")], Duration::from_millis(100)).await;
+            let mut mpd = MpdClient::connect("127.0.0.1", port).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), mpd.status()).await;
+            assert!(reply.expect("the client hung").is_err());
+            let err = server.await.unwrap_err();
+            assert!(err.is_panic(), "{err}");
+        }
     }
 }
