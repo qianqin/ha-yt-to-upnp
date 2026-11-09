@@ -174,9 +174,17 @@ refuses uncommitted or untracked changes there and takes the folder from
 `HEAD` with `git archive`):
 
 ```sh
-scripts/build-ha-app.sh                      # receiver 7a699f5, adapter 556d421
+scripts/build-ha-app.sh                      # receiver and adapter from HEAD
 scripts/build-ha-app.sh --receiver-ref <ref> --adapter-ref <ref> --out <dir>
 ```
+
+By default the receiver and the adapter are built from `HEAD`, the same commit
+as the app folder, so the run scripts and the programs they start (and the
+environment they pass, e.g. `RAUMFELD_HOST`, `ADAPTER_STATE_DIR`) are in step.
+Only uncommitted changes in `ha-yt-to-upnp/` are refused; the receiver and the
+adapter are taken from the commit too (`git archive`, `git show`), so commit
+them before building. Pass other refs only to rebuild an older release (see
+Rollback).
 
 The result is `dist/ha-yt-to-upnp/` (gitignored): the app folder files plus
 `artefacts/`:
@@ -215,21 +223,33 @@ ports**, so nothing is announced on the LAN. The bridge network does reach the
 internet through Docker's NAT, and the smoke test needs that: for the image
 build (Debian packages) and for the PoToken check below.
 
-With test options (placeholder UDNs, cast name `Smoke Test`) it checks that
+Run 1, with test options (placeholder UDNs, cast name `Smoke Test`, no
+`raumfeld_host`), checks that
 MPD answers on `127.0.0.1:6600` (and not on the container's address); while
 MPD plays a generated second of silence (MPD opens its httpd output only when
 it plays) the stream answers on port 8000 as `audio/mpeg`; the receiver
-serves its DIAL device description on 8008 with the configured name; the
+serves its DIAL device description on 8008 with the configured name, and its
+pre-roll silence on `http://localhost:8008/silence` (`200`, `audio/L16`, zero
+samples, fetched with `curl` in the container) but answers `403` to the same
+request on the container's address; `/data/adapter` exists with mode `0700`,
+owned by the `adapter` user; the
 PoToken helper answers `/ping` on `127.0.0.1:4416` only and mints a token on
 `POST /get_pot` for a placeholder content binding (this fetches BotGuard from
 YouTube/Google through the helper's restricted Deno permissions); every
 service runs as its own non-root user, does not get the (dummy)
 `SUPERVISOR_TOKEN` the container is started with and cannot read it from
 `/run/s6/container_environment`; the options arrive as the expected
-environment (auto-detected and explicit `stream_host`, unset optional
-timings); the adapter logs that it finds no speaker and keeps running; no
-service restarts within 20 s; and an invalid `cast_name` stops the app with
-one error naming the option, before any service starts. The checks run in the
+environment (auto-detected `stream_host`, `ADAPTER_STATE_DIR=/data/adapter`,
+no `RAUMFELD_HOST`); the adapter logs that it finds no speaker
+(`DeviceNotFound`) and keeps running; no service restarts within 20 s. Run 2
+sets `raumfeld_host` to the unreachable `192.0.2.20` without
+`raumfeld_speaker_udn`, an explicit `stream_host` and no optional timings: the
+adapter gets `RAUMFELD_HOST` and no `RAUMFELD_SPEAKER_UDN`, logs `Raumfeld
+room not found yet` and keeps running with no service restart within 20 s.
+Runs 3-5 check that an invalid `cast_name`, an invalid `raumfeld_host`
+(`192.0.2.20:47365`) and neither `raumfeld_speaker_udn` nor `raumfeld_host`
+each stop the app with one `FATAL` line naming the option, before any service
+starts. The checks run in the
 container through `docker exec --privileged` (reading other users' `/proc`
 entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it
 removes the containers, network, image, builder (with its cache) and the
@@ -246,16 +266,17 @@ shellcheck -x -s bash ha-yt-to-upnp/rootfs/usr/lib/ytcast/common.sh \
 
 ### Copy to the Home Assistant host
 
-Over SSH (the Terminal & SSH app maps the `/addons` share); `<ha-host>` is the
-Home Assistant host:
+Local apps live in `/local_apps` on the Home Assistant host (current Home
+Assistant OS; not `/addons`). Over SSH (the Terminal & SSH app maps
+`/local_apps`); `<ha-host>` is the Home Assistant host:
 
 ```sh
 tar -C dist -cf - ha-yt-to-upnp | ssh root@<ha-host> \
-  'rm -rf /addons/ha-yt-to-upnp && tar -xf - -C /addons'
+  'rm -rf /local_apps/ha-yt-to-upnp && tar -xf - -C /local_apps'
 ```
 
-The Samba share app works as well: replace the folder `addons/ha-yt-to-upnp`
-as a whole.
+The Samba share app works as well: replace the folder
+`local_apps/ha-yt-to-upnp` as a whole.
 
 ### Install
 
@@ -265,9 +286,9 @@ as a whole.
    under **Local apps** (slug `local_yt_to_upnp`).
 3. Install it. The Supervisor builds the image on the host (a few minutes:
    Debian packages).
-4. Configuration tab: set `cast_name`, `raumfeld_room_udn`,
-   `raumfeld_speaker_udn` (see `DOCS.md`), save, start. Check the log for the
-   four `Starting ...` lines.
+4. Configuration tab: set `cast_name`, `raumfeld_room_udn`, and
+   `raumfeld_speaker_udn` or `raumfeld_host` (or both; see `DOCS.md`), save,
+   start. Check the log for the four `Starting ...` lines.
 
 ### Update
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0
+
+Faster cast start, optional fixed Raumfeld host.
+
+- Silence pre-roll: from the phone's DIAL launch on, the receiver plays
+  silence into MPD (`http://localhost:8008/silence`, refused with 403 to
+  anything but loopback), so the adapter wakes the room and connects it to
+  the stream while the cast is still loading.
+- Held hand-over: the song replaces the silence in MPD; if the adapter holds
+  the silence while the speaker wakes, the song waits paused and the start
+  gate carries on with it, so the song starts at its beginning on the
+  speaker.
+- The adapter finds the Raumfeld host and the room's zone renderer at start
+  and keeps them for the first cast; the start gate asks the renderer every
+  0.25 s (was 0.5 s). The wake wait after `leaveStandby` (up to 10 s) is
+  unchanged from 0.1.0.
+- New option `raumfeld_host` (IPv4 address or DNS name): the adapter reaches
+  the Raumfeld API there directly instead of searching for it;
+  `raumfeld_speaker_udn` is then optional. Without either, the app stops at
+  start with an error naming `raumfeld_speaker_udn`.
+- The zone renderer's location is kept across restarts in `/data/adapter`
+  (private to the adapter), so a restart needs no search.
+- Build inputs: receiver and adapter now come from the same commit as the
+  app folder by default (see `artefacts/BUILD-INFO`).
+- Docs: the app folder goes into `/local_apps` on the Home Assistant host.
+
 ## 0.1.0
 
 First local app build.
