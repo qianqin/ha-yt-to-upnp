@@ -1223,8 +1223,11 @@ class Follower:
     ends the gate at once: it yields (MPD stays paused, the cast is released). Its own
     pause and resume are not followed; a failed takeover lets MPD play at once and is
     retried after PLAY_RETRY_S without the gate. Another song during the gate (the
-    receiver's song replacing its pre-roll silence, or a skip) is held at its start too,
-    the gate carrying on; a stop during the gate is the user's doing and is never undone;
+    receiver's song replacing its pre-roll silence, or a skip) is held too, the gate
+    carrying on: at 0:00 when the receiver hands it over held (MPD reports pause with the
+    new songid; no extra pause), otherwise paused again as soon as its play is read. A
+    held hand-over racing our pause 0 is resumed again (AFTER_GATE_HANDOVER_S). A stop
+    during the gate is the user's doing and is never undone;
     a pause from the phone during the gate can't be told apart from ours (MPD is already
     paused, nothing changes), so it is undone."""
 

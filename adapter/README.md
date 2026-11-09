@@ -21,7 +21,10 @@ Raumfeld room play the receiver's MPD stream automatically.
   start, so the first cast finds them cached, and again only when a request to
   the cached address fails (then the request is sent once more to the address
   found afresh) or the room is in another zone (its renderer is looked for by the
-  new zone UDN). With a valid cache a takeover sends no SSDP at all.
+  new zone UDN). For the zone renderer "fails" means no answer (refused, reset,
+  timed out): an error it answers with, e.g. a UPnP fault (HTTP 500), comes from
+  the right device and is raised as it is, the request not sent twice. With a
+  valid cache a takeover sends no SSDP at all.
   - SSDP searches are multicast (`239.255.255.250:1900`) with `MX: 1`, re-sent
     each second, and return at the first matching answer (the Raumfeld answers
     in about 0.3 s with `MX: 1`, about 2 s with `MX: 2`).
@@ -32,18 +35,26 @@ Raumfeld room play the receiver's MPD stream automatically.
     at `http://<host>:47365/` directly; a name is resolved once (IPv4) and again
     after a failed request. The zone renderer is found by a search for the zone
     UDN (`ST:` the zone UDN) of which only answers sent from the host's address
-    count; others are ignored (at most 3 s). The Raumfeld does **not** answer a
-    unicast M-SEARCH sent to `<host>:1900`, so the setting filters multicast
-    answers instead of replacing multicast.
+    count; others are ignored (at most 3 s), and a matching answer from another
+    address is logged once per search as a warning naming both addresses. So
+    `RAUMFELD_HOST` must resolve to the address the host answers SSDP from (on a
+    host with several interfaces, the one on the speakers' LAN). The Raumfeld does
+    **not** answer a unicast M-SEARCH sent to `<host>:1900`, so the setting filters
+    multicast answers instead of replacing multicast. An IPv4 address gives the
+    firmest binding: no DNS, so nothing can re-point it, and it costs no lookup.
   - **Kept across restarts** with `ADAPTER_STATE_DIR`: after a search the zone
     renderer's location is written to `raumfeld-adapter-state.json` there (zone
     UDN, host address, description URL; nothing secret), atomically (temporary
     file, rename) with mode 0600. At start it is tried first: if its description
-    still names the zone (and, with `RAUMFELD_HOST`, it is on that host's
-    address), no search is needed. Otherwise, or for another zone, the search
-    runs and the file is updated. A file that can't be read, is larger than
+    still names the zone and it is on an acceptable host (with `RAUMFELD_HOST` that
+    host's address; without it an IPv4 address on the LAN, private or link-local,
+    as an SSDP sender is), no search is needed. Otherwise, or for another zone,
+    the search runs and the file is updated. A file that can't be read, is not a
+    regular file (a symlink or a FIFO is not opened through), is larger than
     4 KiB or holds no valid location (plain `http://` on its stored host) is
-    ignored with a warning; a file that can't be written is logged and the
+    ignored with a warning. A state directory writable by group or others is
+    warned about at start: whoever can write there chooses the location the
+    adapter tries first (still checked as above). Make it private to the adapter; a file that can't be written is logged and the
     adapter goes on with its in-memory cache. Without `ADAPTER_STATE_DIR` nothing
     is written. The host itself is still found by SSDP without `RAUMFELD_HOST`.
   - Either way: a host whose `getZones` doesn't list `RAUMFELD_ROOM_UDN` is an
@@ -55,7 +66,8 @@ Raumfeld room play the receiver's MPD stream automatically.
 - **Start gate:** the speaker needs several seconds to wake, join its zone and
   buffer, while MPD starts the song right away. So when MPD starts playing and
   the adapter doesn't own the room (a new cast, or a resume after the room was
-  taken away), it first sends MPD `pause 1`, which holds the song at about 0:00;
+  taken away), it first sends MPD `pause 1`, which holds the song where MPD has
+  got to by then, a moment after its start;
   MPD's httpd output keeps streaming silence while paused (`always_on`), so the
   speaker can connect. Then it wakes the room and starts the stream as usual,
   asks the zone renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL`,
@@ -93,16 +105,31 @@ Raumfeld room play the receiver's MPD stream automatically.
   ids). The adapter's own pause is not followed to the speaker (no AVTransport
   `Pause`, no "taken away"). **Pre-roll:** the receiver starts MPD on endless
   silence at the DIAL launch (see the main README), so the gate normally starts
-  on the silence and the song replaces it later, MPD going from playing the
-  silence straight to playing the song (a new `songid`, no stop). If that
-  happens during the gate, the gate carries on with the song: the adapter sends
-  `pause 1` again if MPD went to play, so the song too is held at about 0:00
-  until the speaker plays, with the gate's timing and re-takeover count
-  unchanged and without a new takeover. A skip from the phone during the gate
-  is held the same way (holding at the start of the new song undoes nothing).
-  If the song arrives while the adapter's `pause 0` is on its way, the speaker
-  already plays: the gate ends and MPD plays the song. If the song arrives after
-  the gate (the speaker already plays the silence), there is no gate and no
+  on the silence and the song replaces it later (a new `songid`, no stop). If
+  MPD is paused then (the gate holds the silence), the receiver hands the song
+  over held: `playid <song>; pause 1; deleteid <silence>` in one command list,
+  so MPD reports `pause` with the new `songid` and sends no audio of the song;
+  the gate carries on with it, held at 0:00, without another `pause 1`, and the
+  adapter's `pause 0` starts it once the speaker plays. This also holds when the
+  song arrives while a slow takeover blocks the adapter: it reads the change
+  after the takeover returned. If MPD plays then, the receiver goes from the
+  silence straight to playing the song, and the adapter sends `pause 1` again as
+  soon as it reads that change: the song is held a moment after its start, not
+  at 0:00 (YouTube streams in MPD can't be sought back to 0:00). Either way the
+  gate's timing and re-takeover count are unchanged, and there is no new
+  takeover. A skip from the phone during the gate is held the same way (holding
+  at the start of the new song undoes nothing). If the song arrives while the
+  adapter's `pause 0` is on its way, the speaker already plays: played by MPD,
+  the gate ends and MPD plays the song; handed over held (the receiver saw MPD
+  paused just before the `pause 0` landed), the adapter sends `pause 0` again.
+  That race can also show only after the gate ended, the `pause 0` having landed
+  on the silence: a `pause` with a new `songid` at most 1 s into the song
+  (`HANDOVER_ELAPSED_S`), within 5 s of the gate's end (`AFTER_GATE_HANDOVER_S`),
+  is taken for the receiver's held hand-over and resumed too. The window is short
+  on purpose: the receiver keeps the phone from pausing during the pre-roll, and
+  right after the hand-over the phone can't have paused a song it hasn't played
+  yet; any other pause is left alone. If the song arrives after the gate while
+  MPD plays (the speaker already plays the silence), there is no gate and no
   takeover: the stream just goes on with the song. If MPD stops during the gate
   (the phone, or the receiver ending the silence after 60 s), the adapter does
   not unpause. **Limit:** a pause from the phone during the gate can't be
@@ -131,7 +158,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   adapter does one more takeover and logs it, then counts again (should another
   source play by then, the speaker counts as taken away). A renderer seen
   playing or `TRANSITIONING` since, or any change in MPD (pause, stop, another
-  song), drops that exception, so a user who stops the speaker later is still
+  song; not the pre-roll's song replacing the silence, which is the receiver's
+  doing, within 60 s of the gate's start), drops that exception, so a user who stops the speaker later is still
   respected. If the speaker counts as taken away while MPD is playing or paused,
   the adapter:
   1. sends MPD `pause 1` if MPD is playing (never `stop`: the receiver reads an
@@ -212,7 +240,7 @@ the stream (the phone shows it paused).
 | --- | --- | --- |
 | `RAUMFELD_ROOM_UDN` | required | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
 | `RAUMFELD_SPEAKER_UDN` | required without `RAUMFELD_HOST` | UDN of the speaker device that hosts the Raumfeld API; found by multicast SSDP. Not used with `RAUMFELD_HOST` (checked if set) |
-| `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly (no SSDP for the host) and takes only that address's answer to the multicast search for the zone renderer (the Raumfeld doesn't answer unicast SSDP). The room and zone UDNs are still checked: a wrong host is an error |
+| `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly (no SSDP for the host) and takes only that address's answer to the multicast search for the zone renderer (the Raumfeld doesn't answer unicast SSDP). The room and zone UDNs are still checked: a wrong host is an error. Must resolve to the address the host answers SSDP from; an IPv4 address binds firmest (no DNS) |
 | `ADAPTER_STATE_DIR` | unset | Absolute path of an existing, writable directory (e.g. `/data` in a container) where the zone renderer's location is kept across restarts, so a restart needs no search. Unset: in-memory cache only |
 | `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
@@ -249,8 +277,10 @@ doesn't answer unicast searches), so in a container use host networking.
 The receiver plays endless silence from the DIAL launch until the song is ready
 (see the main README). So a cast normally goes: MPD plays the silence, the start
 gate holds it and wakes the room while the phone still loads the song; the song
-then replaces the silence, during the gate (held at 0:00 until the speaker
-plays) or after it (it plays at once, the speaker already plays the stream).
+then replaces the silence, during the gate (held until the speaker plays: at
+0:00 when the receiver hands it over while MPD is held, a moment after its
+start if MPD was playing) or after it (it plays at once, the speaker already
+plays the stream).
 Either way there is only one takeover. If no song comes, the receiver stops the
 silence after 60 s, which also ends a gate still running.
 
@@ -259,14 +289,20 @@ started playing (the gate's start), e.g.:
 
 ```
 start: takeover returned at +2.6 s (wake wait 2.1 s, cached addresses, no discovery)
-start: song '2' at +2.2 s, speaker not playing yet: held
+start: song '2' at +2.6 s, speaker not playing yet: held
 start: speaker plays at +4.3 s; resuming MPD
-start: MPD resumed at +4.3 s (song '2' held 2.1 s)
+start: MPD resumed at +4.3 s (song '2' held 1.7 s)
 ```
 
-A song after the gate shows as `start: song '2' at +6.0 s, speaker already
-playing: no hold`. `N discoveries` instead of `cached addresses` says the
-takeover had to look for N devices (host, zone renderer) first.
+Here the receiver handed the song over (held) while the takeover still waited for
+the room; the adapter reads that change once the takeover returned, so the song's
+time is never earlier than the takeover's. A song after the gate shows as
+`start: song '2' at +6.0 s, speaker already playing: no hold`, one handed over
+held right after the gate as `held by the receiver after MPD resumed: resuming
+it`. `1 discovery` or `N discoveries` instead of `cached addresses` says the
+takeover had to look for devices (the host by SSDP or by resolving a
+`RAUMFELD_HOST` name, the zone renderer) first; an IPv4 `RAUMFELD_HOST` is no
+lookup.
 
 ## Tests
 

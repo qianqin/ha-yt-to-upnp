@@ -1216,7 +1216,7 @@ class StartGateTest(unittest.TestCase):
         self.assertIs(self.f._gate, gate)
         self.assertEqual(gate.song, "2")
         self.assertEqual(self.gate_fields(), fields)  # same timing and counters
-        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held at ~0:00 again
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held again, a moment in
         self.f.on_mpd_state("pause", "2")  # run() reports our pause 1
         self.assertEqual(self.requests(), [])
         # Not a takeover: no wake, no song-change takeover, the source before is kept.
