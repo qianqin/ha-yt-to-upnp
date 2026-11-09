@@ -876,11 +876,10 @@ class Follower:
     never played when the gate ends, it gets one more takeover before it counts as taken
     away. A renderer someone made play another source than the one before the takeover
     ends the gate at once: it yields (MPD stays paused, the cast is released). Its own
-    pause and resume are not followed; a failed
-    takeover lets MPD play at once and is retried after PLAY_RETRY_S without the gate. A
-    stop or another song during the gate is the user's doing and is never undone; a pause
-    from the phone during the gate can't be told apart from ours (MPD is already paused,
-    nothing changes), so it is undone."""
+    pause and resume are not followed; a failed takeover lets MPD play at once and is
+    retried after PLAY_RETRY_S without the gate. A stop or another song during the gate is
+    the user's doing and is never undone; a pause from the phone during the gate can't be
+    told apart from ours (MPD is already paused, nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
                  stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S):
