@@ -11,3 +11,6 @@ capture_*.py
 # Research/notes
 Musika_research/
 pibug.md
+
+# Assembled Home Assistant app folder (scripts/build-ha-app.sh)
+/dist
