@@ -43,10 +43,15 @@ PADDED_HOSTS = [" host", "host\n", "192.0.2.20 "]
 
 def config_schema():
     """The schema block of config.yaml as {option: type string}."""
+    return config_block("schema")
+
+
+def config_block(block):
+    """A top-level block of config.yaml (options or schema) as {option: value string}."""
     schema, inside = {}, False
     with open(os.path.join(APP, "config.yaml")) as f:
         for line in f:
-            if re.match(r"^schema:\s*$", line):
+            if re.match(r"^%s:\s*$" % block, line):
                 inside = True
                 continue
             if inside:
@@ -70,6 +75,19 @@ class SchemaInStep(unittest.TestCase):
     def test_checker_uses_exactly_the_config_yaml_schema(self):
         self.assertTrue(config_schema())
         self.assertEqual(check_options.SCHEMA, config_schema())
+
+
+class DefaultsInStep(unittest.TestCase):
+    def test_no_optional_option_has_a_null_default(self):
+        # The Supervisor merges these defaults into the saved options and rejects
+        # any None value as a missing required option, whatever the schema says:
+        # an optional option listed as null could never be left empty.
+        options, schema = config_block("options"), config_schema()
+        self.assertTrue(options)
+        self.assertLessEqual(set(options), set(schema))
+        for name, value in options.items():
+            if schema[name].endswith("?"):
+                self.assertNotEqual(value, "null", name)
 
 
 class AdapterAgreesOnRaumfeldHost(unittest.TestCase):

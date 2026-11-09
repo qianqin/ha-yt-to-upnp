@@ -17,7 +17,8 @@ host_network: true
 options:
   cast_name: YouTube to UPnP
   raumfeld_room_udn: null
-  raumfeld_speaker_udn: null
+  # Optional options are not listed: the Supervisor rejects a null default as a
+  # missing option, even for an optional one.
   log_level: info
 schema:
   # The receiver writes the name unescaped into its DIAL device description.
