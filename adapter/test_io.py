@@ -1,6 +1,7 @@
 """I/O edges: MPD client and main loop against a fake MPD server, SSDP against a local responder."""
 
 import errno
+import logging
 import os
 import socket
 import threading
@@ -10,7 +11,7 @@ from unittest import mock
 
 import raumfeld_adapter as ra
 from fakes import SPEAKER_UDN, FakeMpd, run_bounded
-from test_logic import FakeClock, RecordingController
+from test_logic import FakeClock, RecordingController, no_logs
 
 
 class MpdClientTest(unittest.TestCase):
@@ -738,8 +739,28 @@ class SsdpTest(unittest.TestCase):
 
     def test_search_for_one_hosts_answer_ignores_other_senders(self):
         addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
-        with self.assertRaises(ra.DeviceNotFound):
+        with self.assertLogs("raumfeld_adapter", "WARNING"), self.assertRaises(ra.DeviceNotFound):
             ra.ssdp_from_host(SPEAKER_UDN, "127.0.0.9", timeout=0.5, group=addr)
+
+    def test_a_matching_answer_from_another_sender_is_warned_about_once(self):
+        # RAUMFELD_HOST resolving to another address than the one the host answers SSDP from
+        # (another interface) would otherwise just look like "no answer".
+        addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml"),
+                               self.reply("uuid:00000000-0000-0000-0000-0000000000ff",
+                                          "http://127.0.0.1:1/other.xml")])
+        with self.assertLogs("raumfeld_adapter", "WARNING") as logs, \
+                self.assertRaises(ra.DeviceNotFound):
+            ra.ssdp_from_host(SPEAKER_UDN, "127.0.0.9", timeout=1.5, group=addr)
+        self.assertEqual(len(self.received), 2)  # answered twice ...
+        self.assertEqual(len(logs.output), 1, logs.output)  # ... warned once
+        self.assertTrue(logs.output[0].startswith("WARNING:"), logs.output)
+        self.assertIn("127.0.0.1", logs.output[0])
+        self.assertIn("127.0.0.9", logs.output[0])
+
+    def test_a_search_without_a_sender_filter_warns_about_nothing(self):
+        addr = self.responder([self.reply(SPEAKER_UDN, "http://127.0.0.1:2/desc.xml")])
+        with no_logs(self, "raumfeld_adapter", logging.WARNING):
+            ra.ssdp_discover(SPEAKER_UDN, timeout=3, addr=addr)
 
     def test_not_found_times_out(self):
         addr = self.responder([])

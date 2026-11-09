@@ -381,6 +381,7 @@ def _m_search(st, addr, timeout, sender=None):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
         deadline = time.monotonic() + timeout
         next_send = 0.0
+        ignored = set()  # senders already warned about
         while True:
             now = time.monotonic()
             if now >= deadline:
@@ -393,11 +394,17 @@ def _m_search(st, addr, timeout, sender=None):
                 data, (source, _port) = sock.recvfrom(65507)
             except socket.timeout:
                 continue
-            if sender is not None and source != sender:
-                continue
             headers = _parse_headers(data.decode("utf-8", "replace"))
-            if headers.get("st", "").lower() == st.lower() and headers.get("location"):
+            if headers.get("st", "").lower() != st.lower() or not headers.get("location"):
+                continue
+            if sender is None or source == sender:
                 return source, headers["location"]
+            if source not in ignored:
+                # Usually RAUMFELD_HOST resolving to another address of the host (another
+                # interface) than the one it answers SSDP from.
+                ignored.add(source)
+                log.warning("ignoring the SSDP answer for %s from %s: only %s counts "
+                            "(RAUMFELD_HOST)", st, source, sender)
     finally:
         sock.close()
 

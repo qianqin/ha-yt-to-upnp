@@ -641,9 +641,13 @@ class ControllerWithHostTest(unittest.TestCase):
         # Another Raumfeld host (or anything else on the LAN) answering for the zone UDN.
         self.address = "127.0.0.9"  # the configured host; the fake answers from 127.0.0.1
         with mock.patch.object(ra, "HOST_SEARCH_S", 1.2), \
+                self.assertLogs("raumfeld_adapter", "WARNING") as logs, \
                 self.assertRaises(ra.DeviceNotFound):
             self.locator.renderer(ZONE_UDN)
         self.assertEqual(len(self.ssdp.received), 2)  # re-sent after a second, then gave up
+        self.assertEqual(len(logs.output), 1, logs.output)  # names both addresses, once
+        self.assertIn("from 127.0.0.1", logs.output[0])
+        self.assertIn("only 127.0.0.9", logs.output[0])
 
     def test_no_answer_is_device_not_found(self):
         self.rf.power = "ACTIVE"
