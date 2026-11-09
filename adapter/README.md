@@ -3,19 +3,40 @@
 A small sidecar (Python 3.9+, standard library only) that makes a Teufel
 Raumfeld room play the receiver's MPD stream automatically.
 
-- When MPD starts playing, it finds the speaker via SSDP (by UDN, never by IP),
-  wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
+- When MPD starts playing, it wakes the room (`leaveStandby`), reuses the room's existing zone (or connects
   it to a new one only if it has none) and tells the zone's renderer to play
   `STREAM_URL` via UPnP AVTransport. **Waking waits for the room:** if the room
   was not `ACTIVE`, the adapter asks `getZones` every 0.5 s until it reports the
   room `ACTIVE` (and in a zone, if it had one before), at most 10 s in all,
-  slow answers included (`WAKE_WAIT_S`), and only then finds the zone renderer
-  afresh and sends `SetAVTransportURI`/`Play`. A speaker woken while it is still
+  slow answers included (`WAKE_WAIT_S`), and only then sends
+  `SetAVTransportURI`/`Play` to the renderer of the zone it is in now. A speaker woken while it is still
   finishing its standby otherwise accepts those requests and drops them. A look
   that fails or times out counts as "not awake yet". A room not awake in time is
   taken over anyway, in the zone the last answer named, with a warning; the
   start gate's re-takeover (below) covers the rest. Only if no look answered at
   all does the takeover fail (and is retried, see below).
+- **Finding the devices** (by UDN, never trusting an address alone): the
+  Raumfeld host that serves the API (`getZones`, `leaveStandby`, port 47365) and
+  the zone renderer (UPnP AVTransport). They are looked for once at adapter
+  start, so the first cast finds them cached, and again only when a request to
+  the cached address fails (then the request is sent once more to the address
+  found afresh) or the room is in another zone (its renderer is looked for by the
+  new zone UDN). With a valid cache a takeover sends no SSDP at all.
+  - Without `RAUMFELD_HOST`: the host by a multicast SSDP search for
+    `RAUMFELD_SPEAKER_UDN`, the zone renderer by one for the zone UDN (each up to
+    6 s if nobody answers).
+  - With `RAUMFELD_HOST` (an IPv4 address or a DNS name): the API is reached
+    at `http://<host>:47365/` directly; a name is resolved once (IPv4) and again
+    after a failed request. The zone renderer is found by a **unicast** SSDP
+    search (`ST:` the zone UDN) sent to `<host>:1900`, which the host answers at
+    once (at most 3 s, re-sent each second); only an answer from that address
+    counts.
+  - Either way: a host whose `getZones` doesn't list `RAUMFELD_ROOM_UDN` is an
+    error (a wrong host), and a renderer description whose `UDN` is not the zone
+    UDN is refused: never a wrong device. If nothing is found at start, that is
+    logged and the first cast looks again.
+  - The start gate's renderer looks (every 0.25 s) use the cached renderer and
+    don't look for it again when one fails; the next takeover or room check does.
 - **Start gate:** the speaker needs several seconds to wake, join its zone and
   buffer, while MPD starts the song right away. So when MPD starts playing and
   the adapter doesn't own the room (a new cast, or a resume after the room was
@@ -83,8 +104,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   idle one.
 - **The speaker's own controls win.** While the adapter owns the zone (MPD
   playing, paused or stopped), it looks at the room every `SPEAKER_POLL_SECONDS` (one
-  `getZones` plus `GetTransportInfo`/`GetMediaInfo`, reusing the last SSDP
-  discovery until a request fails or the zone changes). The speaker counts as
+  `getZones` plus `GetTransportInfo`/`GetMediaInfo` at the cached addresses,
+  see above). The speaker counts as
   *taken away* when the room is no longer `ACTIVE` (power button, or the
   Raumfeld's own auto power-off, also while paused), the room left its zone,
   the zone plays anything other than `STREAM_URL` (e.g. line-in switched in by
@@ -126,7 +147,7 @@ Raumfeld room play the receiver's MPD stream automatically.
   leaves the renderer alone. A renderer seen `PLAYING` again ends the episode. A
   short `TRANSITIONING` (normal start or buffering) is left alone.
 - How the timings fit together: one takeover may wait up to 10 s for the room
-  to wake (plus the usual SSDP and request time); a re-takeover is due 5 s after
+  to wake (plus the request time, and SSDP if a device has to be looked for); a re-takeover is due 5 s after
   a takeover returned; the gate ends at `START_GATE_SECONDS` or 5 s after the
   last takeover returned, whichever is later, at most 60 s after it began. A
   re-takeover only starts at least 15 s (wake wait plus its 5 s) before that
@@ -141,7 +162,7 @@ Raumfeld room play the receiver's MPD stream automatically.
   `mixer_type "software"` (as in [`mpd.conf.example`](mpd.conf.example)),
   otherwise MPD answers the phone's volume change with `ACK ... {setvol} No mixer`.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that
-  answered SSDP (redirects included), caps replies at 256 KiB and each request
+  answered SSDP or is `RAUMFELD_HOST` (redirects included), caps replies at 256 KiB and each request
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
   and accepts only `uuid:<letters, digits, dashes>` UDNs.
 - Network and device errors are logged, never fatal, and never count as "taken
@@ -175,7 +196,8 @@ the stream (the phone shows it paused).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `RAUMFELD_ROOM_UDN` | required | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
-| `RAUMFELD_SPEAKER_UDN` | required | UDN of the speaker device that hosts the Raumfeld API |
+| `RAUMFELD_SPEAKER_UDN` | required without `RAUMFELD_HOST` | UDN of the speaker device that hosts the Raumfeld API; found by multicast SSDP. Not used with `RAUMFELD_HOST` (checked if set) |
+| `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly and finds the zone renderer by unicast SSDP to it: no multicast needed, and no 6 s SSDP wait when a device has to be looked for again. The room and zone UDNs are still checked: a wrong host is an error |
 | `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
 | `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
@@ -203,7 +225,34 @@ python3 -m adapter
 # or: python3 adapter/raumfeld_adapter.py
 ```
 
-SSDP needs multicast on the LAN, so in a container use host networking.
+Without `RAUMFELD_HOST`, SSDP needs multicast on the LAN, so in a container use
+host networking. With it, the adapter needs unicast UDP to the host's port 1900
+and TCP to its port 47365 (and to the zone renderer's port), and the host's
+answer back to the adapter's UDP port.
+
+## Pre-roll and cast start timing
+
+The receiver plays endless silence from the DIAL launch until the song is ready
+(see the main README). So a cast normally goes: MPD plays the silence, the start
+gate holds it and wakes the room while the phone still loads the song; the song
+then replaces the silence, during the gate (held at 0:00 until the speaker
+plays) or after it (it plays at once, the speaker already plays the stream).
+Either way there is only one takeover. If no song comes, the receiver stops the
+silence after 60 s, which also ends a gate still running.
+
+Each cast start is logged at INFO, one line per phase, times from the moment MPD
+started playing (the gate's start), e.g.:
+
+```
+start: takeover returned at +2.6 s (wake wait 2.1 s, cached addresses, no discovery)
+start: song '2' at +2.2 s, speaker not playing yet: held
+start: speaker plays at +4.3 s; resuming MPD
+start: MPD resumed at +4.3 s (song '2' held 2.1 s)
+```
+
+A song after the gate shows as `start: song '2' at +6.0 s, speaker already
+playing: no hold`. `N discoveries` instead of `cached addresses` says the
+takeover had to look for N devices (host, zone renderer) first.
 
 ## Tests
 
@@ -212,4 +261,5 @@ python3 -m unittest discover -s adapter -v
 ```
 
 The tests use local fake servers (MPD, Raumfeld host API, device description,
-AVTransport SOAP, SSDP responder) on 127.0.0.1 and need no real devices.
+AVTransport SOAP, multicast and unicast SSDP responders) on 127.0.0.1 and need
+no real devices.
