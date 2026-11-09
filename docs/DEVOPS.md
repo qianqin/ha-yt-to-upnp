@@ -231,8 +231,9 @@ it plays) the stream answers on port 8000 as `audio/mpeg`; the receiver
 serves its DIAL device description on 8008 with the configured name, and its
 pre-roll silence on `http://localhost:8008/silence` (`200`, `audio/L16`, zero
 samples, fetched with `curl` in the container) but answers `403` to the same
-request on the container's address; `/data/adapter` exists with mode `0700`,
-owned by the `adapter` user; the
+request on the container's address; `/data/adapter`, `/data/ytcast`,
+`/data/mpd`, `/data/mpd/music` and `/data/mpd/playlists` are directories
+with mode `0700`, owned by their service's user; the
 PoToken helper answers `/ping` on `127.0.0.1:4416` only and mints a token on
 `POST /get_pot` for a placeholder content binding (this fetches BotGuard from
 YouTube/Google through the helper's restricted Deno permissions); every
@@ -249,7 +250,8 @@ room not found yet` and keeps running with no service restart within 20 s.
 Runs 3-5 check that an invalid `cast_name`, an invalid `raumfeld_host`
 (`192.0.2.20:47365`) and neither `raumfeld_speaker_udn` nor `raumfeld_host`
 each stop the app with one `FATAL` line naming the option, before any service
-starts. The checks run in the
+starts. Run 6 puts a symbolic link (to `/tmp`) at `/data/adapter`: the app
+stops with one `FATAL` line naming it, and the link's target is left alone. The checks run in the
 container through `docker exec --privileged` (reading other users' `/proc`
 entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it
 removes the containers, network, image, builder (with its cache) and the

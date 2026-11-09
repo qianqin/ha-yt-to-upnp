@@ -43,7 +43,7 @@ software volume.
 | `cast_name` | yes | Name in the cast menu. Up to 60 characters, no `<`, `>`, `&` or `"`. |
 | `raumfeld_room_udn` | yes | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001`. |
 | `raumfeld_speaker_udn` | without `raumfeld_host` | UDN of the speaker device that hosts the Raumfeld API; the adapter finds it on the LAN by an SSDP search for this UDN. Not needed with `raumfeld_host` (checked if set). |
-| `raumfeld_host` | no | IPv4 address (recommended) or DNS name of the Raumfeld host, without port, `http://` or path, e.g. `192.0.2.20`. The adapter reaches its API directly instead of searching the LAN for it, so a cast starts sooner. It must be the address the host answers SSDP from (its address on the speakers' LAN): the room's zone renderer is still found by a multicast search, and only answers from this address count. A host that doesn't list `raumfeld_room_udn` is an error, never a wrong device. Empty: found by `raumfeld_speaker_udn`. |
+| `raumfeld_host` | no | IPv4 address (recommended) or DNS name of the Raumfeld host, without port, `http://` or path, e.g. `192.0.2.20`. The adapter reaches its API directly instead of searching the LAN for it, so a cast starts sooner. It must be the address the host answers SSDP from (its address on the speakers' LAN): the room's zone renderer is still found by a multicast search, and only answers from this address count. A host that doesn't list `raumfeld_room_udn` is an error, never a wrong device. A DNS name is only as trustworthy as the LAN's name resolution (mDNS, the router's DNS); use the fixed IPv4 address where possible. Empty: found by `raumfeld_speaker_udn`. |
 | `stream_host` | no | Host name or IPv4 address the speaker fetches the stream from (`http://<stream_host>:8000/stream.mp3`). Empty: the host's LAN IPv4 address (source address of the default route), detected at each start. Set it if the host has several networks or the detected address is wrong. |
 | `start_gate_seconds` | no | 0-60, default 15. How long the song is held at its start while the speaker wakes; `0` turns it off. |
 | `stuck_seconds` | no | 1-300, default 15. How long the speaker may hang while buffering before it is restarted. |
@@ -60,9 +60,10 @@ set`). Fix the option and start the app again.
 The Raumfeld host is the speaker device whose UDN is `raumfeld_speaker_udn`;
 it serves the Raumfeld API on port `47365`. To find its address:
 
-- Start the app once without `raumfeld_host`: the adapter finds the host by
-  its UDN and logs `Raumfeld host at http://<address>:47365/, zone renderer
-  ...`. Use that `<address>`.
+- Start the app once without `raumfeld_host` and with `log_level` `info` or
+  `debug`: the adapter finds the host by its UDN and logs `Raumfeld host at
+  http://<address>:47365/, zone renderer ...` (an info line). Use that
+  `<address>`.
 - Or look the speaker up in your router's list of network devices.
 
 Check it in a browser on the same LAN: `http://<address>:47365/getZones`
@@ -94,8 +95,10 @@ which one and with which exit code.
   reach `http://<stream_host>:8000/stream.mp3`; set `stream_host` if the
   detected address is wrong.
 - **`Raumfeld room not found yet` in the log:** the adapter found no Raumfeld
-  host at start (or the host doesn't list the room); it keeps running and
-  looks again at the first cast. With `raumfeld_host` set, check that the
+  host at start, the host doesn't list the room, or the host was found but
+  the room's zone renderer wasn't; the cause is in brackets (for the zone
+  renderer `DeviceNotFound("no SSDP answer for '<zone UDN>'")`). It keeps
+  running and looks again at the first cast. With `raumfeld_host` set, check that the
   address is still the speaker's (see
   [Finding the Raumfeld host](#finding-the-raumfeld-host)) and that
   `getZones` there lists `raumfeld_room_udn`; or clear `raumfeld_host` to
