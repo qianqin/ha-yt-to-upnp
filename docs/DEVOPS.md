@@ -250,8 +250,9 @@ the `version` in `ha-yt-to-upnp/config.yaml` at `HEAD`
 scripts/pack_artefacts_test.py`). The tarball is reproducible: sorted
 entries, every mtime the commit's time, owner `0:0` without names, modes
 `0755`/`0644`, a gzip header without time or name; links must stay inside
-the folder, also when followed through other links (realpath). It then writes `ha-yt-to-upnp/artefacts.lock` (version, asset
-URL, sha256; also into the assembled folder). Owner and repository of the
+the folder, also when followed through other links (realpath). It then
+writes `ha-yt-to-upnp/artefacts.lock` (version, asset URL, sha256; also
+into the assembled folder). Owner and repository of the
 URL come from `git remote get-url origin` (a GitHub URL without credentials;
 anything else stops the script before the build).
 
