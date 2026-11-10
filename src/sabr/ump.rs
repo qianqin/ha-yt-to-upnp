@@ -18,6 +18,7 @@ pub const FORMAT_INITIALIZATION_METADATA: u32 = 42;
 pub const SABR_REDIRECT: u32 = 43;
 pub const SABR_ERROR: u32 = 44;
 pub const RELOAD_PLAYER_RESPONSE: u32 = 46;
+pub const PLAYBACK_START_POLICY: u32 = 47;
 pub const SABR_CONTEXT_UPDATE: u32 = 57;
 pub const STREAM_PROTECTION_STATUS: u32 = 58;
 pub const SABR_CONTEXT_SENDING_POLICY: u32 = 59;
@@ -121,6 +122,25 @@ pub fn write_varint(out: &mut Vec<u8>, value: u32) {
 pub struct UmpPart {
     pub part_type: u32,
     pub data: Vec<u8>,
+}
+
+/// Compact one-line form of a response's part ids for the log, e.g.
+/// `20,21x3,22,35`: consecutive repeats collapse to `idxN`.
+pub fn summarize_part_ids(ids: &[u32]) -> String {
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    for &id in ids {
+        match runs.last_mut() {
+            Some((last, count)) if *last == id => *count += 1,
+            _ => runs.push((id, 1)),
+        }
+    }
+    if runs.is_empty() {
+        return "-".to_owned();
+    }
+    runs.iter()
+        .map(|&(id, n)| if n == 1 { id.to_string() } else { format!("{id}x{n}") })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +316,23 @@ mod tests {
         assert!(read_varint(&[0x80]).is_none());
         // 5-byte varint but only 3 bytes present
         assert!(read_varint(&[0xF0, 0x01, 0x02]).is_none());
+    }
+
+    // -- part sequence summary -----------------------------------------------
+
+    #[test]
+    fn summary_collapses_runs_of_the_same_part() {
+        let ids = [20, 21, 21, 21, 22, 20, 21, 22, 35];
+        assert_eq!(summarize_part_ids(&ids), "20,21x3,22,20,21,22,35");
+    }
+
+    #[test]
+    fn summary_of_reload_loop_response() {
+        assert_eq!(
+            summarize_part_ids(&[RELOAD_PLAYER_RESPONSE, PLAYBACK_START_POLICY, NEXT_REQUEST_POLICY]),
+            "46,47,35"
+        );
+        assert_eq!(summarize_part_ids(&[]), "-");
     }
 
     // -- parser --------------------------------------------------------------

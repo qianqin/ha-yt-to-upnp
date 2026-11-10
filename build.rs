@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/video_streaming/media_capabilities.proto",
         "proto/video_streaming/reload_player_response.proto",
         "proto/video_streaming/snackbar_message.proto",
+        "proto/video_streaming/playback_start_policy.proto",
     ];
 
     prost_build::Config::new()

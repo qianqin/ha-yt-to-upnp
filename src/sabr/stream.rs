@@ -7,7 +7,7 @@
 //! Called from an axum HTTP handler. Takes a video ID and returns a stream
 //! of audio bytes. The caller pipes these bytes as an HTTP response to MPD.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -723,6 +723,34 @@ struct SabrState {
     client_config: &'static InnerTubeClient,
     po_token: Option<Vec<u8>>,
     done: bool,
+    /// Premium experiment active: protocol detail is logged at info, not debug.
+    verbose: bool,
+    /// A RELOAD_PLAYER_RESPONSE seen in the current response; acted on once
+    /// the whole response has been read.
+    pending_reload: Option<ReloadRequested>,
+    stats: StreamStats,
+}
+
+/// Per-song tallies for the log and the premium experiment verdict.
+#[derive(Debug, Default)]
+struct StreamStats {
+    media_headers_by_itag: BTreeMap<i32, u32>,
+    /// Audio payload bytes forwarded to the consumer, per itag.
+    audio_bytes_by_itag: BTreeMap<i32, u64>,
+    /// STREAM_PROTECTION_STATUS values in arrival order, repeats collapsed.
+    protection_statuses: Vec<i32>,
+}
+
+/// Info when the premium experiment is on, debug otherwise, so production
+/// logs keep their current volume.
+macro_rules! detail {
+    ($state:expr, $($arg:tt)+) => {
+        if $state.verbose {
+            tracing::info!($($arg)+)
+        } else {
+            tracing::debug!($($arg)+)
+        }
+    };
 }
 
 impl SabrState {
@@ -766,6 +794,9 @@ impl SabrState {
             client_config,
             po_token: None,
             done: false,
+            verbose: false,
+            pending_reload: None,
+            stats: StreamStats::default(),
         }
     }
 
@@ -949,6 +980,7 @@ fn handle_media_header(state: &mut SabrState, data: &[u8]) -> Result<(), SabrErr
         start_ms, duration_ms, hdr.time_range, is_audio,
     );
 
+    *state.stats.media_headers_by_itag.entry(itag).or_default() += 1;
     state.header_map.insert(header_id, HeaderInfo {
         itag,
         is_init_seg: hdr.is_init_seg.unwrap_or(false),
@@ -985,6 +1017,7 @@ fn handle_media(state: &mut SabrState, data: &[u8]) -> Option<Bytes> {
     if info.is_init_seg {
         state.audio_init_sent = true;
     }
+    *state.stats.audio_bytes_by_itag.entry(info.itag).or_default() += payload.len() as u64;
 
     Some(Bytes::copy_from_slice(payload))
 }
@@ -1044,7 +1077,37 @@ fn handle_sabr_error(data: &[u8]) -> Result<(), SabrError> {
     let err = vs::SabrError::decode(data)?;
     let t = err.r#type.as_deref().unwrap_or("unknown");
     let c = err.code.unwrap_or(0);
+    tracing::warn!("[sabr] SABR_ERROR type={} code={}", t, c);
     Err(format!("SABR error: type={}, code={}", t, c).into())
+}
+
+fn handle_playback_start_policy(state: &SabrState, data: &[u8]) -> Result<(), SabrError> {
+    let policy = vs::PlaybackStartPolicy::decode(data)?;
+    let readahead = |p: &Option<vs::playback_start_policy::MinReadaheadPolicy>| {
+        p.as_ref().and_then(|p| p.min_readahead_ms).unwrap_or(0)
+    };
+    detail!(
+        state,
+        "[sabr] playback start policy: start_readahead_ms={}, start_timeout_ms={}, resume_readahead_ms={}, resume_timeout_ms={}",
+        readahead(&policy.start_min_readahead_policy),
+        policy.start_timeout_ms.unwrap_or(0),
+        readahead(&policy.resume_min_readahead_policy),
+        policy.resume_timeout_ms.unwrap_or(0),
+    );
+    Ok(())
+}
+
+/// The token is opaque server state for the next /player call; only its
+/// length is logged.
+fn handle_reload_player_response(state: &mut SabrState, data: &[u8]) -> Result<(), SabrError> {
+    let ctx = vs::ReloadPlaybackContext::decode(data)?;
+    let token = ctx.reload_playback_params.and_then(|p| p.token);
+    tracing::info!(
+        "[sabr] RELOAD_PLAYER_RESPONSE (token len={})",
+        token.as_deref().map_or(0, str::len),
+    );
+    state.pending_reload = Some(ReloadRequested { token });
+    Ok(())
 }
 
 fn handle_context_update(state: &mut SabrState, data: &[u8]) -> Result<(), SabrError> {
@@ -1082,10 +1145,13 @@ fn handle_context_sending_policy(state: &mut SabrState, data: &[u8]) -> Result<(
 
 /// Status 1 only says the session is not (yet) asking for attestation; it says
 /// nothing about format entitlement, so the log just states the facts.
-fn handle_stream_protection(data: &[u8], po_token_sent: bool) -> Result<(), SabrError> {
+fn handle_stream_protection(state: &mut SabrState, data: &[u8]) -> Result<(), SabrError> {
     let sps = vs::StreamProtectionStatus::decode(data)?;
     let status = sps.status.unwrap_or(0);
-    let sent = if po_token_sent { "PoToken sent" } else { "no PoToken sent" };
+    if state.stats.protection_statuses.last() != Some(&status) {
+        state.stats.protection_statuses.push(status);
+    }
+    let sent = if state.po_token.is_some() { "PoToken sent" } else { "no PoToken sent" };
     match status {
         0 => tracing::info!("[sabr] stream_protection_status=0 (no protection, {})", sent),
         1 => tracing::info!("[sabr] stream_protection_status=1 (OK, {})", sent),
@@ -1096,12 +1162,21 @@ fn handle_stream_protection(data: &[u8], po_token_sent: bool) -> Result<(), Sabr
     Ok(())
 }
 
-/// The server wants a fresh /player response before it serves anything (it
-/// answers this way e.g. for a format the session may not stream). Reloading
-/// is not implemented, and repeating the same request only gets the same
-/// answer, so the stream ends.
-#[derive(Debug)]
-struct ReloadRequested;
+/// The server wants a fresh /player response (sent with `token` in
+/// `playbackContext.reloadPlaybackContext`) before it serves more media.
+/// Repeating the same SABR request only gets the same answer, so this is
+/// never retried as is.
+struct ReloadRequested {
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for ReloadRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadRequested")
+            .field("token_len", &self.token.as_deref().map_or(0, str::len))
+            .finish()
+    }
+}
 
 impl std::fmt::Display for ReloadRequested {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1126,15 +1201,29 @@ fn handle_part(state: &mut SabrState, part: &ump::UmpPart) -> Result<Option<Byte
         ump::NEXT_REQUEST_POLICY => handle_next_request_policy(state, &part.data)?,
         ump::SABR_REDIRECT => handle_sabr_redirect(state, &part.data)?,
         ump::SABR_ERROR => handle_sabr_error(&part.data)?,
-        ump::RELOAD_PLAYER_RESPONSE => return Err(ReloadRequested.into()),
+        ump::RELOAD_PLAYER_RESPONSE => handle_reload_player_response(state, &part.data)?,
+        ump::PLAYBACK_START_POLICY => handle_playback_start_policy(state, &part.data)?,
         ump::SABR_CONTEXT_UPDATE => handle_context_update(state, &part.data)?,
-        ump::STREAM_PROTECTION_STATUS => {
-            handle_stream_protection(&part.data, state.po_token.is_some())?
-        }
+        ump::STREAM_PROTECTION_STATUS => handle_stream_protection(state, &part.data)?,
         ump::SABR_CONTEXT_SENDING_POLICY => handle_context_sending_policy(state, &part.data)?,
         other => tracing::debug!("[sabr] unhandled UMP type={}, {} bytes", other, part.data.len()),
     }
     Ok(None)
+}
+
+/// Called once a whole response has been read: logs its part sequence and
+/// turns a RELOAD_PLAYER_RESPONSE seen in it into a `ReloadRequested` error.
+fn finish_response(state: &mut SabrState, part_ids: &[u32]) -> Result<(), SabrError> {
+    detail!(
+        state,
+        "[sabr] response #{} parts: {}",
+        state.request_number,
+        ump::summarize_part_ids(part_ids),
+    );
+    match state.pending_reload.take() {
+        Some(reload) => Err(reload.into()),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,12 +1280,14 @@ async fn sabr_request_cycle(
 
     let mut parser = UmpParser::new();
     let mut byte_stream = resp.bytes_stream();
+    let mut part_ids = Vec::new();
 
     while let Some(chunk_result) = byte_stream.next().await {
         let chunk = chunk_result.map_err(|e| e.without_url())?;
         parser.push(&chunk);
 
         while let Some(part) = parser.next_part() {
+            part_ids.push(part.part_type);
             if let Some(audio_bytes) = handle_part(state, &part)? {
                 if tx.send(audio_bytes).await.is_err() {
                     tracing::info!("[sabr] receiver dropped, stopping");
@@ -1206,7 +1297,9 @@ async fn sabr_request_cycle(
         }
     }
 
+    let finished = finish_response(state, &part_ids);
     state.request_number += 1;
+    finished?;
 
     if state.audio_end_segment > 0
         && state.audio_max_segment >= (state.audio_end_segment as i32)
@@ -1895,17 +1988,96 @@ mod tests {
         ump::UmpPart { part_type, data }
     }
 
-    #[test]
-    fn reload_player_response_ends_the_stream_without_retry() {
-        let mut state = test_state(GOOD_URL);
-        // ReloadPlaybackContext { reload_playback_params { token: "tok" } }
-        let data = vec![0x0a, 0x05, 0x0a, 0x03, b't', b'o', b'k'];
+    fn reload_part(token: Option<&str>) -> ump::UmpPart {
+        let ctx = vs::ReloadPlaybackContext {
+            reload_playback_params: Some(vs::ReloadPlaybackParams { token: token.map(str::to_owned) }),
+        };
+        part(ump::RELOAD_PLAYER_RESPONSE, ctx.encode_to_vec())
+    }
 
-        let err = handle_part(&mut state, &part(ump::RELOAD_PLAYER_RESPONSE, data)).unwrap_err();
+    #[test]
+    fn reload_part_is_decoded_and_ends_the_response_without_retry() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = test_state(GOOD_URL);
+        state.verbose = true;
+
+        // The rest of the response (47, 35) is still applied after a 46.
+        assert!(handle_part(&mut state, &reload_part(Some("secret-reload-token"))).unwrap().is_none());
+        let err = finish_response(&mut state, &[46, 47, 35]).unwrap_err();
 
         assert!(!is_retryable(&err));
+        let reload = err.downcast_ref::<ReloadRequested>().expect("a reload request");
+        assert_eq!(reload.token.as_deref(), Some("secret-reload-token"));
         assert!(err.to_string().contains("reload"), "{err}");
-        assert!(!err.to_string().contains("tok"), "{err}");
+        assert!(state.pending_reload.is_none());
+        let logs = logs.text();
+        assert!(logs.contains("RELOAD_PLAYER_RESPONSE (token len=19)"), "{logs}");
+        assert!(logs.contains("parts: 46,47,35"), "{logs}");
+        for text in [err.to_string(), format!("{err:?}"), logs] {
+            assert!(!text.contains("secret-reload-token"), "{text}");
+        }
+    }
+
+    #[test]
+    fn response_without_reload_finishes_cleanly() {
+        let mut state = test_state(GOOD_URL);
+        finish_response(&mut state, &[20, 21, 22, 35]).unwrap();
+    }
+
+    #[test]
+    fn playback_start_policy_is_decoded_for_the_log() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = test_state(GOOD_URL);
+        state.verbose = true;
+        let policy = vs::PlaybackStartPolicy {
+            start_min_readahead_policy: Some(vs::playback_start_policy::MinReadaheadPolicy {
+                min_readahead_ms: Some(1500),
+                min_bandwidth_bytes_per_sec: None,
+            }),
+            start_timeout_ms: Some(5000),
+            ..Default::default()
+        };
+
+        let out = handle_part(&mut state, &part(ump::PLAYBACK_START_POLICY, policy.encode_to_vec())).unwrap();
+
+        assert!(out.is_none());
+        let logs = logs.text();
+        assert!(logs.contains("playback start policy: start_readahead_ms=1500, start_timeout_ms=5000"), "{logs}");
+    }
+
+    #[test]
+    fn sabr_error_part_logs_type_and_code() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = test_state(GOOD_URL);
+        let data = vs::SabrError { r#type: Some("sabr.config".to_owned()), code: Some(3) }.encode_to_vec();
+
+        let err = handle_part(&mut state, &part(ump::SABR_ERROR, data)).unwrap_err();
+
+        assert!(err.to_string().contains("type=sabr.config, code=3"), "{err}");
+        assert!(logs.text().contains("SABR_ERROR type=sabr.config code=3"), "{}", logs.text());
+    }
+
+    #[test]
+    fn media_header_itags_audio_bytes_and_protection_statuses_are_tallied() {
+        let mut state = test_state(GOOD_URL);
+        let header = |id: u32, itag: i32| {
+            part(
+                ump::MEDIA_HEADER,
+                vs::MediaHeader { header_id: Some(id), itag: Some(itag), ..Default::default() }.encode_to_vec(),
+            )
+        };
+        handle_part(&mut state, &header(1, 251)).unwrap();
+        handle_part(&mut state, &header(2, 160)).unwrap();
+        handle_part(&mut state, &header(3, 251)).unwrap();
+        handle_part(&mut state, &part(ump::MEDIA, vec![1, 0xaa, 0xbb, 0xcc])).unwrap();
+        handle_part(&mut state, &part(ump::MEDIA, vec![2, 0xdd])).unwrap();
+        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
+        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(1))).unwrap();
+        handle_part(&mut state, &part(ump::STREAM_PROTECTION_STATUS, protection(2))).unwrap();
+
+        assert_eq!(state.stats.media_headers_by_itag, std::collections::BTreeMap::from([(160, 1), (251, 2)]));
+        assert_eq!(state.stats.audio_bytes_by_itag, std::collections::BTreeMap::from([(251, 3)]));
+        assert_eq!(state.stats.protection_statuses, vec![1, 2]);
     }
 
     #[test]
@@ -1980,8 +2152,8 @@ mod tests {
                     if !first {
                         return Ok(false);
                     }
-                    let reload = part(ump::RELOAD_PLAYER_RESPONSE, vec![0x0a, 0x02, 0x0a, 0x00]);
-                    handle_part(state, &reload)?;
+                    handle_part(state, &reload_part(None))?;
+                    finish_response(state, &[ump::RELOAD_PLAYER_RESPONSE])?;
                     Ok(true)
                 })
             }
