@@ -8,13 +8,14 @@
 # the io.hass.* labels itself.
 FROM ghcr.io/home-assistant/base-debian:bookworm-2026.10.3@sha256:ebb912a11616e3eda2d31204803587276e70bbb4e7f02a6c92dba5f43256b48d AS artefacts
 ARG BUILD_VERSION
-# Set only by scripts/smoke-ha-app.sh --release-path (see fetch-artefacts.sh).
+# Set only by scripts/smoke-ha-app.sh --release-path (see fetch-artefacts.sh);
+# never in a build.yaml.
 ARG ARTEFACTS_URL
 # artefact[s] matches the artefacts/ folder if the build context has one and
 # nothing otherwise; a matched folder's contents land in /stage. Without
 # artefacts/, fetch-artefacts.sh needs artefacts.lock (artefacts.loc[k]: a
-# folder assembled before the first release has none).
-COPY fetch-artefacts.sh artefacts.loc[k] artefact[s] /stage/
+# folder assembled before the first release has none) for config.yaml's version.
+COPY fetch-artefacts.sh config.yaml artefacts.loc[k] artefact[s] /stage/
 RUN sh /stage/fetch-artefacts.sh /stage /artefacts
 
 FROM ghcr.io/home-assistant/base-debian:bookworm-2026.10.3@sha256:ebb912a11616e3eda2d31204803587276e70bbb4e7f02a6c92dba5f43256b48d
