@@ -7,6 +7,7 @@ Each test builds a small repository (master, app folder, receiver and adapter
 sources), a release tarball whose BUILD-INFO names its commit, and the
 committed artefacts.lock, then runs the script and reads the fake tools' log.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -233,6 +234,73 @@ class PublishReleaseTest(unittest.TestCase):
         result, calls = self.run_script()
         self.assertRefused(result, calls, "artefacts.lock is for version 1.2.2")
 
+    def test_lock_url_not_of_origins_repository_is_refused(self):
+        other_url = pack_artefacts.asset_url(("owner", "other"), VERSION)
+        lock = os.path.join(self.repo, "ha-yt-to-upnp", "artefacts.lock")
+        pack_artefacts.write_lock(lock, VERSION, other_url, self.sha256)
+        self.commit("lock of another repository")
+        for args in ((), ("--dry-run",)):
+            with self.subTest(args=args):
+                result, calls = self.run_script(*args)
+                self.assertRefused(result, calls, "artefacts.lock's url %s is not the release asset of origin" % other_url)
+                self.assertEqual(self.remote_calls(calls), [])
+
+    def test_origin_of_another_repository_is_refused(self):
+        result, calls = self.run_script(FAKE_REMOTE="https://github.com/someone/repo.git")
+        self.assertRefused(result, calls, "is not the release asset of origin")
+        self.assertEqual(self.remote_calls(calls), [])
+
+    def test_local_tarball_not_the_one_in_the_lock_is_refused_before_anything_remote(self):
+        # A valid tarball of the same commit, but other bytes than the lock's.
+        art = os.path.join(self.tmp, "artefacts-rebuilt")
+        shutil.copytree(os.path.join(self.tmp, "artefacts-" + self.first[:8]), art)
+        with open(os.path.join(art, "ytcast-lite"), "w") as f:
+            f.write("another binary")
+        other = pack_artefacts.pack(art, self.tarball, 1_700_000_000)
+        self.assertNotEqual(other, self.sha256)
+        for args in ((), ("--dry-run",)):
+            with self.subTest(args=args):
+                result, calls = self.run_script(*args)
+                self.assertRefused(result, calls, "has sha256 %s, artefacts.lock says %s" % (other, self.sha256))
+                self.assertEqual(self.remote_calls(calls), [])
+
+    def test_dirty_tree_is_refused(self):
+        for name, change in (("untracked", lambda: self.write("notes.txt", "x\n")),
+                             ("modified", lambda: self.write("src/main.rs", "edited\n"))):
+            with self.subTest(change=name):
+                change()
+                for args in ((), ("--dry-run",)):
+                    result, calls = self.run_script(*args)
+                    self.assertRefused(result, calls, "working tree is not clean")
+                    self.assertEqual(self.remote_calls(calls), [])
+                self.git("checkout", "-q", "--", ".")
+                self.git("clean", "-qfd")
+
+    def test_missing_changelog_section_is_refused(self):
+        for name, text in (("none", "# Changelog\n\n## 1.2.2\n\n- Old.\n"),
+                           ("only a longer version", "# Changelog\n\n## %s0\n\n- Other.\n" % VERSION),
+                           ("empty", "# Changelog\n\n## %s\n\n## 1.2.2\n\n- Old.\n" % VERSION)):
+            with self.subTest(changelog=name):
+                self.write("ha-yt-to-upnp/CHANGELOG.md", text)
+                self.commit("changelog " + name)
+                for args in ((), ("--dry-run",)):
+                    result, calls = self.run_script(*args)
+                    self.assertRefused(result, calls, "no '## %s' section in ha-yt-to-upnp/CHANGELOG.md" % VERSION)
+
+    def test_release_notes_are_the_versions_changelog_section(self):
+        notes = os.path.join(self.tmp, "notes-seen")
+        fake_gh = os.path.join(self.bin, "gh")
+        with open(fake_gh) as f:
+            body = f.read()
+        with open(fake_gh, "w") as f:
+            f.write(body.replace('"release create"|"release edit") exit 0 ;;',
+                                 '"release create") while [ $# -gt 0 ]; do [ "$1" = --notes-file ] && cp "$2" "$FAKE_NOTES"; shift; done ;;\n'
+                                 '  "release edit") exit 0 ;;'))
+        result, _ = self.run_script(FAKE_NOTES=notes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(notes) as f:
+            self.assertEqual(f.read().strip(), "- New.")
+
     def test_receiver_source_changed_after_the_build_is_refused(self):
         self.write("src/main.rs", "changed\n")
         self.commit("receiver change")
@@ -312,6 +380,20 @@ class PublishReleaseTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("the draft's asset has sha256", result.stderr)
         self.assertFalse([c for c in calls if c.startswith("gh release edit")], calls)
+
+    def test_tampered_public_download_fails_after_publishing(self):
+        tampered = os.path.join(self.tmp, "tampered")
+        with open(tampered, "wb") as f:
+            f.write(b"tampered")
+        result, calls = self.run_script(FAKE_PUBLIC_ASSET=tampered)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        url = pack_artefacts.asset_url(("owner", "repo"), VERSION)
+        self.assertIn("%s has sha256 %s, expected %s" % (url, hashlib.sha256(b"tampered").hexdigest(), self.sha256),
+                      result.stderr)
+        edit = [i for i, c in enumerate(calls) if c.startswith("gh release edit")]
+        public = [i for i, c in enumerate(calls) if c.startswith("curl ") and url in c]
+        self.assertTrue(edit and public and edit[0] < public[0], calls)
+        self.assertNotIn("now push master", result.stdout)
 
     def test_public_download_is_retried_while_the_asset_is_not_there_yet(self):
         with open(self.env["FAKE_CURL_FAILS_FILE"], "w") as f:
