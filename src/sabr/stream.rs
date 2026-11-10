@@ -648,6 +648,18 @@ async fn solve_nsig(
     server_url: String,
     session: Option<&crate::music_session::YtMusicSession>,
 ) -> Result<String, SabrError> {
+    solve_nsig_with(server_url, session, decode_nsig).await
+}
+
+/// The nsig solver entry point (`decode_nsig`; a fake in tests).
+type NsigSolver = fn(&str, &str, &str) -> Result<String, SabrError>;
+
+/// [`solve_nsig`] with an explicit solver; it runs under the solver permit.
+async fn solve_nsig_with(
+    server_url: String,
+    session: Option<&crate::music_session::YtMusicSession>,
+    solver: NsigSolver,
+) -> Result<String, SabrError> {
     let n_value = server_url.split_once('?').and_then(|(_, query)| {
         query.split('&').find_map(|pair| pair.strip_prefix("n=")).map(str::to_owned)
     });
@@ -669,7 +681,7 @@ async fn solve_nsig(
     let permit = solver_permit().await?;
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        decode_nsig(&js, &n_clone, &hash)
+        solver(&js, &n_clone, &hash)
     })
     .await
     {
@@ -1611,6 +1623,8 @@ async fn stream_audio_in(
     start_offset: u64,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     let started = std::time::Instant::now();
+    // Pins made by this request must not outlive a cast change during it.
+    let generation = store.generation();
     // A song this cast already streams via url (a seek, or MPD reopening it
     // at byte 0) continues with the same file.
     if let Some(pin) = ctt.and_then(|ctt| store.pinned(video_id, ctt)) {
@@ -1626,6 +1640,8 @@ async fn stream_audio_in(
     let client = credential_client();
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
+    // TODO(follow-up): make this /player fetch injectable, so the glue from
+    // here into `start_premium` and the SABR start is unit-tested too.
     let result = get_player_data(client, video_id, ctt, yt_session.as_deref()).await?;
     let player = result.player;
     let client_config = result.client_config;
@@ -1636,7 +1652,7 @@ async fn stream_audio_in(
     if let (Some(ctt), Some(session)) = (ctt, yt_session.as_ref()) {
         let url_source = PremiumUrlSource::new(client.clone(), video_id, ctt, session.clone(), gvs_po_token.clone());
         let song = SongMeta { title: player.title.clone(), duration_secs: player.duration_secs };
-        let premium = start_premium(store, &url_source, &player.formats, with_ctt, env_var, &song, |format| {
+        let premium = start_premium(store, generation, &url_source, &player.formats, with_ctt, env_var, &song, |format| {
             tracing::debug!("[audio] {}", describe_variants(&player.formats, format.itag));
             url_source.clone().stream(format, store.clone())
         })
@@ -1751,11 +1767,14 @@ struct SongMeta {
     duration_secs: u64,
 }
 
-/// The byte-0 Premium step after /player: no pin survives from before (a
-/// new start), the Premium formats from the setting are tried in order, and
-/// the one that delivers is pinned for this song and cast. `None` = SABR.
+/// The byte-0 Premium step after /player (the caller has already dropped
+/// any older pin for the song): the Premium formats from the setting are
+/// tried in order, and the one that delivers is pinned for this song and
+/// cast, unless the cast changed since `generation`. `None` = SABR.
+#[allow(clippy::too_many_arguments)]
 async fn start_premium<'f, F, Fut>(
     store: &pins::PinStore,
+    generation: u64,
     source: &PremiumUrlSource,
     formats: &'f [AdaptiveFormat],
     with_ctt: bool,
@@ -1767,12 +1786,11 @@ where
     F: FnMut(&'f AdaptiveFormat) -> Fut,
     Fut: std::future::Future<Output = Result<(mpsc::Receiver<Bytes>, String), SabrError>>,
 {
-    store.unpin(&source.video_id);
     let candidates = premium_plan(formats, with_ctt, env);
     let AudioSource::Premium(format, (rx, url)) = pick_source(&candidates, attempt).await else {
         return None;
     };
-    store.pin(pins::PinnedFormat {
+    let pinned = store.pin_if_current(generation, pins::PinnedFormat {
         video_id: source.video_id.clone(),
         itag: format.itag,
         url,
@@ -1783,6 +1801,9 @@ where
         duration_secs: song.duration_secs,
         source: source.clone(),
     });
+    if !pinned {
+        tracing::info!("[audio] cast changed while itag {} started; not pinning it", format.itag);
+    }
     let info = SabrStreamInfo {
         title: song.title.clone(),
         duration_secs: song.duration_secs,
@@ -1905,13 +1926,20 @@ mod pins {
 
     pub(super) struct PinStore {
         pins: Mutex<Vec<(PinnedFormat, Instant)>>,
+        /// Bumped by `clear` (the cast ended or changed), under the same lock.
+        generation: Mutex<u64>,
         max_pins: usize,
         ttl: Duration,
     }
 
     impl Default for PinStore {
         fn default() -> Self {
-            Self { pins: Mutex::new(Vec::new()), max_pins: 4, ttl: Duration::from_secs(5 * 60) }
+            Self {
+                pins: Mutex::new(Vec::new()),
+                generation: Mutex::new(0),
+                max_pins: 4,
+                ttl: Duration::from_secs(5 * 60),
+            }
         }
     }
 
@@ -1926,6 +1954,21 @@ mod pins {
             let ttl = self.ttl;
             pins.retain(|(_, touched)| touched.elapsed() < ttl);
             pins
+        }
+
+        pub(super) fn generation(&self) -> u64 {
+            *self.generation.lock().unwrap()
+        }
+
+        /// [`Self::pin`], unless `clear` ran since `generation` was read: a
+        /// request that started under the previous cast must not pin.
+        pub(super) fn pin_if_current(&self, generation: u64, format: PinnedFormat) -> bool {
+            let current = self.generation.lock().unwrap();
+            if *current != generation {
+                return false;
+            }
+            self.pin(format);
+            true
         }
 
         /// Pin `format` for its song, replacing an older pin for it; when full,
@@ -1946,6 +1989,8 @@ mod pins {
         }
 
         pub(super) fn clear(&self) {
+            let mut generation = self.generation.lock().unwrap();
+            *generation += 1;
             self.pins.lock().unwrap().clear();
         }
 
@@ -2375,6 +2420,41 @@ async fn drive_loop(
     }
 
     Ok(())
+}
+
+/// For tests elsewhere (main.rs) that check the real, global pin store.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// Tests that touch the global pin store (or clear it) hold this, so they
+    /// do not race each other.
+    pub(crate) fn global_pins_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Pin a placeholder format for `video_id` in the global store.
+    pub(crate) fn pin_global(video_id: &str, ctt: &str, url: &str, content_length: u64) {
+        let session = Arc::new(crate::music_session::test_fixtures::session());
+        let mut source = super::PremiumUrlSource::new(reqwest::Client::new(), video_id, ctt, session, None);
+        source.ctt = ctt.to_owned();
+        super::pins::global().pin(super::pins::PinnedFormat {
+            video_id: video_id.to_owned(),
+            itag: 141,
+            url: url.to_owned(),
+            content_length,
+            last_modified: 1,
+            mime_type: "audio/mp4".to_owned(),
+            title: "Song".to_owned(),
+            duration_secs: 200,
+            source,
+        });
+    }
+
+    pub(crate) fn global_has_pin(video_id: &str) -> bool {
+        super::pins::global().video_ids().iter().any(|id| id == video_id)
+    }
 }
 
 #[cfg(test)]
@@ -3219,7 +3299,7 @@ mod tests {
         let source = url_source("startvideo1");
         let formats = premium_listing_with_lengths();
 
-        let started = start_premium(&store, &source, &formats, true, |_| None, &song(), |f| {
+        let started = start_premium(&store, store.generation(), &source, &formats, true, |_| None, &song(), |f| {
             let itag = f.itag;
             async move {
                 if itag == 774 {
@@ -3241,11 +3321,10 @@ mod tests {
     async fn premium_start_falling_back_to_sabr_leaves_no_pin() {
         let store = pins::PinStore::default();
         let source = url_source("startvideo2");
-        store.pin(pinned_format("startvideo2", "CTT-SECRET", "stale".to_owned(), 10));
         let formats = premium_listing_with_lengths();
         let mut tried = Vec::new();
 
-        let started = start_premium(&store, &source, &formats, true, |_| None, &song(), |f| {
+        let started = start_premium(&store, store.generation(), &source, &formats, true, |_| None, &song(), |f| {
             tried.push(f.itag);
             async { Err::<(mpsc::Receiver<Bytes>, String), SabrError>("no media via url".into()) }
         })
@@ -3257,6 +3336,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cast_change_during_the_start_prevents_the_pin() {
+        let store = pins::PinStore::default();
+        let source = url_source("startvideo4");
+        let formats = premium_listing_with_lengths();
+        let generation = store.generation();
+        store.clear(); // the cast ended while /player and the first range ran
+
+        let started = start_premium(&store, generation, &source, &formats, true, |_| None, &song(), |_| async {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok::<_, SabrError>((rx, "late-url".to_owned()))
+        })
+        .await;
+
+        assert!(started.is_some(), "the song still plays");
+        assert!(store.video_ids().is_empty(), "but nothing is pinned for the old cast");
+    }
+
+    #[test]
+    fn pin_if_current_refuses_after_a_clear() {
+        let store = pins::PinStore::default();
+        let generation = store.generation();
+        assert!(store.pin_if_current(generation, pinned_format("genvideo001", CAST, String::new(), 10)));
+        store.clear();
+        assert!(!store.pin_if_current(generation, pinned_format("genvideo002", CAST, String::new(), 10)));
+        assert!(store.video_ids().is_empty());
+    }
+
+    #[test]
+    fn a_new_pin_replaces_the_older_one_for_the_same_song() {
+        let store = pins::PinStore::default();
+        store.pin(pinned_format("repvideo001", CAST, "first".to_owned(), 10));
+        store.pin(pinned_format("repvideo001", CAST, "second".to_owned(), 10));
+        assert_eq!(store.video_ids(), ["repvideo001"]);
+        assert_eq!(store.url_of("repvideo001").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn clear_pins_empties_the_global_store() {
+        let _lock = test_support::global_pins_lock();
+        test_support::pin_global("globalpin01", CAST, "u", 10);
+        assert!(test_support::global_has_pin("globalpin01"));
+        clear_pins();
+        assert!(!test_support::global_has_pin("globalpin01"));
+    }
+
+    #[tokio::test]
+    async fn public_stream_audio_serves_seeks_from_the_global_pins() {
+        let _lock = test_support::global_pins_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = spawn_ranges(listener, song_content(), 200);
+        test_support::pin_global("globalpin02", CAST, &format!("http://{addr}/videoplayback?itag=141"), 3000);
+
+        let (info, rx) = stream_audio("globalpin02", Some(CAST), None, 1500).await.unwrap();
+
+        assert_eq!(info.start_offset, 1500);
+        assert_eq!(drain(rx).await, song_content()[1500..]);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        clear_pins();
+    }
+
+    #[tokio::test]
+    async fn a_long_pinned_download_keeps_its_own_pin_alive() {
+        let total = 2 * URL_CHUNK_SIZE as usize + 1000;
+        let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let (store, seen) = pin_local("longvideo01", 200, content.clone()).await;
+
+        let (_info, rx) = stream_audio_in(&store, "longvideo01", Some(CAST), None, 1500).await.unwrap();
+        // Four minutes pass before the next ranges are fetched...
+        store.age("longvideo01", std::time::Duration::from_secs(4 * 60));
+        assert_eq!(drain(rx).await, content[1500..]);
+        // ...and four more after: only the download's own touches keep it.
+        store.age("longvideo01", std::time::Duration::from_secs(4 * 60));
+
+        // Two ranges from byte 1500: one boundary, one keep-alive.
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(store.pinned("longvideo01", CAST).is_some());
+    }
+
+    #[tokio::test]
     async fn standard_quality_never_tries_a_premium_format() {
         let store = pins::PinStore::default();
         let source = url_source("startvideo3");
@@ -3264,7 +3423,7 @@ mod tests {
         let standard = |name: &str| (name == "YTCAST_AUDIO_QUALITY").then(|| "standard".to_owned());
         let mut tried = 0;
 
-        let started = start_premium(&store, &source, &formats, true, standard, &song(), |_| {
+        let started = start_premium(&store, store.generation(), &source, &formats, true, standard, &song(), |_| {
             tried += 1;
             async { Err::<(mpsc::Receiver<Bytes>, String), SabrError>("unexpected".into()) }
         })
@@ -3282,31 +3441,57 @@ mod tests {
         assert_eq!(state.client_version, WEB_REMIX_CLIENT.client_version);
     }
 
-    /// Fails or answers per call; flags overlapping solver runs.
+    /// Fails or answers per call; flags overlapping solver runs on shared
+    /// flags; signals when a run has started.
     struct ProbingDecipher {
         fail_first: std::sync::atomic::AtomicBool,
-        busy: std::sync::atomic::AtomicBool,
-        overlapped: std::sync::atomic::AtomicBool,
+        probe: &'static SolverProbe,
     }
 
-    impl super::super::url_transport::Decipher for ProbingDecipher {
-        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+    /// Overlap detection shared by fake solvers (Premium decipher and nsig).
+    struct SolverProbe {
+        busy: std::sync::atomic::AtomicBool,
+        overlapped: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+    }
+
+    impl SolverProbe {
+        const fn new() -> Self {
+            Self {
+                busy: std::sync::atomic::AtomicBool::new(false),
+                overlapped: std::sync::atomic::AtomicBool::new(false),
+                started: tokio::sync::Notify::const_new(),
+            }
+        }
+
+        fn run(&self) {
             use std::sync::atomic::Ordering::SeqCst;
             if self.busy.swap(true, SeqCst) {
                 self.overlapped.store(true, SeqCst);
             }
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.started.notify_one();
+            std::thread::sleep(std::time::Duration::from_millis(60));
             self.busy.store(false, SeqCst);
-            if self.fail_first.swap(false, SeqCst) {
+        }
+
+        fn overlapped(&self) -> bool {
+            self.overlapped.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl super::super::url_transport::Decipher for ProbingDecipher {
+        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+            self.probe.run();
+            if self.fail_first.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Err("jsc n error: no solutions".to_owned());
             }
             Ok((n.map(|_| "n".to_owned()), sig.map(|_| "s".to_owned())))
         }
     }
 
-    fn probing_source(decipher: Arc<ProbingDecipher>) -> PremiumUrlSource {
+    fn probing_source(probe: &'static SolverProbe, fail_first: bool) -> PremiumUrlSource {
         let mut source = url_source("permvideo01");
-        source.decipher = decipher;
+        source.decipher = Arc::new(ProbingDecipher { fail_first: fail_first.into(), probe });
         source
     }
 
@@ -3319,12 +3504,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_solver_run_releases_its_permit() {
-        let decipher = Arc::new(ProbingDecipher {
-            fail_first: true.into(),
-            busy: false.into(),
-            overlapped: false.into(),
-        });
-        let source = probing_source(decipher);
+        static PROBE: SolverProbe = SolverProbe::new();
+        let source = probing_source(&PROBE, true);
 
         assert!(source.resolve(&trusted_format()).await.is_err());
         let second = tokio::time::timeout(std::time::Duration::from_secs(2), source.resolve(&trusted_format())).await;
@@ -3334,35 +3515,81 @@ mod tests {
 
     #[tokio::test]
     async fn solver_runs_never_overlap() {
-        let decipher = Arc::new(ProbingDecipher {
-            fail_first: false.into(),
-            busy: false.into(),
-            overlapped: false.into(),
-        });
-        let source = probing_source(decipher.clone());
+        static PROBE: SolverProbe = SolverProbe::new();
+        let source = probing_source(&PROBE, false);
         let format = trusted_format();
 
         let (a, b, c) = tokio::join!(source.resolve(&format), source.resolve(&format), source.resolve(&format));
 
         assert!(a.is_ok() && b.is_ok() && c.is_ok());
-        assert!(!decipher.overlapped.load(std::sync::atomic::Ordering::SeqCst), "two solver runs overlapped");
+        assert!(!PROBE.overlapped(), "two solver runs overlapped");
     }
 
     #[tokio::test]
     async fn a_cancelled_request_keeps_the_permit_until_the_solver_finishes() {
-        let decipher = Arc::new(ProbingDecipher {
-            fail_first: false.into(),
-            busy: false.into(),
-            overlapped: false.into(),
-        });
-        let source = probing_source(decipher.clone());
+        static PROBE: SolverProbe = SolverProbe::new();
+        let source = probing_source(&PROBE, false);
+
+        let first = {
+            let source = source.clone();
+            tokio::spawn(async move { source.resolve(&trusted_format()).await })
+        };
+        PROBE.started.notified().await; // its solver is running now
+        first.abort();
+        source.resolve(&trusted_format()).await.unwrap();
+
+        assert!(!PROBE.overlapped(), "permit released on cancel while the solver ran");
+    }
+
+    fn probing_nsig(_js: &str, n: &str, _hash: &str) -> Result<String, SabrError> {
+        NSIG_PROBE.run();
+        Ok(n.chars().rev().collect())
+    }
+
+    static NSIG_PROBE: SolverProbe = SolverProbe::new();
+
+    fn nsig_url() -> String {
+        "https://rr1---sn-abc.googlevideo.com/videoplayback?a=1&n=abcd&b=2".to_owned()
+    }
+
+    #[tokio::test]
+    async fn sabr_nsig_runs_under_the_same_solver_permit() {
+        let _lock = nsig_probe_lock();
+        let session = crate::music_session::test_fixtures::session();
+        let source = probing_source(&NSIG_PROBE, false);
         let format = trusted_format();
 
-        // Cancel one resolve while its solver runs, then start another.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(5), source.resolve(&format)).await;
-        source.resolve(&format).await.unwrap();
+        let (nsig, premium) = tokio::join!(
+            solve_nsig_with(nsig_url(), Some(&session), probing_nsig),
+            source.resolve(&format),
+        );
 
-        assert!(!decipher.overlapped.load(std::sync::atomic::Ordering::SeqCst), "permit released on cancel");
+        assert!(nsig.unwrap().contains("n=dcba"));
+        assert!(premium.is_ok());
+        assert!(!NSIG_PROBE.overlapped(), "SABR nsig and a Premium decipher overlapped");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_sabr_nsig_keeps_the_permit() {
+        let _lock = nsig_probe_lock();
+        let source = probing_source(&NSIG_PROBE, false);
+
+        let nsig = tokio::spawn(async {
+            let session = crate::music_session::test_fixtures::session();
+            solve_nsig_with(nsig_url(), Some(&session), probing_nsig).await
+        });
+        NSIG_PROBE.started.notified().await;
+        nsig.abort();
+        source.resolve(&trusted_format()).await.unwrap();
+
+        assert!(!NSIG_PROBE.overlapped(), "permit released on a cancelled nsig solve");
+    }
+
+    /// The two nsig tests share `NSIG_PROBE` (a plain fn solver cannot carry
+    /// its own); they must not run at the same time.
+    fn nsig_probe_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // -- format variants and client info ---------------------------------------------

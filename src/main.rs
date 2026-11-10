@@ -437,18 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     tracing::info!("[player] released by speaker (adapter) — ending cast session");
                     has_remote = false;
-                    let end_msgs = release_cast(&mut playlist, &mut play_started);
-                    set_cast_ctt(&dial_state, None, sabr::stream::clear_pins);
-                    dial_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
-                    if let Err(e) = mpd_client.stop().await {
-                        tracing::warn!("[player] release: mpd stop failed: {e}");
-                    }
-                    if let Err(e) = mpd_client.clear().await {
-                        tracing::warn!("[player] release: mpd clear failed: {e}");
-                    }
-                    for msg in end_msgs {
-                        state_tx.send(msg).await.ok();
-                    }
+                    end_released_cast(&mut mpd_client, &mut playlist, &mut play_started, &dial_state, &state_tx).await;
                     continue;
                 }
 
@@ -628,22 +617,7 @@ async fn handle_command(
                 video_id
             );
 
-            playlist.video_ids = video_ids;
-            playlist.current_index = index;
-            playlist.list_id = list_id;
-            playlist.ctt = ctt.clone();
-            playlist.params = params;
-            playlist.current_duration = 0; // Reset — will be set by play_video after InnerTube resolve
-            playlist.current_title.clear();
-            // New track — reset last_state so NowPlaying is sent (nowPlayingChanged).
-            // Without this, Playing→Loading would suppress NowPlaying since prev==Playing.
-            playlist.last_state = messages::PlayerState::Idle;
-
-            // Store ctt in shared DIAL state so the SABR handler can use it.
-            if ctt.is_some() {
-                tracing::info!("[player] ctt received from cast session");
-            }
-            set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
+            adopt_playlist(playlist, dial_state, video_ids, index, list_id, ctt, params);
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
@@ -656,18 +630,7 @@ async fn handle_command(
         } => {
             tracing::info!("[player] SetVideo: {}", video_id);
 
-            playlist.video_ids = vec![video_id.clone()];
-            playlist.current_index = 0;
-            playlist.list_id.clear();
-            playlist.ctt = ctt.clone();
-            playlist.current_duration = 0;
-            playlist.current_title.clear();
-            playlist.last_state = messages::PlayerState::Idle; // New track — ensure NowPlaying is sent
-
-            if ctt.is_some() {
-                tracing::info!("[player] ctt received from cast session");
-            }
-            set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
+            adopt_video(playlist, dial_state, &video_id, ctt);
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
@@ -848,6 +811,9 @@ async fn handle_command(
         PlayerCommand::RemoteDisconnected { .. } => {
             tracing::info!("[player] Remote disconnected, stopping playback");
             set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
+            // nowPlaying must not echo the departed cast's ctt or params.
+            playlist.ctt = None;
+            playlist.params = None;
             *play_started = false;
             end_preroll(&mut playlist.preroll, "remote disconnected");
             mpd.stop().await?;
@@ -954,16 +920,6 @@ fn reported_playback(preroll_active: bool, status: &mpd::MpdStatus) -> (messages
     }
 }
 
-/// Forget the cast and build the messages that end it on the sender.
-///
-/// `play_started` is cleared first so the MPD stop that follows is not
-/// treated as a song end. `loungeScreenDisconnected` is what
-/// yt-cast-receiver sends to drop its senders while keeping the screen's
-/// Lounge session bound (Session.end() and
-/// YouTubeApp#checkAndSwitchActiveSession; Message.LoungeScreenDisconnected:
-/// "Notifies senders that their Cast session with the receiver has ended").
-/// The empty `nowPlaying` before it clears the phone's mini-player, as
-/// yt-cast-receiver's player reset does.
 /// Store the cast's ctt for `/stream`. When it changes (another cast, or the
 /// cast ended), `clear_pins` drops the pinned formats, which hold the old ctt.
 /// Returns whether it changed.
@@ -977,6 +933,16 @@ fn set_cast_ctt(dial_state: &dial::DialState, ctt: Option<String>, clear_pins: i
     changed
 }
 
+/// Forget the cast and build the messages that end it on the sender.
+///
+/// `play_started` is cleared first so the MPD stop that follows is not
+/// treated as a song end. `loungeScreenDisconnected` is what
+/// yt-cast-receiver sends to drop its senders while keeping the screen's
+/// Lounge session bound (Session.end() and
+/// YouTubeApp#checkAndSwitchActiveSession; Message.LoungeScreenDisconnected:
+/// "Notifies senders that their Cast session with the receiver has ended").
+/// The empty `nowPlaying` before it clears the phone's mini-player, as
+/// yt-cast-receiver's player reset does.
 fn release_cast(playlist: &mut PlaylistState, play_started: &mut bool) -> Vec<messages::OutgoingMessage> {
     *play_started = false;
     *playlist = PlaylistState::default();
@@ -984,6 +950,71 @@ fn release_cast(playlist: &mut PlaylistState, play_started: &mut bool) -> Vec<me
         messages::OutgoingMessage::new("nowPlaying"),
         messages::OutgoingMessage::new("loungeScreenDisconnected"),
     ]
+}
+
+/// The speaker released the cast: end it (see `release_cast`), forget its
+/// ctt and pinned formats, stop the DIAL app and MPD, tell the phone.
+async fn end_released_cast(
+    mpd_client: &mut mpd::MpdClient,
+    playlist: &mut PlaylistState,
+    play_started: &mut bool,
+    dial_state: &dial::DialState,
+    state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
+) {
+    let end_msgs = release_cast(playlist, play_started);
+    set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
+    dial_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = mpd_client.stop().await {
+        tracing::warn!("[player] release: mpd stop failed: {e}");
+    }
+    if let Err(e) = mpd_client.clear().await {
+        tracing::warn!("[player] release: mpd clear failed: {e}");
+    }
+    for msg in end_msgs {
+        state_tx.send(msg).await.ok();
+    }
+}
+
+/// SetPlaylist's state change before its song loads: the new queue, and the
+/// cast's ctt for `/stream` (a new ctt drops the old cast's pins).
+fn adopt_playlist(
+    playlist: &mut PlaylistState,
+    dial_state: &dial::DialState,
+    video_ids: Vec<String>,
+    index: usize,
+    list_id: String,
+    ctt: Option<String>,
+    params: Option<String>,
+) {
+    playlist.video_ids = video_ids;
+    playlist.current_index = index;
+    playlist.list_id = list_id;
+    playlist.ctt = ctt.clone();
+    playlist.params = params;
+    playlist.current_duration = 0; // Reset — will be set by play_video after InnerTube resolve
+    playlist.current_title.clear();
+    // New track — reset last_state so NowPlaying is sent (nowPlayingChanged).
+    // Without this, Playing→Loading would suppress NowPlaying since prev==Playing.
+    playlist.last_state = messages::PlayerState::Idle;
+    if ctt.is_some() {
+        tracing::info!("[player] ctt received from cast session");
+    }
+    set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
+}
+
+/// SetVideo's state change before its song loads (see `adopt_playlist`).
+fn adopt_video(playlist: &mut PlaylistState, dial_state: &dial::DialState, video_id: &str, ctt: Option<String>) {
+    playlist.video_ids = vec![video_id.to_owned()];
+    playlist.current_index = 0;
+    playlist.list_id.clear();
+    playlist.ctt = ctt.clone();
+    playlist.current_duration = 0;
+    playlist.current_title.clear();
+    playlist.last_state = messages::PlayerState::Idle; // New track — ensure NowPlaying is sent
+    if ctt.is_some() {
+        tracing::info!("[player] ctt received from cast session");
+    }
+    set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
 }
 
 /// Unstarted (-1) at position 0: unlike Stopped (0) at the full duration,
@@ -1426,6 +1457,8 @@ mod preroll_wiring_tests {
         play_started: &mut bool,
         script: Vec<(&'static str, &'static str)>,
     ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
+        // Commands such as RemoteDisconnected clear the real pin store.
+        let _lock = sabr::stream::test_support::global_pins_lock();
         let (port, server) = fake_mpd(script).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(16);
@@ -1461,15 +1494,23 @@ mod preroll_wiring_tests {
         assert_eq!(*dial_state.ctt.read().unwrap(), None);
     }
 
+    use sabr::stream::test_support::{global_has_pin, global_pins_lock, pin_global};
+
     #[tokio::test]
-    async fn remote_disconnect_forgets_the_cast_ctt() {
+    async fn remote_disconnect_forgets_the_cast_ctt_params_and_pins() {
+        let _lock = global_pins_lock();
         let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
         let (state_tx, _state_rx) = tokio::sync::mpsc::channel(16);
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
         *dial_state.ctt.write().unwrap() = Some("cast-ctt".into());
-        let mut playlist = PlaylistState::default();
+        pin_global("mainpin0001", "cast-ctt", "u", 10);
+        let mut playlist = PlaylistState {
+            ctt: Some("cast-ctt".into()),
+            params: Some("cast-params".into()),
+            ..PlaylistState::default()
+        };
 
         handle_command(
             lounge::PlayerCommand::RemoteDisconnected { theme: "m".into() },
@@ -1481,6 +1522,54 @@ mod preroll_wiring_tests {
         server.await.unwrap();
 
         assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        assert_eq!((playlist.ctt, playlist.params), (None, None));
+        assert!(!global_has_pin("mainpin0001"));
+    }
+
+    #[tokio::test]
+    async fn a_release_by_the_speaker_forgets_the_cast_and_its_pins() {
+        let _lock = global_pins_lock();
+        let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(16);
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        *dial_state.ctt.write().unwrap() = Some("cast-ctt".into());
+        pin_global("mainpin0002", "cast-ctt", "u", 10);
+        let mut playlist = PlaylistState { ctt: Some("cast-ctt".into()), ..PlaylistState::default() };
+
+        end_released_cast(&mut mpd, &mut playlist, &mut true, &dial_state, &state_tx).await;
+        drop(mpd);
+
+        assert_eq!(server.await.unwrap(), ["stop", "clear"]);
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        assert_eq!(playlist.ctt, None);
+        assert!(!global_has_pin("mainpin0002"));
+        assert_eq!(state_rx.try_recv().unwrap().command, "nowPlaying");
+        assert_eq!(state_rx.try_recv().unwrap().command, "loungeScreenDisconnected");
+    }
+
+    #[test]
+    fn a_new_cast_ctt_from_set_playlist_or_set_video_clears_the_pins() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = PlaylistState::default();
+        let ids = || vec!["mainpin0003".to_owned()];
+
+        adopt_playlist(&mut playlist, &dial_state, ids(), 0, String::new(), Some("ctt-a".into()), None);
+        pin_global("mainpin0003", "ctt-a", "u", 10);
+        adopt_playlist(&mut playlist, &dial_state, ids(), 0, String::new(), Some("ctt-a".into()), None);
+        assert!(global_has_pin("mainpin0003"), "the same cast keeps its pins");
+        adopt_playlist(&mut playlist, &dial_state, ids(), 0, String::new(), Some("ctt-b".into()), None);
+        assert!(!global_has_pin("mainpin0003"));
+
+        pin_global("mainpin0004", "ctt-b", "u", 10);
+        adopt_video(&mut playlist, &dial_state, "mainpin0004", Some("ctt-b".into()));
+        assert!(global_has_pin("mainpin0004"));
+        adopt_video(&mut playlist, &dial_state, "mainpin0004", Some("ctt-c".into()));
+        assert!(!global_has_pin("mainpin0004"));
+        assert_eq!(*dial_state.ctt.read().unwrap(), Some("ctt-c".into()));
     }
 
     #[tokio::test]
