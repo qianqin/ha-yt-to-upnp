@@ -47,7 +47,7 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 5. Extracts and streams audio segments as chunked HTTP to MPD
 6. Reports buffered ranges so the server sends the next segments
 
-If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL and ustreamer config, clears the SABR contexts and continues. At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
+If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL, ustreamer config and format ids, clears the SABR contexts and continues. Unlike googlevideo it also drops the playback cookie, which records the old session's format choice (resending it got `sabr.no_audio_selected` in a live Premium test). At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
 
 The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions (19 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
 
@@ -60,14 +60,16 @@ Opt-in and off by default: without these variables format selection, PoToken use
 | `YTCAST_PREMIUM_AUDIO` | `774` (Opus ~256k), `141` (AAC 256k), `off` (default) | Prefer that Premium itag when the ctt `/player` response lists it. Any other value is ignored with a warning. |
 | `YTCAST_PREMIUM_NO_POT` | `1` | With the experiment on: send no PoToken in SABR requests (yt-dlp: GVS PoToken not required for Premium). |
 
-Per song, the reloads described above apply. If the Premium itag still gets a reload request after 2 reloads and no audio has been forwarded yet, the song falls back to the regular format (251) via a fresh `/player` call; after audio has started, the stream ends instead. A fallback from 141 (AAC/MP4) to 251 (Opus/WebM) keeps the already sent `Content-Type`, so the player has to detect the format itself.
+Per song, the reloads described above apply. If the Premium itag still gets a reload request after 2 reloads, or gets any `SABR_ERROR`, and no audio of it has been forwarded yet, the song falls back to the regular format (251) via a fresh `/player` call; after audio has started, the stream ends instead. A fallback from 141 (AAC/MP4) to 251 (Opus/WebM) keeps the already sent `Content-Type`, so the player has to detect the format itself.
 
 What it logs at info (protocol detail that is otherwise at debug level):
 
 - `[sabr] premium experiment: want itag 774, PoToken sent|omitted|unavailable; /player lists itags [...]`
 - `[sabr] selected audio: itag=...` - the chosen itag
+- `[sabr] request #N formats: selected audio [774 lm=… xtags=…] selected video [...] init [...] cookie audio=… video=…` - the format ids each SABR request sends (fields 16, 17, 2) and the itags named in the playback cookie; no tokens
 - `[sabr] response #N parts: 20,21x3,22,35` - the UMP part ids of each response (consecutive repeats as `idxN`; 46 = reload request, 47 = playback start policy, 35 = next request policy, 44 = SABR error, 58 = stream protection status)
 - `[sabr] RELOAD_PLAYER_RESPONSE (token len=N)`, `[sabr] reloading player response (1/2)`, `[sabr] reloaded /player lists itags [...]`
+- `[sabr] premium experiment: itag 774 got SABR error: type=..., code=..., falling back to itag 251` (or `still asks for a reload after 2 reloads, ...`)
 - `[sabr] playback start policy: ...`, `[sabr] SABR_ERROR type=... code=...`, `[sabr] stream_protection_status=...`
 - the verdict at the end of the song: `[sabr] premium experiment: itag 774 → media OK|NO (reloads N, sps [...], media headers {itag: count}, audio bytes {itag: bytes}[, fell back to itag 251])` - OK only if audio bytes of the Premium itag itself arrived; `→ media NO (not listed by /player)` if the response did not offer it
 

@@ -1065,13 +1065,17 @@ fn switch_audio(state: &mut SabrState, format: &AdaptiveFormat) {
 }
 
 /// Point the stream at a reloaded /player response, as googlevideo does:
-/// new streaming URL and ustreamer config, SABR contexts cleared. Progress
-/// and the playback cookie carry over; format ids are refreshed when the new
-/// response still lists the itag.
+/// new streaming URL and ustreamer config, SABR contexts cleared, format ids
+/// refreshed when the new response still lists the itag. Progress carries
+/// over. Unlike googlevideo, the playback cookie is dropped: it records the
+/// old session's format choice (`audio_fmt`), and resending it with the new
+/// ustreamer config got `sabr.no_audio_selected` for every request in a live
+/// Premium test.
 fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), SabrError> {
     check_streaming_url(&player.server_url)?;
     state.server_url = player.server_url.clone();
     state.ustreamer_config = player.ustreamer_config.clone();
+    state.playback_cookie = None;
     state.sabr_contexts.clear();
     state.sabr_contexts_send.clear();
     state.sabr_contexts_discard.clear();
@@ -1241,12 +1245,67 @@ fn handle_sabr_redirect(state: &mut SabrState, data: &[u8]) -> Result<(), SabrEr
     Ok(())
 }
 
+/// A SABR_ERROR part from the server (retried like transport errors, except
+/// that a premium experiment song falls back to the regular format).
+#[derive(Debug)]
+struct SabrServerError {
+    error_type: String,
+    code: i32,
+}
+
+impl std::fmt::Display for SabrServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SABR error: type={}, code={}", self.error_type, self.code)
+    }
+}
+
+impl std::error::Error for SabrServerError {}
+
 fn handle_sabr_error(data: &[u8]) -> Result<(), SabrError> {
     let err = vs::SabrError::decode(data)?;
-    let t = err.r#type.as_deref().unwrap_or("unknown");
-    let c = err.code.unwrap_or(0);
-    tracing::warn!("[sabr] SABR_ERROR type={} code={}", t, c);
-    Err(format!("SABR error: type={}, code={}", t, c).into())
+    let error_type = err.r#type.unwrap_or_else(|| "unknown".to_owned());
+    let code = err.code.unwrap_or(0);
+    tracing::warn!("[sabr] SABR_ERROR type={} code={}", error_type, code);
+    Err(SabrServerError { error_type, code }.into())
+}
+
+fn format_ids_for_log(ids: &[misc::FormatId]) -> String {
+    let ids: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            format!(
+                "{} lm={} xtags={}",
+                id.itag.unwrap_or(0),
+                id.last_modified.unwrap_or(0),
+                id.xtags.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect();
+    format!("[{}]", ids.join(", "))
+}
+
+/// The format fields of a SABR request for the log: format ids and the itags
+/// the playback cookie names. No tokens, cookie bytes or URLs.
+fn describe_request_formats(req: &vs::VideoPlaybackAbrRequest) -> String {
+    let cookie = req
+        .streamer_context
+        .as_ref()
+        .and_then(|c| c.playback_cookie.as_deref())
+        .and_then(|bytes| vs::PlaybackCookie::decode(bytes).ok());
+    let cookie_itag = |fmt: Option<&misc::FormatId>| {
+        fmt.and_then(|f| f.itag).map_or("-".to_owned(), |i| i.to_string())
+    };
+    let cookie = match cookie {
+        Some(c) => format!("audio={} video={}", cookie_itag(c.audio_fmt.as_ref()), cookie_itag(c.video_fmt.as_ref())),
+        None => "none".to_owned(),
+    };
+    format!(
+        "selected audio {} selected video {} init {} cookie {}",
+        format_ids_for_log(&req.preferred_audio_format_ids),
+        format_ids_for_log(&req.preferred_video_format_ids),
+        format_ids_for_log(&req.selected_format_ids),
+        cookie,
+    )
 }
 
 fn handle_playback_start_policy(state: &SabrState, data: &[u8]) -> Result<(), SabrError> {
@@ -1416,6 +1475,12 @@ async fn sabr_request_cycle(
 ) -> Result<bool, SabrError> {
     check_streaming_url(&state.server_url)?;
     let req_proto = state.build_request();
+    detail!(
+        state,
+        "[sabr] request #{} formats: {}",
+        state.request_number,
+        describe_request_formats(&req_proto),
+    );
     let encoded = req_proto.encode_to_vec();
 
     let url = if state.server_url.contains('?') {
@@ -1743,23 +1808,39 @@ async fn handle_reload(
         return apply_reload(state, &player);
     }
 
-    let premium = state.premium_itag.filter(|&itag| {
-        itag == state.audio_itag && !state.stats.audio_bytes_by_itag.contains_key(&itag)
-    });
-    let Some(premium) = premium else {
+    if premium_fallback_possible(state).is_none() {
         tracing::warn!(
             "[sabr] server still asks for a player reload after {} reloads, giving up",
             MAX_RELOADS_PER_SONG,
         );
         return Err(reload.into());
-    };
+    }
+    let reason = format!("still asks for a reload after {} reloads", MAX_RELOADS_PER_SONG);
+    fall_back_from_premium(state, reloader, &reason).await
+}
 
+/// The premium itag, while it is the audio format and none of its audio has
+/// been forwarded yet (switching formats after that would corrupt the stream).
+fn premium_fallback_possible(state: &SabrState) -> Option<i32> {
+    state.premium_itag.filter(|&itag| {
+        itag == state.audio_itag && !state.stats.audio_bytes_by_itag.contains_key(&itag)
+    })
+}
+
+/// A failed premium experiment must not break playback: switch the song to
+/// the regular format via a fresh /player call (no reload token).
+async fn fall_back_from_premium(
+    state: &mut SabrState,
+    reloader: &mut impl PlayerReloader,
+    reason: &str,
+) -> Result<(), SabrError> {
+    let premium = premium_fallback_possible(state).ok_or("no premium format to fall back from")?;
     let player = reloader.fetch(None).await?;
     apply_reload(state, &player)?;
     let regular = choose_audio_format(&player.formats, None)?;
     tracing::info!(
-        "[sabr] premium experiment: itag {} still asks for a reload after {} reloads, falling back to itag {}",
-        premium, MAX_RELOADS_PER_SONG, regular.itag,
+        "[sabr] premium experiment: itag {} {}, falling back to itag {}",
+        premium, reason, regular.itag,
     );
     switch_audio(state, regular);
     state.premium_itag = None;
@@ -1800,6 +1881,11 @@ async fn drive_loop(
             Err(e) if e.is::<ReloadRequested>() => {
                 let reload = *e.downcast::<ReloadRequested>().expect("checked by is()");
                 handle_reload(state, reloader, reload).await?;
+                continue;
+            }
+            Err(e) if e.is::<SabrServerError>() && premium_fallback_possible(state).is_some() => {
+                let reason = format!("got {}", e);
+                fall_back_from_premium(state, reloader, &reason).await?;
                 continue;
             }
             Err(e) if !is_retryable(&e) => return Err(e),
@@ -2588,9 +2674,125 @@ mod tests {
         assert_eq!(state.ustreamer_config, vec![9, 9]);
         assert!(state.sabr_contexts.is_empty());
         assert!(state.sabr_contexts_send.is_empty());
-        assert_eq!(state.playback_cookie, Some(vec![7]));
+        assert_eq!(state.playback_cookie, None);
         assert_eq!(state.stats.reloads, 1);
         assert_eq!(state.audio_itag, 251);
+    }
+
+    /// Records the request each round trip would send, then plays `inner`.
+    struct RecordingCycle<C> {
+        sent: Vec<vs::VideoPlaybackAbrRequest>,
+        inner: C,
+    }
+
+    impl<C: SabrCycle + Send> SabrCycle for RecordingCycle<C> {
+        fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+            self.sent.push(state.build_request());
+            self.inner.run(state)
+        }
+    }
+
+    #[tokio::test]
+    async fn first_request_after_reload_selects_the_reloaded_format_id() {
+        let mut state = premium_state();
+        state.playback_cookie = Some(vec![7]);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = RecordingCycle {
+            sent: Vec::new(),
+            inner: ReloadingCycle { requests: 0, reload_while: |s| s.server_url == GOOD_URL },
+        };
+        let mut reloaded_774 = audio(774, OPUS, 272_644);
+        reloaded_774.last_modified = 2;
+        reloaded_774.xtags = Some("CgcKAnhoEgEx".to_owned());
+        let mut reloader = FakeReloader::new(vec![reloaded_774, audio(251, OPUS, 146_272)]);
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(cycle.sent.len(), 2);
+        let after = &cycle.sent[1];
+        let expected = misc::FormatId {
+            itag: Some(774),
+            last_modified: Some(2),
+            xtags: Some("CgcKAnhoEgEx".to_owned()),
+        };
+        // Field 16: googlevideo's selected_audio_format_ids.
+        assert_eq!(after.preferred_audio_format_ids, vec![expected]);
+        // The old session's cookie (its audio_fmt) is not sent to the new one.
+        assert_eq!(after.streamer_context.as_ref().unwrap().playback_cookie, None);
+        assert_eq!(cycle.sent[0].preferred_audio_format_ids[0].last_modified, Some(1));
+    }
+
+    /// Answers with a SABR_ERROR while `error_while(state, request count)`
+    /// holds, else ends cleanly.
+    struct SabrErrorCycle {
+        requests: u32,
+        error_while: fn(&SabrState, u32) -> bool,
+    }
+
+    impl SabrCycle for SabrErrorCycle {
+        fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+            self.requests += 1;
+            let requests = self.requests;
+            Box::pin(async move {
+                if !(self.error_while)(state, requests) {
+                    return Ok(false);
+                }
+                let err = vs::SabrError { r#type: Some("sabr.no_audio_selected".to_owned()), code: Some(2) };
+                handle_part(state, &part(ump::SABR_ERROR, err.encode_to_vec()))?;
+                Ok(true)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn premium_falls_back_to_251_on_a_sabr_error() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = premium_state();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = SabrErrorCycle { requests: 0, error_while: |s, _| while_premium(s) };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(reloader.tokens, vec![None]);
+        assert_eq!(state.audio_itag, 251);
+        assert_eq!(state.fell_back_from, Some(774));
+        assert_eq!(cycle.requests, 2);
+        assert!(logs.text().contains("sabr.no_audio_selected"), "{}", logs.text());
+        assert!(logs.text().contains("falling back to itag 251"), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn sabr_error_without_premium_is_retried_as_before() {
+        let mut state = test_state(GOOD_URL);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = SabrErrorCycle { requests: 0, error_while: |_, requests| requests == 1 };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert!(reloader.tokens.is_empty());
+        assert_eq!(cycle.requests, 2);
+        assert_eq!(state.audio_itag, 251);
+    }
+
+    #[test]
+    fn request_format_summary_shows_format_ids_and_cookie_formats_only() {
+        let mut state = premium_state();
+        state.po_token = Some(SECRET_POTOKEN.to_vec());
+        let cookie = vs::PlaybackCookie {
+            audio_fmt: Some(misc::FormatId { itag: Some(251), last_modified: Some(5), xtags: None }),
+            ..Default::default()
+        };
+        state.playback_cookie = Some(cookie.encode_to_vec());
+
+        let line = describe_request_formats(&state.build_request());
+
+        assert!(line.contains("selected audio [774 lm=1 xtags=-]"), "{line}");
+        assert!(line.contains("selected video [251 lm=1 xtags=-]"), "{line}");
+        assert!(line.contains("init [251 lm=1 xtags=-]"), "{line}");
+        assert!(line.contains("cookie audio=251 video=-"), "{line}");
+        assert!(!line.contains("secret"), "{line}");
     }
 
     #[tokio::test]
