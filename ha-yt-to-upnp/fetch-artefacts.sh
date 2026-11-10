@@ -12,8 +12,12 @@ set -eu
 stage="$1"
 out="$2"
 readonly ENTRIES="BUILD-INFO ytcast-lite deno adapter bgutil"
+readonly MAX_BYTES=536870912  # 512 MiB
+# Byte ranges in the patterns below, whatever the build's locale.
+export LC_ALL=C
 
-die() { echo "fetch-artefacts: error: $*" >&2; exit 1; }
+# printf, not echo: echo acts on backslash escapes in a URL.
+die() { printf 'fetch-artefacts: error: %s\n' "$*" >&2; exit 1; }
 lock_value() { sed -n "s/^$1: //p" "$stage/artefacts.lock"; }
 # No setuid or setgid bit survives, whichever way the programs came.
 strip_special_bits() { chmod -R u-s,g-s "$out"; }
@@ -61,16 +65,22 @@ if [ -n "${ARTEFACTS_URL:-}" ]; then
   # Strict: no user info, so "http://127.0.0.1:1@elsewhere/" cannot pass.
   if artefacts_url_is 'http://(host\.docker\.internal|127\.0\.0\.1):[0-9]{1,5}/[A-Za-z0-9._/-]*'; then
     proto='=http'
-  elif ! artefacts_url_is 'https://[^@[:space:]]+'; then
+  elif ! artefacts_url_is 'https://[^]@[:space:]\\{}[]+'; then
     die "ARTEFACTS_URL must be https:// or http://host.docker.internal:<port>/ or http://127.0.0.1:<port>/"
   fi
   url="$ARTEFACTS_URL"
 fi
 
-echo "fetch-artefacts: $url"
+printf 'fetch-artefacts: %s\n' "$url"
 tarball="$(mktemp)"
-curl -fsSL --proto "$proto" --proto-redir "$proto" --tlsv1.2 --retry 3 --max-filesize 512M \
-    -o "$tarball" "$url" \
+curl_status="$(mktemp)"
+# -q first: no .curlrc. --max-filesize refuses a Content-Length over the cap
+# at once, but curl 7.88 does not count a transfer without one; head cuts any
+# transfer one byte past the cap, so a tarball that size is refused below.
+{ curl -q -fsSL --globoff --proto "$proto" --proto-redir "$proto" --tlsv1.2 --retry 3 \
+    --max-filesize "$MAX_BYTES" -o - "$url"; echo "$?" > "$curl_status"; } \
+  | head -c "$((MAX_BYTES + 1))" > "$tarball"
+[ "$(cat "$curl_status")" = 0 ] && [ "$(($(wc -c < "$tarball")))" -le "$MAX_BYTES" ] \
   || die "download of $url failed"
 actual="$(sha256sum "$tarball" | cut -d' ' -f1)"
 [ "$actual" = "$sha256" ] || die "sha256 mismatch for $url: expected $sha256, got $actual"
@@ -82,5 +92,5 @@ for entry in $ENTRIES; do
   [ -e "$unpack/artefacts/$entry" ] || die "artefacts/$entry missing from the release tarball"
   mv "$unpack/artefacts/$entry" "$out/"
 done
-rm -rf "$tarball" "$unpack"
+rm -rf "$tarball" "$curl_status" "$unpack"
 strip_special_bits

@@ -7,6 +7,11 @@
   (which `echo` in dash acts on) left part of the value unchecked, so user
   info could slip into an https URL. The build from the repository never sets
   it.
+- Artefacts stage: the 512 MiB cap now also holds for a download without a
+  Content-Length (bookworm's curl 7.88 counted only that header); curl runs
+  with `-q` (no `.curlrc`) and `--globoff`, an https `ARTEFACTS_URL` may not
+  contain `[]{}` or a backslash, the pattern checks run with `LC_ALL=C`, and
+  URLs are printed as they are (printf, not echo).
 - Tests: `scripts/fetch_artefacts_test.py` (URL check, sha256 in the lock,
   512 MB cap, no setuid/setgid bits) and `scripts/ha_mpd_conf_test.py`
   (exactly one `@STREAM_ENCODER@` in `mpd.conf.template`, now checked by

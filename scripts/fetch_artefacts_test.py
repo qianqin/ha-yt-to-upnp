@@ -38,8 +38,23 @@ exit 7
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    """Files from the served folder; /nolength/<n>: n zero bytes without a
+    Content-Length (the end is where the connection closes)."""
+
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        if not self.path.startswith("/nolength/"):
+            return super().do_GET()
+        left = int(self.path.rsplit("/", 1)[1])
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        chunk = bytes(1 << 20)
+        while left > 0:
+            self.wfile.write(chunk[:min(left, len(chunk))])
+            left -= len(chunk)
 
 
 class QuietServer(http.server.ThreadingHTTPServer):
@@ -156,7 +171,26 @@ class FetchArtefactsTest(unittest.TestCase):
         result = self.run_fetch("https://192.0.2.1/a.tar.gz", fake_curl=True)
         self.assertFails(result, "download of https://192.0.2.1/a.tar.gz failed")
         with open(self.curl_log) as f:
-            self.assertIn("--proto =https --proto-redir =https ", f.read())
+            call = f.read()
+        self.assertIn("--proto =https --proto-redir =https ", call)
+        # -q first: no .curlrc of the build's user; --globoff: [] and {} are no URL ranges.
+        self.assertTrue(call.startswith("curl -q "), call)
+        self.assertIn(" --globoff ", call)
+
+    def test_url_glob_and_backslash_characters_are_refused(self):
+        self.write_lock("0" * 64)
+        for url in ("https://192.0.2.1/a[1-3].tar.gz", "https://192.0.2.1/{a,b}.tar.gz",
+                    "https://192.0.2.1/a]b", "https://192.0.2.1/a}b", "https://192.0.2.1\\x/a.tar.gz"):
+            with self.subTest(url=url):
+                self.assertUrlRefused(url)
+
+    def test_the_lock_url_is_logged_as_it_is(self):
+        # echo in dash (and the Mac's sh) would stop at \c.
+        url = "https://192.0.2.1/a\\cb.tar.gz"
+        self.write_lock("0" * 64, url=url)
+        result = self.run_fetch(fake_curl=True)
+        self.assertIn("fetch-artefacts: %s\n" % url, result.stdout)
+        self.assertFails(result, "download of %s failed" % url)
 
     def test_http_to_this_machine_allows_only_http(self):
         self.write_lock("0" * 64)
@@ -231,6 +265,18 @@ class FetchArtefactsTest(unittest.TestCase):
         self.write_lock("0" * 64)
         result = self.run_fetch(self.url("huge.tar.gz"))
         self.assertFails(result, "download of %s failed" % self.url("huge.tar.gz"))
+
+    def test_a_download_over_512_mib_without_a_length_is_refused(self):
+        # curl 7.88 (bookworm) checks --max-filesize only against a Content-Length.
+        self.write_lock("0" * 64)
+        url = self.url("nolength/%d" % (MAX_FILESIZE + 1))
+        result = self.run_fetch(url)
+        self.assertFails(result, "download of %s failed" % url)
+
+    def test_a_download_of_exactly_512_mib_without_a_length_is_taken(self):
+        self.write_lock("0" * 64)
+        result = self.run_fetch(self.url("nolength/%d" % MAX_FILESIZE))
+        self.assertFails(result, "sha256 mismatch")
 
     def test_a_download_of_exactly_512_mib_is_taken(self):
         # Downloaded in full, so it reaches the sha256 check.

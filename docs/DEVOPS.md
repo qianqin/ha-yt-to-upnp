@@ -180,12 +180,14 @@ programs, which its first stage (`fetch-artefacts.sh`) takes from:
   It fails closed: a sha256 other than the lock's, a lock for another
   version than `config.yaml`'s (copied into the stage; a `BUILD_VERSION`
   from the Supervisor must agree with it too), a failed download, more than
-  512 MB or a missing entry stops the build. Files are extracted without
+  512 MiB (with or without a Content-Length) or a missing entry stops the
+  build. Files are extracted without
   their owners or stored permissions, and no setuid or setgid bit is kept.
   No secret is needed (public release). The build argument `ARTEFACTS_URL`
   is for `scripts/smoke-ha-app.sh --release-path` only: it may name
   `https://` or plain http to `host.docker.internal` or `127.0.0.1` with a
-  port, nothing else (no user info, one line, checked as a whole), and a
+  port, nothing else (no user info, no `[]{}` or backslash, one line,
+  checked as a whole), and a
   `build.yaml` must never set it. `scripts/fetch_artefacts_test.py` tests
   all of this on the host against a local http server (the smoke test runs
   it first); on the Mac `sh` is bash and `tar` is bsdtar, so for dash and
