@@ -94,7 +94,7 @@ formats (always 251 via SABR).
   points the zone renderer at MPD's stream and resumes MPD once the speaker
   plays. The song replaces the silence and starts at 0:00 on the speaker.
 - **Pause / resume / seek / skip** from the phone: done in MPD; the speaker
-  keeps playing the stream. Premium songs are seekable; SABR songs are not.
+  keeps playing the stream. Premium songs are seekable; SABR songs only once fully buffered.
 - **Speaker switched off, auto power-off, or switched to line-in or another
   source:** the adapter pauses MPD and tells the receiver to end the cast. It
   then leaves the room alone until you resume or cast again from the phone.
@@ -184,7 +184,6 @@ Run only one receiver with the same cast name on the LAN.
 - Home Assistant app: `scripts/build-ha-app.sh` builds the app folder with
   pinned, verified artefacts; `scripts/smoke-ha-app.sh` builds the image and
   checks it on an isolated Docker network.
-
 - App release: `scripts/build-ha-app.sh --release` packs the release tarball
   and `artefacts.lock`, `scripts/publish-release.sh` publishes it as the
   GitHub Release asset of the version.
@@ -218,7 +217,7 @@ The parts also run on any Linux host (or a Mac for testing,
    | `MPD_HOST`, `MPD_PORT` | `localhost`, `6600` | MPD control connection |
    | `YTCAST_DATA_DIR` | OS config/cache dirs | Absolute path for the device identity and nsig cache |
    | `YTCAST_AUDIO_QUALITY` | `max` | `max`: Premium formats first; `standard`: always 251 via SABR |
-   | `RUST_LOG` | - | Currently ignored: the build has no `env-filter`, the receiver logs at info |
+   | `RUST_LOG` | `info` | Log level or targets, e.g. `debug`, `ytcast_lite=debug` |
 
 4. **Raumfeld adapter:** `python3 -m adapter` with `RAUMFELD_ROOM_UDN`,
    `RAUMFELD_SPEAKER_UDN` or `RAUMFELD_HOST`, `STREAM_URL`
