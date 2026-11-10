@@ -21,9 +21,9 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         self.assertEqual(client.status().state, "stop")
-        self.assertTrue(client.wait_player(None))
+        self.assertTrue(client.wait_changes(None))
         self.assertEqual(client.status().state, "play")
-        self.assertEqual(mpd.commands, ["status", "idle player", "status"])
+        self.assertEqual(mpd.commands, ["status", "idle player mixer", "status"])
 
     def test_idle_timeout_sends_noidle_and_connection_stays_usable(self):
         mpd = FakeMpd([["pause"]])
@@ -31,10 +31,10 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         started = time.monotonic()
-        self.assertFalse(client.wait_player(0.2))
+        self.assertFalse(client.wait_changes(0.2))
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(client.status().state, "pause")
-        self.assertEqual(mpd.commands, ["idle player", "noidle", "status"])
+        self.assertEqual(mpd.commands, ["idle player mixer", "noidle", "status"])
 
     def test_status_reports_the_song_id(self):
         mpd = FakeMpd([[("play", "7"), "stop"]])
@@ -42,7 +42,7 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         self.assertEqual(client.status(), ("play", "7", 0.0))
-        client.wait_player(None)
+        client.wait_changes(None)
         self.assertEqual(client.status(), ("stop", None, None))  # no current song
 
     def test_status_reports_how_far_into_the_song(self):
@@ -69,7 +69,7 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         with self.assertRaises(ValueError):
-            client.wait_player(0.0)
+            client.wait_changes(0.0)
         self.assertEqual(client.status().state, "stop")
 
     def test_pause_and_release_message(self):
@@ -108,7 +108,7 @@ class MpdClientTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", mpd.port)
         self.addCleanup(client.close)
         with self.assertRaises(ConnectionError):
-            client.wait_player(None)
+            client.wait_changes(None)
 
     def test_not_mpd_is_rejected(self):
         srv = socket.socket()
@@ -290,7 +290,7 @@ class MpdConnectionLostTest(unittest.TestCase):
         client = self.client(sock=ScriptedSocket([socket.timeout("idle wait over"), b"OK\n"],
                                                  recv_after_s=0.1))
         with mock.patch.object(ra, "TIMEOUT_HINT_S", 0.05):
-            self.assertFalse(client.wait_player(0.1))
+            self.assertFalse(client.wait_changes(0.1))
             with self.assertRaises(ConnectionError) as cm:
                 client.status()  # EOF
         self.assertEqual(str(cm.exception), "MPD closed the connection")
@@ -306,7 +306,7 @@ class MpdConnectionLostTest(unittest.TestCase):
         client = ra.MpdClient("127.0.0.1", raw_server(self, hang_up_during_idle))
         self.addCleanup(client.close)
         with self.assertRaises(ConnectionError) as cm:
-            client.wait_player(None)
+            client.wait_changes(None)
         self.assertIn("idle", str(cm.exception))
         self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
 
@@ -314,7 +314,7 @@ class MpdConnectionLostTest(unittest.TestCase):
         client = self.client(sock=BrokenSocket(recv_error=ConnectionResetError(54, "reset"),
                                                recv_after_s=0.2))
         with self.assertRaises(ConnectionError) as cm:
-            client.wait_player(None)
+            client.wait_changes(None)
         self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
         self.assertNotIn("Errno", str(cm.exception))
 
@@ -330,7 +330,7 @@ class MpdConnectionLostTest(unittest.TestCase):
 
         client.sock.sendall = sendall
         with self.assertRaises(ConnectionError) as cm:
-            client.wait_player(0.2)
+            client.wait_changes(0.2)
         self.assertNotIn(self.TIMEOUT_HINT, str(cm.exception))
 
 
@@ -426,11 +426,17 @@ class RecordingFollower:
     def on_mpd_state(self, state, songid=None, elapsed=None):
         self.states.append(state)
 
+    def on_mpd_volume(self, volume):
+        self.volumes = getattr(self, "volumes", []) + [volume]
+
     def tick(self):
         self.ticks += 1
 
     def take_mpd_requests(self):
         return []
+
+    def take_mpd_volume(self):
+        return None
 
     def seconds_until_deadline(self):
         return None
@@ -769,6 +775,72 @@ class SsdpTest(unittest.TestCase):
             ra.ssdp_discover(SPEAKER_UDN, timeout=1.5, addr=addr)
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(len(self.received), 2)
+
+
+class MpdVolumeTest(unittest.TestCase):
+    """MPD's volume (a null mixer: just a number, the samples untouched) is the phone's."""
+
+    def client(self, mpd):
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        return client
+
+    def test_idle_reports_volume_changes(self):
+        mpd = FakeMpd([["play", {"volume": 40}, "pause"]])
+        client = self.client(mpd)
+        self.assertEqual(client.wait_changes(None), {"mixer"})
+        self.assertEqual(client.volume(), 40)
+        self.assertEqual(client.wait_changes(None), {"player"})
+        self.assertEqual(mpd.commands, ["idle player mixer", "status", "idle player mixer"])
+
+    def test_set_volume_sends_setvol(self):
+        mpd = FakeMpd([["play"]])
+        client = self.client(mpd)
+        client.set_volume(35)
+        self.assertEqual(mpd.volume, 35)
+        self.assertEqual(client.wait_changes(None), {"mixer"})
+        self.assertEqual(client.volume(), 35)
+
+    def test_set_volume_refuses_what_is_no_volume(self):
+        mpd = FakeMpd([["play"]])
+        client = self.client(mpd)
+        for volume in (-1, 101, 2.5, True, "50"):
+            with self.subTest(volume=volume), self.assertRaises(ValueError):
+                client.set_volume(volume)
+        self.assertEqual(mpd.commands, [])
+
+    def test_no_mixer_is_no_volume(self):
+        mpd = FakeMpd([["play"]])
+        mpd.volume = -1
+        self.assertIsNone(self.client(mpd).volume())
+
+
+class RunLoopVolumeTest(unittest.TestCase):
+    def test_volume_changes_are_followed(self):
+        mpd = FakeMpd([["play", {"volume": 40}, {"volume": 45}]])
+        self.addCleanup(mpd.close)
+        follower = RecordingFollower(stop_after=99)
+        run_bounded(self, follower, mpd, sleep=lambda s: None,
+                    should_stop=lambda: len(getattr(follower, "volumes", [])) >= 2)
+        self.assertEqual(follower.volumes, [40, 45])
+
+    def test_the_speakers_volume_goes_to_mpd_and_is_not_echoed(self):
+        ctl = RecordingController()
+        ctl.speaker_volume = 20
+        follower = ra.Follower(ctl, poll_seconds=60, clock=FakeClock(), start_gate_seconds=0,
+                               max_volume=50)
+        mpd = FakeMpd([["play"]])
+        self.addCleanup(mpd.close)
+
+        def echo_read():
+            cmds = mpd.commands
+            return "setvol 40" in cmds and "status" in cmds[cmds.index("setvol 40") + 2:]
+
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            run_bounded(self, follower, mpd, sleep=lambda s: None, should_stop=echo_read)
+        self.assertEqual(mpd.volume, 40)
+        self.assertEqual(ctl.volume_calls, ["get_volume"])  # no SetVolume for our own setvol
 
 
 if __name__ == "__main__":

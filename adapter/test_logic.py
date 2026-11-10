@@ -199,6 +199,57 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("RAUMFELD_ROOM_UDN", err.getvalue())
 
 
+class MaxVolumeConfigTest(unittest.TestCase):
+    def test_max_volume_defaults_to_50(self):
+        self.assertEqual(ra.Config.from_env(REQUIRED).max_volume, 50)
+
+    def test_max_volume_is_a_whole_number_from_1_to_100(self):
+        for value in ("1", "100", " 42 "):
+            self.assertEqual(ra.Config.from_env(dict(REQUIRED, MAX_VOLUME=value)).max_volume,
+                             int(value))
+        for value in ("0", "101", "-5", "50.5", "loud", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ra.ConfigError, "MAX_VOLUME"):
+                ra.Config.from_env(dict(REQUIRED, MAX_VOLUME=value))
+
+    def test_main_passes_max_volume_to_the_follower(self):
+        env = dict(REQUIRED, MAX_VOLUME="35")
+        with no_network(), mock.patch.object(ra, "run") as run, mock.patch("logging.basicConfig"):
+            ra.main(env)
+        self.assertEqual(run.call_args[0][0].max_volume, 35)
+
+
+class VolumeScaleTest(unittest.TestCase):
+    """Phone 0-100 % is speaker 0..max_volume, linear, rounded half up."""
+
+    def test_phone_to_speaker(self):
+        self.assertEqual(ra.speaker_volume(100, 50), 50)
+        self.assertEqual(ra.speaker_volume(0, 50), 0)
+        self.assertEqual(ra.speaker_volume(51, 50), 26)  # 25.5
+        self.assertEqual(ra.speaker_volume(33, 30), 10)  # 9.9
+        self.assertEqual(ra.speaker_volume(1, 1), 0)
+        self.assertEqual(ra.speaker_volume(50, 1), 1)
+
+    def test_never_above_max_volume_nor_below_zero(self):
+        for max_volume in range(1, 101):
+            for phone in (-10, 0, 1, 50, 99, 100, 150):
+                with self.subTest(max_volume=max_volume, phone=phone):
+                    self.assertTrue(0 <= ra.speaker_volume(phone, max_volume) <= max_volume)
+
+    def test_speaker_to_phone_is_clamped_to_100(self):
+        self.assertEqual(ra.phone_volume(25, 50), 50)
+        self.assertEqual(ra.phone_volume(50, 50), 100)
+        self.assertEqual(ra.phone_volume(80, 50), 100)  # louder than the app's maximum
+        self.assertEqual(ra.phone_volume(0, 50), 0)
+        self.assertEqual(ra.phone_volume(1, 3), 33)
+
+    def test_the_round_trip_keeps_the_speaker_volume(self):
+        # The volume the adapter gives MPD maps back onto the speaker's own: no drift.
+        for max_volume in range(1, 101):
+            for speaker in range(0, max_volume + 1):
+                self.assertEqual(
+                    ra.speaker_volume(ra.phone_volume(speaker, max_volume), max_volume), speaker)
+
+
 class LineInTest(unittest.TestCase):
     def test_double_encoded_line_in(self):
         self.assertTrue(ra.is_line_in(LINE_IN_URI))
@@ -372,6 +423,10 @@ class RecordingController:
         self.restart_fail = None
         self.pause_fail = None
         self.play_fail = None
+        # RenderingControl, recorded apart: most tests are about the transport.
+        self.volume_calls = []
+        self.speaker_volume = 30
+        self.volume_fail = None
         self.plays = True
         self.plays_fail = None
         self.renderer = "STOPPED"  # what renderer_state reports while not playing
@@ -424,6 +479,18 @@ class RecordingController:
         self.calls.append("play_renderer")
         if self.play_fail:
             raise self.play_fail
+
+    def get_volume(self):
+        self.volume_calls.append("get_volume")
+        if self.volume_fail:
+            raise self.volume_fail
+        return self.speaker_volume
+
+    def set_volume(self, volume):
+        self.volume_calls.append("set_volume %d" % volume)
+        if self.volume_fail:
+            raise self.volume_fail
+        self.speaker_volume = volume
 
 
 class FollowerTest(unittest.TestCase):
@@ -1955,6 +2022,221 @@ class PauseFollowTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             f.on_mpd_state("play", "1")
         self.assertEqual(self.ctl.calls, ["renderer_state", "play_renderer", "ensure_playing"])
+
+
+class VolumeFollowTest(unittest.TestCase):
+    """The phone's volume (MPD's, a null mixer) is the speaker's own, scaled to 0..max_volume:
+    a change is sent to the zone renderer (RenderingControl SetVolume) at once; at a takeover
+    and on the speaker's own changes the speaker's volume is given to MPD instead, so the
+    phone shows it and the loudness does not jump."""
+
+    MAX = 50
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.ctl.clock = self.clock
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=15,
+                             max_volume=self.MAX)
+
+    def advance(self, seconds):
+        self.clock.now += seconds
+        self.f.tick()
+
+    def requests(self):
+        return self.f.take_mpd_requests()
+
+    def owned(self, song="1"):
+        """A gated cast start; the speaker's volume goes to MPD (served like run() does)."""
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", song)
+            self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+            self.f.on_mpd_state("pause", song)
+            self.mpd_volume_set()
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", song)
+        self.ctl.volume_calls.clear()
+
+    def mpd_volume_set(self):
+        """run() gives MPD the volume (setvol); MPD reports the change back (idle mixer)."""
+        volume = self.f.take_mpd_volume()
+        self.f.on_mpd_volume(volume)
+        return volume
+
+    # -- cast start
+
+    def test_takeover_gives_mpd_the_speakers_volume_and_leaves_the_speaker_alone(self):
+        self.ctl.speaker_volume = 20
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])
+        self.assertEqual(self.requests(), [])  # MPD's volume has its own channel
+        self.assertEqual(self.mpd_volume_set(), 40)  # 20 of 50: the phone shows 40 %
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])  # no echo back
+        self.assertTrue(any("volume" in m for m in logs.output), logs.output)
+
+    def test_a_speaker_louder_than_max_volume_shows_100_and_is_left_alone(self):
+        self.ctl.speaker_volume = 80
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.mpd_volume_set(), 100)
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])
+        self.assertEqual(self.ctl.speaker_volume, 80)
+        # Until the user moves the slider: then it is scaled, never above max_volume.
+        self.f.on_mpd_volume(99)
+        self.assertEqual(self.ctl.volume_calls, ["get_volume", "set_volume 50"])
+
+    def test_the_phones_volume_is_not_pushed_at_a_takeover(self):
+        # The phone's setVolume before the speaker is ours: nothing is sent to the speaker.
+        self.f.on_mpd_volume(90)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.f.on_mpd_volume(80)  # during the gate, before the takeover
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_a_failed_volume_read_at_takeover_is_logged_and_the_cast_goes_on(self):
+        self.ctl.volume_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertTrue(any("WARNING" in m for m in logs.output), logs.output)
+        self.assertIsNone(self.f.take_mpd_volume())  # MPD's volume left as it is
+        self.assertTrue(self.f.owned)
+        self.assertEqual(self.f.seconds_until_deadline(), ra.GATE_POLL_S)  # the gate goes on
+
+    # -- phone changes
+
+    def test_a_phone_volume_change_is_sent_to_the_speaker_scaled(self):
+        self.owned()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_volume(70)
+        self.assertEqual(self.ctl.volume_calls, ["set_volume 35"])
+        self.assertEqual(self.requests(), [])
+        self.f.on_mpd_volume(100)
+        self.f.on_mpd_volume(0)
+        self.assertEqual(self.ctl.volume_calls, ["set_volume 35", "set_volume 50", "set_volume 0"])
+
+    def test_phone_changes_are_sent_while_paused_too(self):
+        self.owned()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")
+        self.f.on_mpd_volume(20)
+        self.assertEqual(self.ctl.volume_calls, ["set_volume 10"])
+
+    def test_no_volume_is_sent_without_a_volume_from_mpd(self):
+        self.owned()
+        self.f.on_mpd_volume(None)  # MPD without a mixer reports none
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_a_failed_set_volume_is_logged_and_the_loop_goes_on(self):
+        self.owned()
+        self.ctl.volume_fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_volume(70)
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.ctl.volume_fail = None
+        self.f.on_mpd_volume(60)
+        self.assertEqual(self.ctl.volume_calls, ["set_volume 35", "set_volume 30"])
+
+    # -- speaker changes
+
+    def test_a_volume_changed_on_the_speaker_is_given_to_mpd_without_an_echo(self):
+        self.owned()
+        self.ctl.speaker_volume = 45  # its buttons, or the Raumfeld app
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])
+        self.assertEqual(self.mpd_volume_set(), 90)
+        self.advance(5)  # unchanged: nothing more for MPD
+        self.assertIsNone(self.f.take_mpd_volume())
+        self.assertEqual(self.ctl.volume_calls, ["get_volume", "get_volume"])  # no SetVolume
+
+    def test_a_failed_volume_poll_is_logged_and_polling_goes_on(self):
+        self.owned()
+        self.ctl.volume_fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.advance(5)
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.assertIsNone(self.f.take_mpd_volume())
+
+    def test_a_volume_not_given_to_mpd_is_given_after_a_reconnect(self):
+        self.owned()
+        self.ctl.speaker_volume = 45
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.f.requeue_mpd_volume(self.f.take_mpd_volume())  # the connection dropped
+        self.assertEqual(self.mpd_volume_set(), 90)
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])
+
+    def test_only_our_own_setvol_is_not_echoed(self):
+        self.owned()
+        self.ctl.speaker_volume = 45
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.f.take_mpd_volume()  # setvol 90 sent; the phone moves before its event is read
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_volume(60)
+        self.f.on_mpd_volume(60)
+        self.assertEqual(self.ctl.volume_calls, ["get_volume", "set_volume 30", "set_volume 30"])
+
+    # -- not ours
+
+    def test_no_volume_calls_when_the_speaker_is_not_ours(self):
+        self.owned()
+        self.ctl.verdict = ra.OTHER_SOURCE
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)  # yields
+        self.f.on_mpd_volume(70)
+        self.f.on_mpd_state("pause", "1")
+        self.f.on_mpd_volume(60)
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_no_volume_calls_when_mpd_is_stopped(self):
+        self.owned()
+        self.f.on_mpd_state("stop", None)
+        self.ctl.speaker_volume = 10
+        self.advance(5)
+        self.f.on_mpd_volume(70)
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_no_volume_calls_without_a_cast(self):
+        self.f.on_mpd_volume(70)
+        self.advance(5)
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_the_gate_and_the_hand_over_make_no_volume_calls(self):
+        self.ctl.plays = False
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+            self.mpd_volume_set()
+            self.f.on_mpd_state("pause", "2")  # the receiver's held hand-over
+            for _ in range(GATE_LOOKS):  # gate checks, re-takeovers, timeout
+                self.advance(ra.GATE_POLL_S)
+                if ra.RESUME_PLAYER in self.f._requests:
+                    break
+        self.assertEqual(self.ctl.volume_calls, ["get_volume"])  # the takeover's read only
+        self.assertIn("ensure_playing(retake)", self.ctl.calls)
+
+    def test_a_resume_of_our_paused_speaker_reads_no_volume(self):
+        self.owned()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.volume_calls, [])
+
+    def test_max_volume_defaults_like_the_config(self):
+        self.assertEqual(ra.Follower(self.ctl).max_volume, ra.DEFAULT_MAX_VOLUME)
+        self.assertEqual(ra.DEFAULT_MAX_VOLUME, 50)
 
 
 if __name__ == "__main__":

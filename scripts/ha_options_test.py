@@ -126,12 +126,12 @@ class Valid(unittest.TestCase):
 
     def test_all_options(self):
         options = dict(VALID, stream_host="192.0.2.10", start_gate_seconds=0,
-                       stuck_seconds=300, log_level="debug")
+                       stuck_seconds=300, max_volume=50, log_level="debug")
         self.assertIsNone(problem(options))
 
     def test_unset_optional_options(self):
         for unset in (None, ""):
-            options = dict(VALID, stream_host=unset, start_gate_seconds=None)
+            options = dict(VALID, stream_host=unset, start_gate_seconds=None, max_volume=unset)
             self.assertIsNone(problem(options))
 
     def test_raumfeld_host(self):
@@ -152,6 +152,8 @@ class Valid(unittest.TestCase):
 
     def test_bounds(self):
         self.assertIsNone(problem(dict(VALID, start_gate_seconds=60, stuck_seconds=1)))
+        for volume in (1, 100):
+            self.assertIsNone(problem(dict(VALID, max_volume=volume)), volume)
         self.assertIsNone(problem(dict(VALID, cast_name="x" * 60)))
 
 
@@ -213,7 +215,8 @@ class Invalid(unittest.TestCase):
             self.assertProblem(dict(VALID, log_level=bad), "log_level")
 
     def test_timings(self):
-        for key, low, high in (("start_gate_seconds", 0, 60), ("stuck_seconds", 1, 300)):
+        for key, low, high in (("start_gate_seconds", 0, 60), ("stuck_seconds", 1, 300),
+                               ("max_volume", 1, 100)):
             for bad in (low - 1, high + 1, "10", 10.5, True):
                 self.assertProblem(dict(VALID, **{key: bad}), key)
 

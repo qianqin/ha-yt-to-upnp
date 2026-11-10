@@ -9,8 +9,9 @@ Python 3.9+ standard library only. Devices are identified exclusively by UPnP
 UDN, never by IP: the host by SSDP (or at RAUMFELD_HOST, verified by knowing our room),
 the zone renderer by an SSDP search for the zone UDN (answered by RAUMFELD_HOST, if set) and
 its description's UDN. Both are found at start and cached until a request fails or the
-zone changes. No volume is ever touched:
-this module sends no RenderingControl requests at all.
+zone changes. The phone's volume (MPD's, a null mixer that leaves the samples alone) is the
+zone renderer's RenderingControl volume, scaled so that 100 % is MAX_VOLUME; nothing else
+on RenderingControl is ever sent.
 """
 
 import errno
@@ -41,6 +42,9 @@ SSDP_ADDR = ("239.255.255.250", 1900)
 HOST_SEARCH_S = 3.0
 RAUMFELD_API_PORT = 47365
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
+RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:1"
+# The speaker's volume at phone 100 %: its real maximum would be far too loud.
+DEFAULT_MAX_VOLUME = 50
 HTTP_TIMEOUT_S = 10  # hard limit per HTTP request: connect, headers, body and redirects
 MAX_BODY = 256 * 1024  # getZones, device descriptions and SOAP replies are a few KiB
 MPD_MAX_LINE = 64 * 1024
@@ -128,7 +132,7 @@ def _state_dir(env):
 
 class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url stream_mime "
                                   "stream_metadata poll_seconds stuck_seconds start_gate_seconds "
-                                  "mpd_host mpd_port log_level state_dir")):
+                                  "mpd_host mpd_port log_level state_dir max_volume")):
     @classmethod
     def from_env(cls, env):
         raumfeld_host = _raumfeld_host(env)
@@ -156,6 +160,13 @@ class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url
         # connection_timeout.)
         start_gate_seconds = _seconds(env, "START_GATE_SECONDS", str(START_GATE_S), 0,
                                       START_GATE_MAX_S)
+
+        try:
+            max_volume = int(env.get("MAX_VOLUME", str(DEFAULT_MAX_VOLUME)))
+        except ValueError:
+            raise ConfigError("MAX_VOLUME must be a whole number 1-100") from None
+        if not 1 <= max_volume <= 100:
+            raise ConfigError("MAX_VOLUME must be a whole number 1-100")
 
         try:
             mpd_port = int(env.get("MPD_PORT", "6600"))
@@ -188,6 +199,7 @@ class Config(namedtuple("Config", "room_udn speaker_udn raumfeld_host stream_url
             mpd_port=mpd_port,
             log_level=log_level,
             state_dir=_state_dir(env),
+            max_volume=max_volume,
         )
 
 
@@ -263,6 +275,18 @@ def judge_speaker(power, zone, status, stream_url):
     return NOT_PLAYING
 
 
+def speaker_volume(phone, max_volume):
+    """The speaker volume for a phone (MPD) volume of 0-100 %: 0..max_volume, linear,
+    rounded half up, never outside it."""
+    return max(0, min(max_volume, (phone * max_volume + 50) // 100))
+
+
+def phone_volume(speaker, max_volume):
+    """The phone (MPD) volume showing a speaker volume: its inverse, at most 100 % for a
+    speaker louder than max_volume. speaker_volume() maps it back onto the same volume."""
+    return max(0, min(100, (200 * speaker + max_volume) // (2 * max_volume)))
+
+
 def build_didl(stream_url, mime):
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -277,14 +301,14 @@ def build_didl(stream_url, mime):
     )
 
 
-def soap_envelope(action, args):
+def soap_envelope(action, args, service=AVTRANSPORT):
     body = "".join("<%s>%s</%s>" % (k, _escape(v), k) for k, v in args)
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
         's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
         '<s:Body><u:%s xmlns:u="%s">%s</u:%s></s:Body></s:Envelope>'
-        % (action, AVTRANSPORT, body, action)
+        % (action, service, body, action)
     )
 
 
@@ -345,11 +369,19 @@ def _elements(root, name):
 
 
 def avtransport_control_url(description_xml, location):
+    url = service_control_url(description_xml, location, AVTRANSPORT)
+    if url is None:
+        raise RaumfeldError("no AVTransport service in device description at %r" % location)
+    return url
+
+
+def service_control_url(description_xml, location, service):
+    """The control URL of a service in a device description, or None."""
     for el in _elements(_parse_xml(description_xml), "service"):
         fields = {_local(child.tag): (child.text or "").strip() for child in el}
-        if fields.get("serviceType") == AVTRANSPORT and fields.get("controlURL"):
+        if fields.get("serviceType") == service and fields.get("controlURL"):
             return urljoin(location, fields["controlURL"])
-    raise RaumfeldError("no AVTransport service in device description at %r" % location)
+    return None
 
 
 def device_udn(description_xml):
@@ -591,10 +623,10 @@ def http_get(url, deadline_s=HTTP_TIMEOUT_S):
     return _fetch("GET", url, deadline_s)
 
 
-def soap_call(control_url, action, args):
-    body = soap_envelope(action, [("InstanceID", "0")] + list(args)).encode("utf-8")
+def soap_call(control_url, action, args, service=AVTRANSPORT):
+    body = soap_envelope(action, [("InstanceID", "0")] + list(args), service).encode("utf-8")
     headers = {"Content-Type": 'text/xml; charset="utf-8"',
-               "SOAPACTION": '"%s#%s"' % (AVTRANSPORT, action)}
+               "SOAPACTION": '"%s#%s"' % (service, action)}
     root = _parse_xml(_fetch("POST", control_url, HTTP_TIMEOUT_S, body, headers))
     return {_local(el.tag): (el.text or "") for el in root.iter()}
 
@@ -719,6 +751,7 @@ class Controller:
         self._api = None
         self._zone = None  # UDN of the zone of the last takeover or look
         self._control = None  # its AVTransport control URL, None until found
+        self._rendering = None  # its RenderingControl control URL, if it has one
         # The URI the zone held when the last takeover (not a re-takeover) set up our
         # stream; "" if none (standby, no zone, nothing loaded).
         self._source_before = ""
@@ -839,6 +872,27 @@ class Controller:
         resume of a renderer we paused. It reconnects to the stream."""
         soap_call(self._known_control(), "Play", [("Speed", "1")])
 
+    def get_volume(self):
+        """The zone renderer's volume (RenderingControl, Master), 0-100."""
+        reply = soap_call(self._known_rendering(), "GetVolume", [("Channel", "Master")],
+                          RENDERING_CONTROL)
+        volume = reply.get("CurrentVolume", "")
+        if not re.fullmatch(r"[0-9]{1,3}", volume) or int(volume) > 100:
+            raise RaumfeldError("invalid volume %r" % volume[:MAX_STATE_LEN])
+        return int(volume)
+
+    def set_volume(self, volume):
+        if type(volume) is not int or not 0 <= volume <= 100:
+            raise ValueError("refusing volume %r" % (volume,))
+        soap_call(self._known_rendering(), "SetVolume",
+                  [("Channel", "Master"), ("DesiredVolume", str(volume))], RENDERING_CONTROL)
+
+    def _known_rendering(self):
+        self._known_control()
+        if self._rendering is None:
+            raise RaumfeldError("zone renderer %r has no RenderingControl" % self._zone)
+        return self._rendering
+
     def _known_control(self):
         if self._control is None:
             raise RaumfeldError("no zone renderer known yet")
@@ -897,9 +951,9 @@ class Controller:
 
     def _zone_control(self, zone):
         if self._zone != zone or self._control is None:
-            self._zone, self._control = zone, None
+            self._zone, self._control, self._rendering = zone, None, None
             self._lookups += 1
-            self._control = self._control_url(zone)
+            self._control, self._rendering = self._control_url(zone)
         return self._control
 
     def _wait_awake(self, api, had_zone):
@@ -943,9 +997,9 @@ class Controller:
         raise RaumfeldError("room did not appear in a zone after connectRoomToZone")
 
     def _control_url(self, zone):
-        """The zone renderer's control URL: from the stored location if there is one for this
-        zone (tried once) and it still describes the zone, otherwise from a search; a found
-        location is stored."""
+        """The zone renderer's control URLs (AVTransport; RenderingControl or None): from the
+        stored location if there is one for this zone (tried once) and it still describes the
+        zone, otherwise from a search; a found location is stored."""
         stored, self._stored = self._stored, None
         if stored is not None and stored["zone_udn"] == zone:
             try:
@@ -956,10 +1010,10 @@ class Controller:
                 log.info("zone renderer location from the adapter state not usable (%r); "
                          "searching for it", e)
         host, location = self.locator.renderer(zone)
-        control = self._describe(zone, host, location)
+        controls = self._describe(zone, host, location)
         if self.state is not None:
             self.state.save({"zone_udn": zone, "host": host, "location": location})
-        return control
+        return controls
 
     def _describe(self, zone, host, location):
         check_device_url(location, host)
@@ -967,7 +1021,9 @@ class Controller:
         udn = device_udn(description)
         if udn != zone:
             raise RaumfeldError("device at %r has UDN %r, not the zone's %r" % (location, udn, zone))
-        return check_device_url(avtransport_control_url(description, location), host)
+        rendering = service_control_url(description, location, RENDERING_CONTROL)
+        return (check_device_url(avtransport_control_url(description, location), host),
+                rendering and check_device_url(rendering, host))
 
 
 # --------------------------------------------------------------------------- MPD
@@ -985,8 +1041,8 @@ TIMEOUT_HINT_S = 30
 
 
 class MpdClient:
-    """Minimal MPD protocol client: `status`, `idle player`, `pause 1`/`pause 0` and
-    `sendmessage`. Never `stop`: the receiver takes an MPD stop for the end of the track
+    """Minimal MPD protocol client: `status`, `idle player mixer`, `pause 1`/`pause 0`,
+    `setvol` and `sendmessage`. Never `stop`: the receiver takes an MPD stop for the end of the track
     and advances."""
 
     def __init__(self, host, port, timeout=HTTP_TIMEOUT_S):
@@ -1040,28 +1096,41 @@ class MpdClient:
     def resume(self):
         self._command("pause 0")
 
+    def volume(self):
+        """MPD's volume, 0-100; None without a mixer."""
+        self._send("status")
+        fields = dict(line.partition(": ")[::2] for line in self._response())
+        volume = fields.get("volume", "-1")
+        if not re.fullmatch(r"-1|[0-9]{1,3}", volume) or int(volume) > 100:
+            raise MpdError("status with invalid volume %r" % volume[:40])
+        return None if volume == "-1" else int(volume)
+
+    def set_volume(self, volume):
+        if type(volume) is not int or not 0 <= volume <= 100:
+            raise ValueError("refusing MPD volume %r" % (volume,))
+        self._command("setvol %d" % volume)
+
     def send_message(self, channel, text):
         for token in (channel, text):
             if not _MPD_TOKEN.fullmatch(token):
                 raise ValueError("refusing MPD message token %r" % token)
         self._command("sendmessage %s %s" % (channel, text))
 
-    def wait_player(self, timeout):
-        """Block until the player changes (True) or `timeout` seconds pass (False;
-        None = forever)."""
+    def wait_changes(self, timeout):
+        """Block until the player or the volume changes or `timeout` seconds pass (None =
+        forever); the changed subsystems, {"player"}, {"mixer"}, both or none."""
         if timeout is not None and timeout <= 0:
             raise ValueError("idle timeout must be positive or None, got %r" % timeout)
-        self._send("idle player")
+        self._send("idle player mixer")
         self._idle_since = time.monotonic()
         self.sock.settimeout(timeout)
         try:
-            self._response()
-            return True
+            return _changed(self._response())
         except socket.timeout:
             self.sock.settimeout(self.timeout)
             self._send("noidle")
             # MPD may have reported a change just before it saw noidle.
-            return bool(self._response())
+            return _changed(self._response())
         finally:
             self.sock.settimeout(self.timeout)
             # MPD restarts its connection_timeout when an `idle` ends.
@@ -1122,6 +1191,11 @@ class MpdClient:
             return ConnectionError("MPD closed the connection")
         return ConnectionError("MPD closed the connection while the adapter waited in idle "
                                "for %.1f s" % idle_s)
+
+
+def _changed(lines):
+    return frozenset(line[len("changed: "):] for line in lines
+                     if line.startswith("changed: ")) & {"player", "mixer"}
 
 
 # --------------------------------------------------------------------------- orchestration
@@ -1254,6 +1328,13 @@ class Follower:
     (yield). Anything else is a resume as without the pause. A pause on the speaker
     itself (MPD still playing) is not ours: it counts as stopped, as before.
 
+    Volume: while it owns the zone and MPD plays or is paused, a change of MPD's volume
+    (the phone's) is sent to the renderer at once, scaled to 0..max_volume. The speaker's
+    own volume goes the other way, to MPD (so the phone shows it): read at each takeover of
+    a zone it did not own (the phone's volume is never pushed then) and at each poll, where
+    a change made on the speaker is noticed. MPD's report of our own setvol is not sent
+    back. Neither the gate's checks and restarts nor the hand-over touch the volume.
+
     Start gate: when MPD starts playing and the adapter doesn't own the zone, it first
     asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
     pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). A
@@ -1273,8 +1354,13 @@ class Follower:
     paused, nothing changes), so it is undone."""
 
     def __init__(self, controller, poll_seconds=DEFAULT_POLL_S, clock=time.monotonic,
-                 stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S):
+                 stuck_seconds=STUCK_S, start_gate_seconds=START_GATE_S,
+                 max_volume=DEFAULT_MAX_VOLUME):
         self.controller = controller
+        self.max_volume = max_volume
+        self._speaker_volume = None  # the speaker's volume as last read or set
+        self._mpd_volume = None  # the volume run() is to give MPD (setvol), if any
+        self._mpd_volume_sent = None  # our setvol whose report MPD has yet to give
         self.poll_seconds = poll_seconds
         self.stuck_seconds = stuck_seconds
         self.start_gate_seconds = start_gate_seconds
@@ -1365,6 +1451,51 @@ class Follower:
             self._schedule(_POLL)
         else:
             self.pending = None
+
+    def on_mpd_volume(self, volume):
+        """MPD's volume changed (`idle mixer`): the phone's, unless it is our own setvol."""
+        ours, self._mpd_volume_sent = volume == self._mpd_volume_sent, None
+        if volume is None or ours or not self._casting():
+            return
+        target = speaker_volume(volume, self.max_volume)
+        try:
+            self.controller.set_volume(target)
+        except _ERRORS as e:
+            log.warning("setting the speaker volume to %d failed: %r", target, e)
+            return
+        self._speaker_volume = target
+        log.info("volume %d %% from the phone: speaker volume %d (of max %d)", volume, target,
+                 self.max_volume)
+
+    def take_mpd_volume(self):
+        """The volume run() is to give MPD now (setvol), or None; handed out once."""
+        volume, self._mpd_volume = self._mpd_volume, None
+        if volume is not None:
+            self._mpd_volume_sent = volume
+        return volume
+
+    def requeue_mpd_volume(self, volume):
+        """Put back a volume run() could not give MPD (lost connection), unless a newer
+        one is due."""
+        self._mpd_volume_sent = None
+        if self._mpd_volume is None:
+            self._mpd_volume = volume
+
+    def _casting(self):
+        return self.owned and not self.yielded and self.mpd_state in ("play", "pause")
+
+    def _show_speaker_volume(self, why):
+        """Read the speaker's volume; if it is not the one known, give it to MPD."""
+        try:
+            volume = self.controller.get_volume()
+        except _ERRORS as e:
+            log.warning("reading the speaker volume failed: %r", e)
+            return
+        if volume == self._speaker_volume:
+            return
+        self._speaker_volume = volume
+        self._mpd_volume = phone_volume(volume, self.max_volume)
+        log.info("speaker volume %d (%s): MPD volume %d %%", volume, why, self._mpd_volume)
 
     def take_mpd_requests(self):
         requests, self._requests = self._requests, []
@@ -1695,8 +1826,11 @@ class Follower:
         if decision in TAKEN_AWAY:
             self._yield(decision)
         else:
-            self.owned = True
+            newly_owned, self.owned = not self.owned, True
             self._schedule(_POLL)
+            if newly_owned:
+                self._speaker_volume = None  # whatever it was, the phone is shown it
+                self._show_speaker_volume("at the takeover")
 
     def _poll(self):
         verdict = self.controller.check()
@@ -1725,6 +1859,8 @@ class Follower:
             self._stuck = None
         # Schedule first: a failing restart is logged by _attempt and must not stop polling.
         self._schedule(_POLL)
+        if self._casting():
+            self._show_speaker_volume("changed on the speaker")
         if stuck:
             self._unstick()
 
@@ -1788,7 +1924,7 @@ def _serve_requests(follower, mpd):
     while True:
         requests = follower.take_mpd_requests()
         if not requests:
-            return
+            return _serve_volume(follower, mpd)
         for i, request in enumerate(requests):
             try:
                 if request in (PAUSE_PLAYER, RESUME_PLAYER):
@@ -1806,6 +1942,17 @@ def _serve_requests(follower, mpd):
                 # The connection is gone; what is left must still go out after the reconnect.
                 follower.requeue_mpd_requests(requests[i:])
                 raise
+
+
+def _serve_volume(follower, mpd):
+    volume = follower.take_mpd_volume()
+    if volume is None:
+        return
+    try:
+        mpd.set_volume(volume)
+    except BaseException:
+        follower.requeue_mpd_volume(volume)
+        raise
 
 
 def _send_release(mpd):
@@ -1838,8 +1985,11 @@ def run(follower, connect_mpd, sleep=time.sleep, should_stop=lambda: False):
             while not should_stop():
                 wait = follower.seconds_until_deadline()
                 # Only a real player change is an MPD event; a timeout just means "tick".
-                if mpd.wait_player(None if wait is None else max(wait, MIN_WAIT_S)):
+                changes = mpd.wait_changes(None if wait is None else max(wait, MIN_WAIT_S))
+                if "player" in changes:
                     follower.on_mpd_state(*mpd.status())
+                if "mixer" in changes:
+                    follower.on_mpd_volume(mpd.volume())
                 follower.tick()
                 # Outside `idle`: the connection is free for our own commands.
                 _serve_requests(follower, mpd)
@@ -1871,7 +2021,8 @@ def main(env=None):
     controller = Controller(config, locator, state=state)
     controller.warm_up()
     follower = Follower(controller, config.poll_seconds, stuck_seconds=config.stuck_seconds,
-                        start_gate_seconds=config.start_gate_seconds)
+                        start_gate_seconds=config.start_gate_seconds,
+                        max_volume=config.max_volume)
     try:
         run(follower, lambda: MpdClient(config.mpd_host, config.mpd_port))
     except KeyboardInterrupt:

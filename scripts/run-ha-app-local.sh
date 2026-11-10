@@ -77,6 +77,7 @@ while [ $# -gt 0 ]; do
     --log-level) opts+=(log_level "$2") ;;
     --start-gate-seconds) opts+=(start_gate_seconds "$2") ;;
     --stuck-seconds) opts+=(stuck_seconds "$2") ;;
+    --max-volume) opts+=(max_volume "$2") ;;
     --app-dir) app="$2" ;;
     *) usage; exit 2 ;;
   esac
@@ -111,7 +112,7 @@ python3 -I - "${opts[@]}" > "$run/data/options.json" <<'PY'
 import json, sys
 args = sys.argv[1:]
 options = dict(zip(args[0::2], args[1::2]))
-for name in ("start_gate_seconds", "stuck_seconds"):
+for name in ("start_gate_seconds", "stuck_seconds", "max_volume"):
     if name in options:
         try:
             options[name] = int(options[name])
@@ -186,7 +187,8 @@ adapter_env=(
   ADAPTER_STATE_DIR="$run/data/adapter" HOME=/nonexistent
 )
 for pair in raumfeld_speaker_udn:RAUMFELD_SPEAKER_UDN raumfeld_host:RAUMFELD_HOST \
-            start_gate_seconds:START_GATE_SECONDS stuck_seconds:STUCK_SECONDS; do
+            start_gate_seconds:START_GATE_SECONDS stuck_seconds:STUCK_SECONDS \
+            max_volume:MAX_VOLUME; do
   value="$(option "${pair%%:*}")"
   [ -z "$value" ] || adapter_env+=("${pair#*:}=$value")
 done

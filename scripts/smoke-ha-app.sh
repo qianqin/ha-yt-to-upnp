@@ -673,7 +673,8 @@ main="$run_id-main"
 start_app "$main" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
-  "start_gate_seconds": 7, "stuck_seconds": 20, "stream_format": "flac", "log_level": "debug"}'
+  "start_gate_seconds": 7, "stuck_seconds": 20, "max_volume": 40, "stream_format": "flac",
+  "log_level": "debug"}'
 expect_main='{"cast_name": "Smoke Test",
   "stream": {"path": "/stream.flac", "mime": "audio/flac",
              "params": {"codec": "flac", "rate": 48000, "channels": 2, "bits": 16}},
@@ -684,6 +685,7 @@ expect_main='{"cast_name": "Smoke Test",
                   "STREAM_URL": "http://{ip}:8000/stream.flac", "STREAM_MIME": "audio/flac",
                   "MPD_HOST": "127.0.0.1",
                   "MPD_PORT": "6600", "START_GATE_SECONDS": "7", "STUCK_SECONDS": "20",
+                  "MAX_VOLUME": "40",
                   "LOG_LEVEL": "DEBUG", "ADAPTER_STATE_DIR": "/data/adapter"},
   "adapter_env_absent": ["RAUMFELD_HOST"]}'
 wait_for_checks "$main" full "$expect_main"

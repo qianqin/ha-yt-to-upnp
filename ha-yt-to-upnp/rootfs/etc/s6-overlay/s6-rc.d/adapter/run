@@ -46,6 +46,10 @@ if ytcast_has_option stuck_seconds; then
     stuck_seconds="$(ytcast_option stuck_seconds)"
     env+=(STUCK_SECONDS="${stuck_seconds}")
 fi
+if ytcast_has_option max_volume; then
+    max_volume="$(ytcast_option max_volume)"
+    env+=(MAX_VOLUME="${max_volume}")
+fi
 
 ytcast_wait_for_mpd
 bashio::log.info "Starting Raumfeld adapter (stream ${stream_url}, Raumfeld host ${raumfeld_host:-by SSDP})"

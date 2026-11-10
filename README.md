@@ -43,7 +43,8 @@ solving with the vendored yt-dlp/ejs solver in QuickJS.
   it is awake, holds the song in a start gate until the speaker plays, retakes
   a speaker that didn't start, restarts a renderer stuck in `TRANSITIONING`,
   respects standby, line-in and other sources, and releases the cast when the
-  speaker is taken away. Never touches the speaker's volume.
+  speaker is taken away. Follows the phone's pause, resume and volume to the
+  speaker (its own volume, scaled to `max_volume`).
 - **FLAC 16-bit/48 kHz stream** to the speaker (from 0.4.0, see below).
 - **Home Assistant app packaging:** the programs are built on the release
   machine (a Mac) from pinned, checksummed inputs and published as a GitHub
@@ -67,8 +68,11 @@ Raumfeld adapter  --UPnP AVTransport-->  Raumfeld zone renderer (the room)
 ```
 
 The phone stays the remote: play, pause, seek, skip and volume go to the
-receiver over the Lounge API and become MPD commands. Volume is MPD's software
-volume; the speaker's own volume is never changed.
+receiver over the Lounge API and become MPD commands. MPD's volume is only a
+number (null mixer, the stream stays bit-perfect); the adapter sets the
+speaker's own volume from it, scaled so that 100 % is `max_volume` (default
+50), and gives MPD the speaker's volume at a cast start and after a change on
+the speaker, which the receiver reports to the phone.
 
 ### Audio chain
 
@@ -204,7 +208,8 @@ The parts also run on any Linux host (or a Mac for testing,
 `scripts/run-ha-app-local.sh`), on the same LAN as the phone and the speaker:
 
 1. **MPD** on the same host with an `httpd` output and `mixer_type
-   "software"`, control on localhost: see
+   "null"` (the adapter turns the phone's volume into the speaker's), control
+   on localhost: see
    [adapter/mpd.conf.example](adapter/mpd.conf.example). For FLAC use
    `format "48000:16:2"` (16-bit, fixed 48 kHz, as the app does).
 2. **PoToken helper:** [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)

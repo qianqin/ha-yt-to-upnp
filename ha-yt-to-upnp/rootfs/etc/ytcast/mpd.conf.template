@@ -8,7 +8,7 @@ music_directory     "/data/mpd/music"
 playlist_directory  "/data/mpd/playlists"
 db_file             "/data/mpd/database"
 state_file          "/data/mpd/state"
-# The state file keeps the phone's volume across restarts; a restored queue must
+# The state file keeps MPD's volume across restarts; a restored queue must
 # not start playing (and wake the speaker) before the receiver clears it.
 restore_paused      "yes"
 bind_to_address     "127.0.0.1"
@@ -33,7 +33,8 @@ audio_output {
     # speaker neither drops it nor stalls during the adapter's start gate.
     always_on   "yes"
     tags        "yes"
-    # Volume from the phone is MPD's software volume; the speaker's own volume
-    # is never touched.
-    mixer_type  "software"
+    # The phone's volume is just a number in MPD (setvol works, the samples are
+    # left alone: the stream stays bit-perfect); the adapter sends it, scaled to
+    # max_volume, to the speaker's own volume.
+    mixer_type  "null"
 }

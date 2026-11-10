@@ -27,6 +27,8 @@ LINE_IN_URI = (
 )
 
 AVT_NS = "urn:schemas-upnp-org:service:AVTransport:1"
+RC_NS = "urn:schemas-upnp-org:service:RenderingControl:1"
+RENDERING_PATH = "/RenderingControl/ctrl"
 
 
 class FakeRaumfeld:
@@ -59,6 +61,8 @@ class FakeRaumfeld:
         self.on_get_zones = None  # called at every getZones, e.g. to model a slow answer
         self.fail_paths = set()  # substrings of paths that answer 500
         self.fail_actions = set()  # SOAP actions that answer 500 (a UPnP fault)
+        self.volume = 30  # the zone renderer's RenderingControl volume, 0-100
+        self.rendering_control = True  # False: the description lists no RenderingControl
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.description_udn = None  # the UDN the description names, if not the zone's
         self.room_listed = True  # False: a host that doesn't know our room (a wrong host)
@@ -83,7 +87,17 @@ class FakeRaumfeld:
                 if m == "GET" and p.startswith(HOST_PREFIX)]
 
     def soap_actions(self):
-        return [a for m, p, a, b in self.requests if a]
+        """AVTransport requests; RenderingControl ones are volume_actions()."""
+        return [a for m, p, a, b in self.requests if a and p != RENDERING_PATH]
+
+    def volume_actions(self):
+        """RenderingControl requests, e.g. "GetVolume", "SetVolume 25"."""
+        out = []
+        for m, p, a, b in self.requests:
+            if a and p == RENDERING_PATH:
+                desired = ET.fromstring(b).find(".//DesiredVolume")
+                out.append(a if desired is None else "%s %s" % (a, desired.text))
+        return out
 
     def soap_body(self, action):
         for m, p, a, b in self.requests:
@@ -112,16 +126,16 @@ class FakeRaumfeld:
                 "</zoneConfig>" % (other, zone, unassigned))
 
     def device_xml(self):
+        rendering = ("<service><serviceType>%s</serviceType><controlURL>%s</controlURL>"
+                     "</service>" % (RC_NS, RENDERING_PATH)) if self.rendering_control else ""
         return (
             "<?xml version='1.0'?><root xmlns='urn:schemas-upnp-org:device-1-0'><device>"
             "<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>"
-            "<UDN>%s</UDN><serviceList>"
-            "<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1"
-            "</serviceType><controlURL>/RenderingControl/ctrl</controlURL></service>"
+            "<UDN>%s</UDN><serviceList>%s"
             "<service><serviceType>%s</serviceType>"
             "<controlURL>%s</controlURL></service>"
             "</serviceList></device></root>"
-            % (self.description_udn or self.zone_udn, AVT_NS, self.control_url)
+            % (self.description_udn or self.zone_udn, rendering, AVT_NS, self.control_url)
         )
 
     def _api(self, name, query):
@@ -165,6 +179,23 @@ class FakeRaumfeld:
             self.zone_udn = self.zone_after_wake
         if self.rejoin_after_polls:
             self._rejoining, self.zone_udn = (self.rejoin_after_polls, self.zone_udn), None
+
+    def _rendering(self, action, body):
+        root = ET.fromstring(body)
+        args = {el.tag: (el.text or "") for el in root.iter() if "}" not in el.tag}
+        assert args.get("InstanceID") == "0" and args.get("Channel") == "Master", args
+        out = ""
+        if action == "GetVolume":
+            out = "<CurrentVolume>%s</CurrentVolume>" % self.volume
+        elif action == "SetVolume":
+            self.volume = int(args["DesiredVolume"])
+        else:
+            raise AssertionError("unknown RenderingControl action " + action)
+        return (
+            "<?xml version='1.0'?><s:Envelope xmlns:s='http://schemas.xmlsoap.org/soap/envelope/'>"
+            "<s:Body><u:%sResponse xmlns:u='%s'>%s</u:%sResponse></s:Body></s:Envelope>"
+            % (action, RC_NS, out, action)
+        )
 
     def _soap(self, action, body):
         root = ET.fromstring(body)
@@ -243,6 +274,10 @@ class FakeRaumfeld:
                     if (any(f in self.path for f in fake.fail_paths)
                             or fake.requests[-1][2] in fake.fail_actions):
                         return self._send(500, "boom")
+                    if self.path == RENDERING_PATH:
+                        assert soap_action == '"%s#%s"' % (RC_NS, fake.requests[-1][2]), soap_action
+                        return self._send(200, fake._rendering(fake.requests[-1][2], body),
+                                          [("Content-Type", 'text/xml; charset="utf-8"')])
                     if self.path != urlsplit(urljoin("/zone.xml", fake.control_url)).path:
                         return self._send(404, "no such control URL")  # the renderer moved
                     assert soap_action == '"%s#%s"' % (AVT_NS, fake.requests[-1][2]), soap_action
@@ -317,7 +352,8 @@ class FakeSsdpResponder:
 class FakeMpd:
     """A scripted MPD server. Each accepted connection consumes one script:
     a list of player states, each a state ("play"), a (state, songid) pair (at 0:00) or a
-    (state, songid, elapsed) triple; the first
+    (state, songid, elapsed) triple, or {"volume": N} (a volume change, `changed: mixer`); the
+    first (a state)
     answers the initial `status`, each following one is announced via `changed: player`
     to the next `idle player`.
     When a script is exhausted the server holds `idle` open until `noidle`
@@ -338,6 +374,7 @@ class FakeMpd:
         # first `pause 0` MPD is paused at that song (0:00), seen at once ("now") or as the
         # next player change after the one of our pause 0 ("next").
         self.handover_on_resume = None
+        self.volume = 100  # MPD's (null) mixer volume
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -379,6 +416,7 @@ class FakeMpd:
             state, songid, elapsed = _player(states.pop(0))
             idling = False
             changed_by_client = False
+            mixer_by_client = False
             while True:
                 conn.settimeout(None if idling else self.connection_timeout)
                 try:
@@ -392,7 +430,8 @@ class FakeMpd:
                 if cmd == "status":
                     song = ("" if songid is None else
                             "song: 0\nsongid: %s\nelapsed: %.3f\n" % (songid, elapsed))
-                    f.write(("volume: -1\nrepeat: 0\nstate: %s\n%sOK\n" % (state, song)).encode())
+                    f.write(("volume: %d\nrepeat: 0\nstate: %s\n%sOK\n"
+                             % (self.volume, state, song)).encode())
                 elif cmd == "pause 1" and self.drop_on_first_pause:
                     self.drop_on_first_pause = False
                     return
@@ -407,16 +446,25 @@ class FakeMpd:
                         else:
                             states.insert(0, ("pause", handover, 0.0))
                     f.write(b"OK\n")
+                elif cmd.startswith("setvol "):
+                    self.volume, mixer_by_client = int(cmd.split()[1]), True
+                    f.write(b"OK\n")
                 elif cmd.startswith("sendmessage ") and self.message_subscribers:
                     if self.stop_on_message:
                         state, changed_by_client = "stop", True
                     f.write(b"OK\n")
                 elif cmd.startswith("sendmessage "):
                     f.write(b"ACK [50@0] {sendmessage} nobody is subscribed to this channel\n")
-                elif cmd == "idle player":
-                    if changed_by_client:
+                elif cmd in ("idle player", "idle player mixer"):
+                    mixer = mixer_by_client and cmd.endswith("mixer")
+                    if changed_by_client or mixer:
+                        f.write((("changed: player\n" if changed_by_client else "")
+                                 + ("changed: mixer\n" if mixer else "") + "OK\n").encode())
                         changed_by_client = False
-                        f.write(b"changed: player\nOK\n")
+                        mixer_by_client = mixer_by_client and not mixer
+                    elif states and isinstance(states[0], dict):
+                        self.volume = states.pop(0)["volume"]  # the phone's setvol
+                        f.write(b"changed: mixer\nOK\n")
                     elif states:
                         state, songid, elapsed = _player(states.pop(0))
                         f.write(b"changed: player\nOK\n")

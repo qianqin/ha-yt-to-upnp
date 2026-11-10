@@ -226,10 +226,28 @@ Raumfeld room play the receiver's MPD stream automatically.
   setting.
 - Apart from these restarts it never stops the zone, and it never puts the room
   into standby itself; the Raumfeld's own auto power-off does that.
-- It never changes the Raumfeld's volume and sends no RenderingControl requests
-  at all. Volume from the phone is MPD's software volume: the httpd output needs
-  `mixer_type "software"` (as in [`mpd.conf.example`](mpd.conf.example)),
-  otherwise MPD answers the phone's volume change with `ACK ... {setvol} No mixer`.
+- **Volume: the phone's slider is the speaker's own volume**, scaled so that
+  phone 100 % is `MAX_VOLUME` (default 50; the speaker's real maximum would be
+  far too loud). MPD's volume is just a number: the httpd output needs
+  `mixer_type "null"` (as in [`mpd.conf.example`](mpd.conf.example); without a
+  mixer MPD answers the phone's volume change with `ACK ... {setvol} No mixer`,
+  and `"software"` would scale the samples), and the adapter waits for
+  `idle player mixer`. While it owns the zone and MPD plays or is paused, a
+  change of MPD's volume is sent at once as RenderingControl `SetVolume`
+  (Master) to the zone renderer: `round(v * MAX_VOLUME / 100)`, half up, never
+  above `MAX_VOLUME`. The other way, the speaker's volume (`GetVolume`) is given
+  to MPD as `min(100, round(speaker * 100 / MAX_VOLUME))`: at each takeover of a
+  zone the adapter did not own (the phone's volume is never pushed to the
+  speaker then, so the loudness does not jump; a speaker louder than
+  `MAX_VOLUME` shows 100 % and is left alone until the slider moves) and at each
+  look at the room (`SPEAKER_POLL_SECONDS`), where a change made on the speaker
+  itself is noticed. MPD's report of the adapter's own `setvol` is not sent back
+  (no feedback loop), and the round trip maps back onto the same speaker volume.
+  The receiver tells the phone (`onVolumeChanged`) when MPD's volume changes
+  other than by the phone. No volume requests without a cast, on a zone taken
+  away or yielded, with MPD stopped, or from the start gate's checks, restarts
+  and re-takeovers. A failing volume request is logged and changes nothing
+  else; a renderer description without RenderingControl only disables volume.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that
   answered SSDP or is `RAUMFELD_HOST` (redirects included), caps replies at 256 KiB and each request
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
@@ -273,6 +291,7 @@ the stream (the phone shows it paused).
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
 | `START_GATE_SECONDS` | `15` | How long (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. A takeover in the gate always gets 5 s to start playing, so the hold can run past this value, but never past 60 s: holding the song any longer only leaves the phone standing still |
+| `MAX_VOLUME` | `50` | The speaker volume (1-100) at phone 100 %; the phone's volume is scaled linearly to 0..`MAX_VOLUME`, never above it |
 | `STUCK_SECONDS` | `15` | How long (seconds, 1-300) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
@@ -282,7 +301,7 @@ naming the variable. `IDLE_MINUTES` is no longer used; if it is set, the
 adapter logs a warning and ignores it.
 
 See [`mpd.conf.example`](mpd.conf.example) for a matching MPD setup (httpd
-output on port 8000, MP3 or FLAC, software mixer for the phone's volume).
+output on port 8000, MP3 or FLAC, null mixer for the phone's volume).
 
 ## Run
 

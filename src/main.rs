@@ -353,6 +353,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut playlist = PlaylistState::default();
     let mut play_started = false;
     let mut has_remote = false;
+    // The volume the phone was last told (or set itself): a change of MPD's
+    // volume from elsewhere (the speaker adapter) is reported, the phone's own
+    // setVolume not echoed.
+    let mut reported_volume: Option<u32> = None;
     // localhost like the /stream URLs, so the DIAL server's loopback check passes.
     let silence_url = format!("http://localhost:{dial_port}{}", dial::SILENCE_PATH);
     let mut position_timer = tokio::time::interval(std::time::Duration::from_secs(3));
@@ -383,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         has_remote = false;
                         // Fall through to handle_command for stop/cleanup
                     }
+                    lounge::PlayerCommand::SetVolume { volume } => reported_volume = Some(*volume),
                     _ => {}
                 }
 
@@ -419,6 +424,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     event = event.merge(more);
                 }
                 let plan = idle_plan(event, play_started, playlist.preroll.is_active());
+
+                if event.mixer {
+                    match mpd_client.status().await {
+                        Ok(status) => {
+                            if let Some(volume) = volume_to_report(has_remote, reported_volume, status.volume) {
+                                tracing::info!("[player] volume {} set on MPD (speaker adapter)", volume);
+                                reported_volume = Some(volume);
+                                send_volume(&state_tx, volume).await.ok();
+                            }
+                        }
+                        Err(e) => tracing::warn!("[player] mpd.status() after a volume change FAILED: {}", e),
+                    }
+                }
 
                 if plan.release {
                     match release_action(has_remote, &playlist) {
@@ -853,6 +871,13 @@ fn stop_action(stream_failure: Option<String>, playlist: &PlaylistState) -> Stop
         }
         None => StopAction::Finished,
     }
+}
+
+/// The volume to tell the phone after MPD's volume changed: a change from
+/// elsewhere (the speaker adapter shows the speaker's own volume), not the
+/// phone's own setVolume coming back, and only to a connected phone.
+fn volume_to_report(has_remote: bool, reported: Option<u32>, volume: u32) -> Option<u32> {
+    (has_remote && reported != Some(volume)).then_some(volume)
 }
 
 /// What the player loop does with one (merged) idle wake-up.
@@ -1291,6 +1316,23 @@ async fn send_volume(
 mod stop_tests {
     use super::*;
 
+    #[test]
+    fn a_volume_set_by_the_speaker_adapter_is_reported_to_the_phone() {
+        // The adapter gives MPD the speaker's volume (cast start, buttons on the speaker).
+        assert_eq!(volume_to_report(true, Some(50), 40), Some(40));
+        assert_eq!(volume_to_report(true, None, 40), Some(40));
+    }
+
+    #[test]
+    fn the_phones_own_volume_is_not_echoed() {
+        assert_eq!(volume_to_report(true, Some(40), 40), None);
+    }
+
+    #[test]
+    fn no_volume_is_reported_without_a_phone() {
+        assert_eq!(volume_to_report(false, Some(50), 40), None);
+    }
+
     fn playlist(len: usize, index: usize) -> PlaylistState {
         PlaylistState {
             video_ids: (0..len).map(|i| format!("vid{i}")).collect(),
@@ -1302,20 +1344,20 @@ mod stop_tests {
 
     #[test]
     fn release_wins_over_song_end_in_the_same_wake_up() {
-        let both = mpd::IdleEvent { player: true, release: true };
+        let both = mpd::IdleEvent { player: true, release: true, mixer: false };
         assert_eq!(idle_plan(both, true, false), IdlePlan { release: true, check_song_end: false });
     }
 
     #[test]
     fn player_change_checks_song_end_only_while_playing() {
-        let player = mpd::IdleEvent { player: true, release: false };
+        let player = mpd::IdleEvent { player: true, release: false, mixer: false };
         assert_eq!(idle_plan(player, true, false), IdlePlan { release: false, check_song_end: true });
         assert_eq!(idle_plan(player, false, false), IdlePlan { release: false, check_song_end: false });
     }
 
     #[test]
     fn the_pre_roll_silence_never_ends_a_song() {
-        let player = mpd::IdleEvent { player: true, release: false };
+        let player = mpd::IdleEvent { player: true, release: false, mixer: false };
         // Even if a stray resume from the phone set play_started.
         assert!(!idle_plan(player, true, true).check_song_end);
         assert!(!idle_plan(player, false, true).check_song_end);
@@ -1356,7 +1398,7 @@ mod stop_tests {
         assert!(pl.video_ids.is_empty());
         assert_eq!(pl.current_index, 0);
         assert!(pl.list_id.is_empty());
-        assert!(!idle_plan(mpd::IdleEvent { player: true, release: false }, play_started, false).check_song_end);
+        assert!(!idle_plan(mpd::IdleEvent { player: true, release: false, mixer: false }, play_started, false).check_song_end);
         // Fresh state for the next cast: NowPlaying will be sent again.
         assert_eq!(pl.last_state, messages::PlayerState::Idle);
 
@@ -1690,7 +1732,7 @@ mod preroll_wiring_tests {
 
         assert!(!play_started);
         assert!(!playlist.preroll.is_active());
-        let mpd_stopped = mpd::IdleEvent { player: true, release: false };
+        let mpd_stopped = mpd::IdleEvent { player: true, release: false, mixer: false };
         assert!(!idle_plan(mpd_stopped, play_started, playlist.preroll.is_active()).check_song_end);
 
         // A further launch within the cooldown gets no silence.

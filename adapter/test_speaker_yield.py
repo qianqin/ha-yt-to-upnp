@@ -9,8 +9,8 @@ import time
 import unittest
 
 import raumfeld_adapter as ra
-from fakes import (LINE_IN_URI, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN, FakeDiscovery,
-                   FakeMpd, FakeRaumfeld, run_bounded)
+from fakes import (LINE_IN_URI, RENDERING_PATH, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN,
+                   FakeDiscovery, FakeMpd, FakeRaumfeld, run_bounded)
 from test_logic import GATE_LOOKS, FakeClock
 
 POLL_S = 5
@@ -27,14 +27,19 @@ def make_controller(rf, discover):
                          sleep=lambda s: None)
 
 
-def assert_speaker_left_alone(test, rf, restarts=0):
-    """In every scenario: no volume, and the adapter never stops or powers down the room
-    itself (the Raumfeld's own auto power-off does that); a Stop only as part of the
+def assert_speaker_left_alone(test, rf, restarts=0, max_volume=ra.DEFAULT_MAX_VOLUME):
+    """In every scenario: the speaker's volume only through RenderingControl GetVolume and
+    SetVolume, never set above max_volume; and the adapter never stops or powers down the
+    room itself (the Raumfeld's own auto power-off does that); a Stop only as part of the
     expected number of renderer restarts (Stop, Play)."""
     for method, path, action, body in rf.requests:
-        test.assertNotIn("RenderingControl", path)
-        test.assertNotIn("Volume", path + (action or "") + body)
+        if path != RENDERING_PATH:
+            test.assertNotIn("Volume", path + (action or "") + body)
         test.assertNotIn("Standby", path.replace("leaveStandby", ""))
+    for action in rf.volume_actions():
+        test.assertRegex(action, r"^(GetVolume|SetVolume \d+)$")
+        if action.startswith("SetVolume"):
+            test.assertLessEqual(int(action.split()[1]), max_volume)
     test.assertEqual(rf.soap_actions().count("Stop"), restarts)
 
 
@@ -377,10 +382,7 @@ class StuckRendererScenarioTest(unittest.TestCase):
         self.poll()
         self.assertEqual(self.follower.take_mpd_requests(), [])
         self.assertFalse(self.follower.yielded)
-        for method, path, action, body in self.rf.requests:
-            self.assertNotIn("RenderingControl", path)
-            self.assertNotIn("Volume", path + (action or "") + body)
-            self.assertNotIn("Standby", path)
+        self.assertEqual(set(self.rf.volume_actions()), {"GetVolume"})  # polls; no SetVolume
 
 
 class StartGateScenarioTest(unittest.TestCase):
@@ -716,8 +718,9 @@ class SpeakerYieldRunTest(unittest.TestCase):
             self.run_until(mpd, self.rf, self.follower, self.standby_once_playing,
                            lambda: self.follower.mpd_state == "pause")
         self.assertEqual(self.follower.mpd_state, "pause")
-        cmds = [c for c in mpd.commands if c not in ("status", "idle player", "noidle")]
-        self.assertEqual(cmds, ["pause 1", "sendmessage ytcast release"])
+        cmds = [c for c in mpd.commands if c not in ("status", "idle player mixer", "noidle")]
+        # setvol: the takeover shows the speaker's volume (30 of 50) on the phone.
+        self.assertEqual(cmds, ["setvol 60", "pause 1", "sendmessage ytcast release"])
         self.assertEqual(self.rf.power, "MANUAL_STANDBY")
 
     def test_release_without_subscriber_is_logged_and_not_fatal(self):
@@ -752,16 +755,17 @@ class SpeakerYieldRunTest(unittest.TestCase):
                            and self.follower.mpd_state == "pause")
         self.assertEqual(mpd.connections, 2)
         self.assertEqual(mpd.commands.count("sendmessage ytcast release"), 1)
-        cmds = [c for c in mpd.commands if c not in ("status", "idle player", "noidle")]
-        self.assertEqual(cmds, ["pause 1", "pause 1", "sendmessage ytcast release"])
+        cmds = [c for c in mpd.commands if c not in ("status", "idle player mixer", "noidle")]
+        self.assertEqual(cmds, ["setvol 60", "pause 1", "pause 1", "sendmessage ytcast release"])
 
     def test_track_changes_send_nothing_to_mpd(self):
         mpd = FakeMpd([["play", "stop", "play", "play"]])
         self.addCleanup(mpd.close)
-        self.run_until(mpd, self.rf, self.follower, lambda: None,
-                       lambda: mpd.commands.count("status") >= 4)
-        cmds = [c for c in mpd.commands if c not in ("status", "idle player", "noidle")]
-        self.assertEqual(cmds, [])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.run_until(mpd, self.rf, self.follower, lambda: None,
+                           lambda: mpd.commands.count("status") >= 5)
+        cmds = [c for c in mpd.commands if c not in ("status", "idle player mixer", "noidle")]
+        self.assertEqual(cmds, ["setvol 60"])  # the first takeover's volume, nothing more
 
 
 class PauseFollowScenarioTest(unittest.TestCase):
@@ -877,6 +881,73 @@ class PauseFollowScenarioTest(unittest.TestCase):
         self.rf.fail_actions.clear()
         self.assertIn("SetAVTransportURI", self.rf.soap_actions())
         self.assertEqual(self.requests(), [ra.RESUME_PLAYER])  # the takeover failed too
+
+
+class VolumeScenarioTest(unittest.TestCase):
+    """Scenario: the phone's volume slider moves the speaker's own volume, scaled so that
+    100 % is max_volume; the speaker's volume shows on the phone at a cast start and after
+    a change on the speaker itself."""
+
+    MAX = 50
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.clock = FakeClock()
+        self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
+                                    poll_seconds=POLL_S, clock=self.clock, start_gate_seconds=15,
+                                    max_volume=self.MAX)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf, max_volume=self.MAX)
+
+    def requests(self):
+        return self.follower.take_mpd_requests()
+
+    def poll(self):
+        self.clock.now += POLL_S
+        self.follower.tick()
+
+    def test_cast_start_shows_the_speakers_volume_and_the_slider_moves_it(self):
+        self.rf.volume = 20
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+            self.requests()
+            self.follower.on_mpd_state("pause", "1")
+        self.assertEqual(self.follower.take_mpd_volume(), 40)
+        self.follower.on_mpd_volume(40)  # MPD reports our setvol: no echo
+        self.assertEqual(self.rf.volume_actions(), ["GetVolume"])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.clock.now += ra.GATE_POLL_S
+            self.follower.tick()
+        self.follower.on_mpd_state("play", "1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_volume(70)  # the phone's slider
+        self.assertEqual(self.rf.volume, 35)
+        self.follower.on_mpd_volume(100)
+        self.assertEqual(self.rf.volume, self.MAX)
+        self.rf.requests.clear()
+        self.rf.volume = 10  # the Raumfeld app
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.follower.take_mpd_volume(), 20)
+        self.follower.on_mpd_volume(20)
+        self.assertEqual(self.rf.volume_actions(), ["GetVolume"])  # no SetVolume back
+
+    def test_a_failing_volume_call_is_logged_and_the_cast_goes_on(self):
+        self.rf.fail_actions.update({"GetVolume", "SetVolume"})
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.follower.on_mpd_state("play", "1")
+            self.requests()
+            self.follower.on_mpd_state("pause", "1")
+            self.clock.now += ra.GATE_POLL_S
+            self.follower.tick()
+        self.assertTrue(any("WARNING" in m for m in logs.output), logs.output)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.follower.on_mpd_volume(70)
+        self.assertTrue(self.follower.owned)
 
 
 if __name__ == "__main__":

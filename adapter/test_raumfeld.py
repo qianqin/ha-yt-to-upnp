@@ -1105,5 +1105,66 @@ class RendererPauseTest(unittest.TestCase):
         self.assertEqual(self.rf.requests, [])
 
 
+class RendererVolumeTest(unittest.TestCase):
+    """Scenario: the speaker's volume is the zone renderer's RenderingControl volume (Master
+    channel) on the zone of the last look."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def checked(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.assertEqual(self.ctl.check(), ra.OURS)
+        self.rf.requests.clear()
+
+    def test_get_and_set_volume_on_the_checked_zone(self):
+        self.checked()
+        self.rf.volume = 33
+        self.assertEqual(self.ctl.get_volume(), 33)
+        self.ctl.set_volume(25)
+        self.assertEqual(self.rf.volume, 25)
+        self.assertEqual(self.rf.volume_actions(), ["GetVolume", "SetVolume 25"])
+        self.assertEqual(self.rf.soap_actions(), [])  # nothing on AVTransport
+        self.assertEqual(self.rf.api_calls(), [])
+
+    def test_a_volume_out_of_range_is_refused_before_it_is_sent(self):
+        self.checked()
+        for volume in (-1, 101, 2.5, True):
+            with self.subTest(volume=volume), self.assertRaises(ValueError):
+                self.ctl.set_volume(volume)
+        self.assertEqual(self.rf.requests, [])
+
+    def test_a_device_volume_that_is_no_volume_is_an_error(self):
+        self.checked()
+        for reported in ("", "loud", "101", "-3"):
+            with self.subTest(reported=reported):
+                self.rf.volume = reported
+                with self.assertRaises(ra.RaumfeldError):
+                    self.ctl.get_volume()
+
+    def test_volume_without_a_checked_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.get_volume()
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.set_volume(10)
+        self.assertEqual(self.rf.requests, [])
+
+    def test_a_renderer_without_rendering_control_has_no_volume_but_plays(self):
+        self.rf.rendering_control = False
+        self.checked()
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.get_volume()
+        self.assertEqual(self.rf.requests, [])
+
+
 if __name__ == "__main__":
     unittest.main()
