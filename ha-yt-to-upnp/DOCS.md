@@ -6,7 +6,7 @@ app bundles four processes:
 | Process | What it does | Listens on |
 | --- | --- | --- |
 | Receiver (`ytcast-lite`) | Cast target for YouTube Music (DIAL + YouTube Lounge API), streams the audio into MPD; plays silence into MPD while a cast loads (`/silence`, answered on loopback only) | `8008/tcp` (DIAL, LAN), `1900/udp` (SSDP multicast, LAN) |
-| MPD | Plays the audio and re-serves it as an MP3 stream (192 kbit/s) | `8000/tcp` (stream, LAN), `127.0.0.1:6600` (control, loopback only) |
+| MPD | Plays the audio and re-serves it as a FLAC (48 kHz, 16-bit) or MP3 (320 kbit/s) stream, see [Stream format](#stream-format) | `8000/tcp` (stream, LAN), `127.0.0.1:6600` (control, loopback only) |
 | PoToken helper (bgutil-ytdlp-pot-provider on Deno) | Proof-of-origin tokens, so YouTube does not throttle streams after a minute | `127.0.0.1:4416` (loopback only) |
 | Raumfeld adapter | Wakes the room and makes it play MPD's stream when a cast starts; ends the cast when the speaker is switched off or to another source | none (SSDP/UPnP client) |
 
@@ -44,9 +44,10 @@ software volume.
 | `raumfeld_room_udn` | yes | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001`. |
 | `raumfeld_speaker_udn` | without `raumfeld_host` | UDN of the speaker device that hosts the Raumfeld API; the adapter finds it on the LAN by an SSDP search for this UDN. Not needed with `raumfeld_host` (checked if set). |
 | `raumfeld_host` | no | IPv4 address (recommended) or DNS name of the Raumfeld host, without port, `http://` or path, e.g. `192.0.2.20`. The adapter reaches its API directly instead of searching the LAN for it, so a cast starts sooner. It must be the address the host answers SSDP from (its address on the speakers' LAN): the room's zone renderer is still found by a multicast search, and only answers from this address count. A host that doesn't list `raumfeld_room_udn` is an error, never a wrong device. A DNS name is only as trustworthy as the LAN's name resolution (mDNS, the router's DNS); use the fixed IPv4 address where possible. Empty: found by `raumfeld_speaker_udn`. |
-| `stream_host` | no | Host name or IPv4 address the speaker fetches the stream from (`http://<stream_host>:8000/stream.mp3`). Empty: the host's LAN IPv4 address (source address of the default route), detected at each start. Set it if the host has several networks or the detected address is wrong. |
+| `stream_host` | no | Host name or IPv4 address the speaker fetches the stream from (`http://<stream_host>:8000/stream.flac`, or `stream.mp3` with `stream_format` `mp3`). Empty: the host's LAN IPv4 address (source address of the default route), detected at each start. Set it if the host has several networks or the detected address is wrong. |
 | `start_gate_seconds` | no | 0-60, default 15. How long the song is held at its start while the speaker wakes; `0` turns it off. |
 | `stuck_seconds` | no | 1-300, default 15. How long the speaker may hang while buffering before it is restarted. |
+| `stream_format` | yes | `flac` (default) or `mp3`: the format of the stream the speaker plays, see [Stream format](#stream-format). |
 | `log_level` | yes | `debug`, `info` (default), `warning` or `error`, for the receiver and the adapter. |
 
 The app checks the options again at each start. If one is missing or invalid,
@@ -54,6 +55,29 @@ it starts nothing and stops, with one error in the log naming the option and
 the rule it breaks (for example `option 'cast_name' is invalid: must match
 ...`, or `option 'raumfeld_speaker_udn' is required when raumfeld_host is not
 set`). Fix the option and start the app again.
+
+### Stream format
+
+MPD re-encodes the song (YouTube's Opus, or AAC if no Opus is offered; lossy
+already) into the stream the speaker fetches on port `8000`. Both formats are
+48 kHz, 16-bit stereo; 48 kHz is Opus's own rate, so Opus needs no resampling:
+
+| `stream_format` | Stream | URL | MIME type | On the LAN |
+| --- | --- | --- | --- | --- |
+| `flac` (default) | FLAC, lossless | `/stream.flac` | `audio/flac` | about 1-1.5 Mbit/s |
+| `mp3` | MP3 (LAME), 320 kbit/s CBR | `/stream.mp3` | `audio/mpeg` | 320 kbit/s |
+
+- **FLAC** adds no second lossy step: the speaker gets exactly what MPD
+  decoded. It is **16-bit, not 24-bit**, on purpose: a Raumfeld connects to a
+  24-bit FLAC stream but never starts playing it (it stays in
+  `TRANSITIONING`). 16 bits are more than YouTube's lossy sources carry.
+  Encoding takes MPD a small fraction of one CPU core (compression level 5).
+- **MP3** is the fallback: use it if the speaker does not play the FLAC
+  stream, or if the network to the speaker (Wi-Fi with a weak signal, for
+  example) drops out with FLAC's higher bandwidth.
+
+The change takes effect when the app is restarted. The adapter announces the
+stream to the speaker with the matching MIME type.
 
 ### Finding the Raumfeld host
 
@@ -76,7 +100,8 @@ Troubleshooting).
 
 1. Set the options and start the app. The log shows each process starting:
    `Starting MPD`, `Starting PoToken helper`, `Starting receiver as '<name>'`,
-   `Starting Raumfeld adapter (stream http://<host>:8000/stream.mp3)`.
+   `Starting Raumfeld adapter (stream http://<host>:8000/stream.flac)`
+   (`stream.mp3` with `stream_format` `mp3`).
 2. On the phone (same LAN), open YouTube Music, tap Cast and pick the name.
 3. While the cast loads, the receiver already plays silence into MPD, so the
    adapter wakes the room and connects it to the stream before the song is
@@ -92,8 +117,11 @@ which one and with which exit code.
   segment (multicast). Check the log for `SSDP listening`. Another device with
   the same name or another process on port `8008` also prevents it.
 - **Speaker stays silent:** check the adapter's log lines. The speaker must
-  reach `http://<stream_host>:8000/stream.mp3`; set `stream_host` if the
-  detected address is wrong.
+  reach `http://<stream_host>:8000/stream.flac` (or `stream.mp3`); set
+  `stream_host` if the detected address is wrong.
+- **Speaker connects but never plays** (the adapter's log shows it
+  `TRANSITIONING` and restarting it): set `stream_format` to `mp3` and
+  restart the app.
 - **`Raumfeld room not found yet` in the log:** the adapter found no Raumfeld
   host at start, the host doesn't list the room, or the host was found but
   the room's zone renderer wasn't; the cause is in brackets (for the zone

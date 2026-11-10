@@ -210,7 +210,12 @@ digest) together with the receiver's `rust-toolchain.toml`.
 
 ```sh
 scripts/smoke-ha-app.sh                      # tests dist/ha-yt-to-upnp
+scripts/smoke-ha-app.sh --quick              # seconds, before a live test
+scripts/smoke-ha-app.sh --clean-cache        # removes --quick's cached base image
 ```
+
+The full run is the one reviews and releases need; `--quick` (below) is a
+check before a live test.
 
 It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
@@ -224,10 +229,12 @@ internet through Docker's NAT, and the smoke test needs that: for the image
 build (Debian packages) and for the PoToken check below.
 
 Run 1, with test options (placeholder UDNs, cast name `Smoke Test`, no
-`raumfeld_host`), checks that
+`raumfeld_host`, `stream_format` `flac`), checks that
 MPD answers on `127.0.0.1:6600` (and not on the container's address); while
 MPD plays a generated second of silence (MPD opens its httpd output only when
-it plays) the stream answers on port 8000 as `audio/mpeg`; the receiver
+it plays) the stream answers on `http://<container>:8000/stream.flac` as
+`audio/flac`, starting with `fLaC` and a STREAMINFO block of 48000 Hz, 2
+channels, 16 bits, and the adapter gets that URL with `STREAM_MIME=audio/flac`; the receiver
 serves its DIAL device description on 8008 with the configured name, and its
 pre-roll silence on `http://localhost:8008/silence` (`200`, `audio/L16`, zero
 samples, fetched with `curl` in the container) but answers `403` to the same
@@ -244,18 +251,43 @@ environment (auto-detected `stream_host`, `ADAPTER_STATE_DIR=/data/adapter`,
 no `RAUMFELD_HOST`); the adapter logs that it finds no speaker
 (`DeviceNotFound`) and keeps running; no service restarts within 20 s. Run 2
 sets `raumfeld_host` to the unreachable `192.0.2.20` without
-`raumfeld_speaker_udn`, an explicit `stream_host` and no optional timings: the
-adapter gets `RAUMFELD_HOST` and no `RAUMFELD_SPEAKER_UDN`, logs `Raumfeld
-room not found yet` and keeps running with no service restart within 20 s.
+`raumfeld_speaker_udn`, an explicit `stream_host`, no optional timings and
+`stream_format` `mp3`: the stream is `/stream.mp3`, `audio/mpeg`, its first
+frame MPEG-1 Layer III at 320 kbit/s, 48 kHz, stereo; the adapter gets
+`RAUMFELD_HOST`, `STREAM_MIME=audio/mpeg` and no `RAUMFELD_SPEAKER_UDN`, logs
+`Raumfeld room not found yet` and keeps running with no service restart within
+20 s.
 Runs 3-5 check that an invalid `cast_name`, an invalid `raumfeld_host`
 (`192.0.2.20:47365`) and neither `raumfeld_speaker_udn` nor `raumfeld_host`
 each stop the app with one `FATAL` line naming the option, before any service
 starts. Run 6 puts a symbolic link (to `/tmp`) at `/data/adapter`: the app
-stops with one `FATAL` line naming it, and the link's target is left alone. The checks run in the
+stops with one `FATAL` line naming it, and the link's target is left alone.
+Run 7 checks that an invalid `stream_format` (`flac24`) stops the app with one
+`FATAL` line naming the option and its values. The checks run in the
 container through `docker exec --privileged` (reading other users' `/proc`
 entries needs `CAP_SYS_PTRACE`); the app itself runs unprivileged. Then it
 removes the containers, network, image, builder (with its cache) and the
 buildkit image if it pulled it.
+
+**`--quick`** builds and checks in seconds instead of minutes: one container
+with `stream_format` `flac` and `raumfeld_host` `192.0.2.20` (all four
+services up as their own users without `SUPERVISOR_TOKEN`, MPD answers, the
+FLAC stream as in run 1, the DIAL description has the cast name, the PoToken
+helper answers `/ping` (no token is minted), the adapter's environment) and,
+in parallel, run 7. It polls every 0.5 s and has no stability wait. It builds
+with the classic builder (`DOCKER_BUILDKIT=0`, which leaves no build cache)
+on a cached base image: the `Dockerfile` up to its
+`# smoke-quick-cache-boundary` line (base image, Debian packages, Deno and
+bgutil), tagged `ytcast-ha-smoke-base:<hash>` (hash of that part of the
+`Dockerfile` and the files it copies, labelled `io.github.ytcast.smoke-base`).
+The first quick run, or one after Deno or bgutil changed, builds it (about
+20 s plus the package download) and replaces an older one; later runs build
+only the steps after the boundary, from a build context without Deno and
+bgutil. The cached base image is the one thing a quick run leaves behind;
+`--clean-cache` removes it with its untagged parent layers. With the
+containerd image store, removing an image does not remove the untagged
+images the classic builder made for each step, so both modes remove them
+too (child first, stopping at a tagged image or one that is still used).
 
 Run `shellcheck` on the scripts if it is installed:
 
@@ -265,6 +297,35 @@ shellcheck -x -s bash ha-yt-to-upnp/rootfs/usr/lib/ytcast/common.sh \
   ha-yt-to-upnp/rootfs/etc/s6-overlay/scripts/*.sh \
   ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/run ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/finish
 ```
+
+### Live test on a Mac
+
+The app's image cannot be live-tested in Docker Desktop for Mac: even
+`--network host` is the network of Docker's Linux VM (`192.168.65.x`), not
+the Mac's LAN, so the phone's SSDP search and the adapter's search for the
+Raumfeld zone renderer never reach the container, and the receiver would
+announce an address nobody on the LAN can reach. `scripts/run-ha-app-local.sh`
+runs the same four processes natively instead, configured as the app is:
+
+```sh
+scripts/run-ha-app-local.sh --name "<cast name>" --room-udn <room UDN> \
+  --raumfeld-host <speaker IPv4> [--speaker-udn <UDN>] [--stream-format flac|mp3] \
+  [--stream-host <Mac's LAN IPv4>] [--log-level debug]
+scripts/run-ha-app-local.sh --stop
+```
+
+It writes the options to a temporary `options.json` (defaults as in
+`config.yaml`) and checks them with the app's `check_options.py`; renders
+MPD's configuration from the app's `mpd.conf.template` with the app's
+`stream_format` encoder (paths moved to its own directory); runs Homebrew's
+`mpd`, the PoToken helper from the assembled folder (`artefacts/bgutil` with
+its Deno cache, Homebrew's `deno`), the receiver built from this checkout for
+macOS (`cargo build --release --locked`; it warns if that is not the app's
+receiver commit) and the adapter from the assembled folder, each with only
+its own environment. They run in the background; state and logs are in
+`$TMPDIR/ytcast-local-<uid>`, and `--stop` stops them and removes that
+directory. Needs `mpd`, `deno` and `jq` (Homebrew) and `cargo` on `PATH`. The
+Mac's firewall must let the phone reach port 8008 and the speaker port 8000.
 
 ### Copy to the Home Assistant host
 

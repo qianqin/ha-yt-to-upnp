@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+Lossless stream to the speaker.
+
+- New option `stream_format` (`flac` or `mp3`, default `flac`). MPD's
+  stream on port 8000 is now FLAC 48 kHz 16-bit (compression level 5,
+  about 1-1.5 Mbit/s, `http://<stream_host>:8000/stream.flac`, announced as
+  `audio/flac`) or, with `mp3`, MP3 320 kbit/s 48 kHz (`/stream.mp3`,
+  `audio/mpeg`). Was MP3 192 kbit/s 44.1 kHz.
+- FLAC is 16-bit because a Raumfeld connects to a 24-bit FLAC stream but
+  never plays it (stays `TRANSITIONING`); 16-bit FLAC and MP3 320 kbit/s
+  both play (checked on a Raumfeld speaker).
+- MPD's configuration is written to `/run/ytcast/mpd.conf` at each start
+  from `/etc/ytcast/mpd.conf.template`; an invalid `stream_format` stops the
+  app with one error naming it, like any other option.
+- Dockerfile: the PoToken helper (Deno, bgutil) is copied before the
+  receiver, adapter and app files, so that a rebuild reuses its layers; the
+  image's contents and modes are unchanged.
+
 ## 0.2.0
 
 Faster cast start, optional fixed Raumfeld host.

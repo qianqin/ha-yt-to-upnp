@@ -24,7 +24,8 @@ audio_output {
     mixer_type  "software"
 }
 
-# Lossless variant (use instead of the block above; set STREAM_MIME=audio/flac):
+# Lossless variant (use instead of the block above; set STREAM_MIME=audio/flac).
+# Keep it 16-bit: a Raumfeld connects to a 24-bit FLAC stream but never plays it.
 # audio_output {
 #     type        "httpd"
 #     name        "Raumfeld stream (FLAC)"
