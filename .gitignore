@@ -14,3 +14,7 @@ pibug.md
 
 # Assembled Home Assistant app folder (scripts/build-ha-app.sh)
 /dist
+
+# The app folder never holds prebuilt programs: Home Assistant builds it from
+# the repository and downloads them (artefacts.lock).
+/ha-yt-to-upnp/artefacts/
