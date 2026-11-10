@@ -484,7 +484,10 @@ forward):
    then requires branch `master`, fetches origin's `master` and requires it
    to be an ancestor of `HEAD`, and requires that neither the tag on origin
    (`git ls-remote` exit 2; any other failure stops it) nor the release
-   (`release not found`; any other answer stops it) exists. Then it pushes
+   (`release not found`; any other answer stops it) exists. If origin's
+   `master` already contains `HEAD`, it warns (Home Assistant is already
+   offering the version) and still publishes, so that the asset appears as
+   soon as possible. Then it pushes
    the tag `v<version>` (`HEAD`, no `--force`), creates a **draft** release
    from it with the tarball and the CHANGELOG section, downloads the draft's
    asset and checks its sha256 (a mismatch stops it before publishing),

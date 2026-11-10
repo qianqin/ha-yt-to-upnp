@@ -287,6 +287,21 @@ class PublishReleaseTest(unittest.TestCase):
         result, calls = self.run_script(FAKE_ORIGIN_MASTER=side)
         self.assertRefused(result, calls, "origin/master is not an ancestor of HEAD")
 
+    def test_master_pushed_first_warns_and_still_publishes_in_order(self):
+        result, calls = self.run_script(FAKE_ORIGIN_MASTER="HEAD")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("origin/master already has this commit", result.stderr)
+        steps = [c.split(" --")[0] for c in self.remote_calls(calls)
+                 if c.startswith(("git push", "gh release", "curl "))]
+        self.assertEqual(steps, [
+            "gh release view %s" % TAG,
+            "git push origin %s:refs/tags/%s" % (self.built, TAG),
+            "gh release create %s %s" % (TAG, self.tarball),
+            "gh release download %s" % TAG,
+            "gh release edit %s" % TAG,
+            "curl -fsSL",
+        ])
+
     # -- the uploaded asset is checked twice ----------------------------------
 
     def test_tampered_draft_asset_is_never_published(self):
