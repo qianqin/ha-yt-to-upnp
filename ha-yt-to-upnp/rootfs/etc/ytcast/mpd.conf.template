@@ -1,7 +1,7 @@
 # MPD for the receiver and the Raumfeld adapter. Control stays on loopback;
 # only the httpd stream (port 8000) is reachable from the LAN.
 # ytcast-init writes it to /run/ytcast/mpd.conf at each start, with the encoder
-# for the stream_format option in place of @STREAM_ENCODER@.
+# lines for the stream_format option in place of the placeholder below.
 # Loopback is the HA host's loopback (host network); MPD has no password because
 # neither the receiver nor the adapter can send one (see DOCS.md).
 music_directory     "/data/mpd/music"
