@@ -7,9 +7,24 @@
 # should, get the options as environment and cannot read the Supervisor token;
 # that the receiver's /silence answers on loopback only; that MPD's stream on
 # port 8000 is FLAC 48 kHz 16-bit or MP3 320 kbit/s as stream_format says, under
-# a URL that names it; that the PoToken helper mints a token; that the adapter keeps running whether it looks for the
-# Raumfeld host by SSDP or is given an unreachable raumfeld_host; and that
-# invalid options stop the app with one clear error.
+# a URL that names it; that the PoToken helper mints a token; that the adapter
+# keeps running whether it looks for the Raumfeld host by SSDP or is given an
+# unreachable raumfeld_host; and that invalid options stop the app with one
+# clear error.
+#
+# --quick: a check in seconds before a live test, not a replacement for the full
+# run (which reviews need). One container with the default stream_format
+# (flac): the four services up as their users, MPD answers, port 8000 serves
+# FLAC while MPD plays, the DIAL description has the cast name, the PoToken
+# helper answers /ping (it mints no token), the adapter gets its options; plus,
+# in parallel, one invalid option that must stop the app. No stability wait.
+# The image is built with the classic builder (no BuildKit cache is left) on a
+# cached base image: the Dockerfile up to its "# smoke-quick-cache-boundary"
+# line (base image, packages, PoToken helper), tagged
+# ytcast-ha-smoke-base:<hash of that part and the files it copies>. A quick run
+# makes it when there is none for the hash (replacing an older one) and keeps
+# it; only the steps after the boundary run each time, on a build context
+# without the files the base image already holds. --clean-cache removes it.
 #
 # Nothing is announced on the LAN: the container runs on its own Docker bridge
 # network (no host networking, no published ports), so the receiver's SSDP and
@@ -20,26 +35,65 @@
 # through its restricted Deno permissions).
 #
 # Everything created here (buildx builder and its cache, image, containers,
-# network, temp dir, a pulled buildkit image) is removed on exit.
+# network, temp dir, a pulled buildkit or base image) is removed on exit; with
+# --quick, all of it but the cached base image.
 set -euo pipefail
 
-usage() { echo "usage: scripts/smoke-ha-app.sh [APP_DIR]  (default dist/ha-yt-to-upnp)" >&2; }
+usage() {
+  cat >&2 <<'USAGE'
+usage: scripts/smoke-ha-app.sh [--quick] [APP_DIR]  (default dist/ha-yt-to-upnp)
+       scripts/smoke-ha-app.sh --clean-cache        (remove --quick's base image)
+USAGE
+}
 
-case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+readonly BASE_REPO=ytcast-ha-smoke-base
+readonly BASE_LABEL=io.github.ytcast.smoke-base
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo; echo "==> $*"; }
+
+# Removes an image and then its untagged parents, child first: the classic
+# builder leaves one per step, and with the containerd image store removing an
+# image leaves them. Stops at a tagged parent (the cached base image, or a base
+# image that was there before) or one that another image still uses.
+rm_image_chain() {
+  local id="$1" parent
+  while :; do
+    parent="$(docker image inspect -f '{{.Parent}}' "$id" 2>/dev/null)" || return 0
+    docker image rm "$id" >/dev/null 2>&1 || return 0
+    [ -n "$parent" ] || return 0
+    [ "$(docker image inspect -f '{{len .RepoTags}}' "$parent" 2>/dev/null)" = 0 ] || return 0
+    id="$parent"
+  done
+}
+
+quick=0
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --clean-cache)
+    [ $# -eq 1 ] || { usage; exit 2; }
+    docker info >/dev/null 2>&1 || die "Docker daemon not running"
+    cached="$(docker image ls --filter "label=$BASE_LABEL" --format '{{.Repository}}:{{.Tag}}')"
+    for ref in $cached; do rm_image_chain "$ref"; echo "removed $ref"; done
+    [ -n "$cached" ] || echo "no cached base image"
+    exit 0 ;;
+  --quick) quick=1; shift ;;
+esac
 [ $# -le 1 ] || { usage; exit 2; }
 
 root="$(git rev-parse --show-toplevel)"
 dir="${1:-$root/dist/ha-yt-to-upnp}"
-die() { echo "error: $*" >&2; exit 1; }
-step() { echo; echo "==> $*"; }
 
 [ -f "$dir/artefacts/BUILD-INFO" ] || die "$dir is not an assembled app folder; run scripts/build-ha-app.sh first"
 docker info >/dev/null 2>&1 || die "Docker daemon not running"
 
 readonly PLATFORM=linux/amd64
 readonly BUILDKIT_IMAGE=moby/buildkit:buildx-stable-1
-readonly UP_TIMEOUT_S=180
 readonly STABLE_S=20
+if [ "$quick" = 1 ]; then
+  readonly UP_TIMEOUT_S=60 POLL_S=0.5
+else
+  readonly UP_TIMEOUT_S=180 POLL_S=3
+fi
 version="$(sed -n 's/^version: "\(.*\)"$/\1/p' "$dir/config.yaml")"
 [ -n "$version" ] || die "no version in $dir/config.yaml"
 
@@ -51,17 +105,18 @@ network=""
 builder=""
 image_built=0
 buildkit_pulled=0
-docker image inspect "$BUILDKIT_IMAGE" >/dev/null 2>&1 || buildkit_pulled=1
+from_pulled=""
 
 cleanup() {
   status=$?
   set +e
   for c in $containers; do docker rm -fv "$c" >/dev/null 2>&1; done
   [ -n "$network" ] && docker network rm "$network" >/dev/null 2>&1
-  [ "$image_built" = 1 ] && docker image rm "$image" >/dev/null 2>&1
+  [ "$image_built" = 1 ] && rm_image_chain "$image"
   # Removing the builder also removes its container, state volume and cache.
   [ -n "$builder" ] && docker buildx rm --force "$builder" >/dev/null 2>&1
   [ "$buildkit_pulled" = 1 ] && docker image rm "$BUILDKIT_IMAGE" >/dev/null 2>&1
+  [ -n "$from_pulled" ] && docker image rm "$from_pulled" >/dev/null 2>&1
   rm -rf "$tmp"
   echo "==> cleanup: removed containers [${containers# }], network [$network], image [$image], builder [$builder]"
   exit "$status"
@@ -72,14 +127,61 @@ trap 'exit 130' INT TERM
 step "option validator matches config.yaml's schema (host)"
 python3 -I "$root/scripts/ha_options_test.py"
 
-step "build $PLATFORM image from $dir (version $version)"
-# A builder of its own keeps the build cache out of the default builder.
-builder="$run_id"
-docker buildx create --name "$builder" --driver docker-container >/dev/null
-image_built=1
-docker buildx build --builder "$builder" --platform "$PLATFORM" --load \
-  --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
-  -t "$image" "$dir"
+# The full run builds as the Supervisor does: BuildKit, on a builder of its own
+# so that the build cache stays out of the default builder.
+build_full() {
+  docker image inspect "$BUILDKIT_IMAGE" >/dev/null 2>&1 || buildkit_pulled=1
+  builder="$run_id"
+  docker buildx create --name "$builder" --driver docker-container >/dev/null
+  image_built=1
+  docker buildx build --builder "$builder" --platform "$PLATFORM" --load \
+    --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
+    -t "$image" "$dir"
+}
+
+# The quick run splits the Dockerfile at its boundary line: the part above
+# becomes the cached base image, named by the hash of that part and of the
+# files it copies, and the rest is built on it. The classic builder keeps no
+# build cache: removing the image removes all it made.
+build_quick() {
+  local split sources base from old
+  split="$(grep -n '^# smoke-quick-cache-boundary$' "$dir/Dockerfile" | cut -d: -f1)"
+  [ -n "$split" ] || die "no '# smoke-quick-cache-boundary' line in $dir/Dockerfile"
+  head -n "$split" "$dir/Dockerfile" > "$tmp/Dockerfile.base"
+  # COPY's sources in the base part (the last word is the destination).
+  sources="$(awk '/^COPY /{for (i = 2; i < NF; i++) print $i}' "$tmp/Dockerfile.base")"
+  base="$BASE_REPO:$( { cat "$tmp/Dockerfile.base"
+    # shellcheck disable=SC2086  # one path per word
+    (cd "$dir" && find $sources -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
+  } | shasum -a 256 | cut -c1-16)"
+  if docker image inspect "$base" >/dev/null 2>&1; then
+    echo "cached base image $base"
+  else
+    from="$(sed -n 's/^FROM \([^ ]*\).*/\1/p' "$tmp/Dockerfile.base" | head -n 1)"
+    docker image inspect "$from" >/dev/null 2>&1 || from_pulled="$from"
+    old="$(docker image ls --filter "label=$BASE_LABEL" --format '{{.Repository}}:{{.Tag}}')"
+    echo "building base image $base (kept for later quick runs; --clean-cache removes it)"
+    DOCKER_BUILDKIT=0 docker build -q --platform "$PLATFORM" --label "$BASE_LABEL=1" \
+      -t "$base" -f "$tmp/Dockerfile.base" "$dir" >/dev/null
+    # The base image holds the layers; the pulled image's name is not needed.
+    if [ -n "$from_pulled" ]; then docker image rm "$from_pulled" >/dev/null; from_pulled=""; fi
+    for ref in $old; do rm_image_chain "$ref"; echo "removed older $ref"; done
+  fi
+  { echo "FROM $base"; tail -n "+$((split + 1))" "$dir/Dockerfile"; } > "$tmp/Dockerfile.quick"
+  # The classic builder sends the whole context: leave out what the base holds.
+  mkdir "$tmp/context"
+  (cd "$dir" && find . \( -type f -o -type l \) -print) \
+    | SKIP="$sources" awk 'BEGIN { n = split(ENVIRON["SKIP"], skip, "\n") }
+        { for (i = 1; i <= n; i++) if (index($0, "./" skip[i]) == 1) next; print }' \
+    | tar -cf - -C "$dir" -T - | tar -xpf - -C "$tmp/context"
+  image_built=1
+  DOCKER_BUILDKIT=0 docker build -q --platform "$PLATFORM" \
+    --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
+    -t "$image" -f "$tmp/Dockerfile.quick" "$tmp/context" >/dev/null
+}
+
+step "build $PLATFORM image from $dir (version $version$([ "$quick" = 1 ] && echo ", quick"))"
+if [ "$quick" = 1 ]; then build_quick; else build_full; fi
 docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' "$image"
 
 network="$run_id"
@@ -246,8 +348,10 @@ def check_stream(want):
         try:
             with urllib.request.urlopen(url, timeout=5) as r:
                 status, ctype = r.status, r.headers.get("Content-Type", "")
-                while len(head) < 8192:
-                    chunk = r.read(8192 - len(head))
+                # Only as much as the header needs: MPD sends in real time, and
+                # FLAC packs silence into a few bytes a frame.
+                while len(head) < 8192 and "error" in stream_params(head):
+                    chunk = r.read1(4096)
                     if not chunk:
                         break
                     head += chunk
@@ -275,14 +379,13 @@ for name, needle in services.items():
     check(user_of(p[1]) == users[name], "%s runs as %s, not root" % (name, users[name]))
     check("SUPERVISOR_TOKEN" not in p[2], "%s gets no SUPERVISOR_TOKEN" % name)
 
-if mode == "full":
+if mode in ("full", "quick"):
     try:
         with socket.create_connection(("127.0.0.1", 6600), timeout=3) as s:
             hello = s.recv(64).decode()
     except OSError as e:
         hello = str(e)
     check(hello.startswith("OK MPD"), "MPD answers on 127.0.0.1:6600 (%s)" % hello.strip())
-    check(not can_connect(ip, 6600), "MPD control is not reachable on %s:6600" % ip)
 
     try:
         desc = urllib.request.urlopen("http://%s:8008/ssdp/device-desc.xml" % ip, timeout=5).read().decode()
@@ -296,6 +399,9 @@ if mode == "full":
     except Exception as e:
         pong = repr(e)
     check('"server_uptime"' in pong, "PoToken helper answers on 127.0.0.1:4416 (%s)" % pong[:80])
+
+if mode == "full":
+    check(not can_connect(ip, 6600), "MPD control is not reachable on %s:6600" % ip)
     check(not can_connect(ip, 4416), "PoToken helper is not reachable on %s:4416" % ip)
 
     st = os.stat("/data/ytcast/ytcast-lite.json") if os.path.exists("/data/ytcast/ytcast-lite.json") else None
@@ -382,12 +488,54 @@ wait_for_checks() {
       echo "--- container log ($name)"; docker logs "$name" 2>&1 | tail -60
       die "checks did not pass within ${UP_TIMEOUT_S}s"
     fi
-    sleep 3
+    sleep "$POLL_S"
   done
   grep -v '^PIDS ' "$tmp/$name.out"
 }
 
 pids_of() { sed -n 's/^PIDS //p' "$tmp/$1.out"; }
+
+# Waits until the container has stopped; it must stop with an error, one FATAL
+# line with the message and no service started.
+expect_stopped() {
+  local name="$1" message="$2" deadline=$((SECONDS + 60)) logs code
+  until [ "$(docker inspect -f '{{.State.Status}}' "$name")" = exited ]; do
+    [ "$SECONDS" -lt "$deadline" ] || { docker logs "$name" 2>&1 | tail -40; die "the app did not stop within 60s"; }
+    sleep "$POLL_S"
+  done
+  logs="$(docker logs "$name" 2>&1)"
+  code="$(docker inspect -f '{{.State.ExitCode}}' "$name")"
+  echo "--- container log ($name)"
+  cut -c1-200 <<<"$logs"
+  [ "$code" != 0 ] || die "the app stopped with exit code 0"
+  echo "PASS the app stopped (exit code $code), no restart loop"
+  [ "$(grep -F "$message" <<<"$logs" | grep -c FATAL)" = 1 ] || die "no single FATAL line with: $message"
+  echo "PASS one FATAL line: $message"
+  if grep -E "Starting " <<<"$logs"; then die "a service started on invalid options"; fi
+  echo "PASS no service started"
+}
+
+if [ "$quick" = 1 ]; then
+  step "quick run: default options (flac), raumfeld_host given; an invalid stream_format in parallel"
+  started=$SECONDS
+  start_app "$run_id-quick" '{"cast_name": "Smoke Test",
+    "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+    "raumfeld_host": "192.0.2.20", "stream_format": "flac", "log_level": "info"}'
+  start_app "$run_id-badformat" '{"cast_name": "Smoke Test",
+    "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+    "raumfeld_host": "192.0.2.20", "stream_format": "flac24", "log_level": "info"}'
+  wait_for_checks "$run_id-quick" quick '{"cast_name": "Smoke Test",
+    "stream": {"path": "/stream.flac", "mime": "audio/flac",
+               "params": {"codec": "flac", "rate": 48000, "channels": 2, "bits": 16}},
+    "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "STREAM_MIME": "audio/flac",
+                    "STREAM_URL": "http://{ip}:8000/stream.flac",
+                    "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001"},
+    "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"]}'
+  echo "services up and checked $((SECONDS - started))s after the start"
+  expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of flac, mp3"
+  step "quick smoke test passed ($((SECONDS - started))s after the start; the full run is still needed for review)"
+  exit 0
+fi
 
 step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected, FLAC stream (default)"
 main="$run_id-main"
@@ -474,22 +622,9 @@ echo "PASS no service exit, configuration error or traceback in the log"
 # Starts the app with invalid options; it must stop (no restart loop) with one
 # FATAL line naming the option, before any service starts.
 expect_fatal() {
-  local name="$1" options="$2" message="$3" link="${4:-}" deadline=$((SECONDS + 60)) logs code
+  local name="$1" options="$2" message="$3" link="${4:-}"
   start_app "$name" "$options" "$link"
-  until [ "$(docker inspect -f '{{.State.Status}}' "$name")" = exited ]; do
-    [ "$SECONDS" -lt "$deadline" ] || { docker logs "$name" 2>&1 | tail -40; die "the app did not stop within 60s"; }
-    sleep 2
-  done
-  logs="$(docker logs "$name" 2>&1)"
-  code="$(docker inspect -f '{{.State.ExitCode}}' "$name")"
-  echo "--- container log ($name)"
-  cut -c1-200 <<<"$logs"
-  [ "$code" != 0 ] || die "the app stopped with exit code 0"
-  echo "PASS the app stopped (exit code $code), no restart loop"
-  [ "$(grep -F "$message" <<<"$logs" | grep -c FATAL)" = 1 ] || die "no single FATAL line with: $message"
-  echo "PASS one FATAL line: $message"
-  if grep -E "Starting " <<<"$logs"; then die "a service started on invalid options"; fi
-  echo "PASS no service started"
+  expect_stopped "$name" "$message"
 }
 
 step "run 3: an invalid cast_name stops the app with one clear error"
