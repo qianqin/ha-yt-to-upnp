@@ -27,6 +27,12 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# Home Assistant would build the app from tracked artefacts instead of the release.
+if [ -n "$(git ls-files ha-yt-to-upnp/artefacts)" ]; then
+  echo "error: ha-yt-to-upnp/artefacts is tracked; remove it from git" >&2
+  exit 1
+fi
+
 for tool in cargo protoc docker python3; do
   command -v "$tool" >/dev/null || { echo "error: '$tool' not found (see docs/DEVOPS.md, Prerequisites)" >&2; exit 1; }
 done

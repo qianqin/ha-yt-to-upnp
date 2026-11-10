@@ -7,8 +7,9 @@
 # dist/release/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz (reproducible, see
 # scripts/pack_artefacts.py) and writes ha-yt-to-upnp/artefacts.lock with the
 # version, the asset's GitHub release URL (owner and repository from the origin
-# remote) and its sha256, for Home Assistant's build from the repository. The build images are pinned by digest, Deno by checksum,
-# bgutil by commit and lock files; any mismatch aborts. Not pinned: protoc
+# remote) and its sha256, for Home Assistant's build from the repository.
+# The build images are pinned by digest, Deno by checksum, bgutil by commit and
+# lock files; any mismatch aborts. Not pinned: protoc
 # (Debian bookworm's protobuf-compiler, installed in the Rust container); its
 # version is recorded in BUILD-INFO.
 # Temporary directories, containers and volumes created here are always
