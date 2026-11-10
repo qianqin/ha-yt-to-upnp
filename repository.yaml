@@ -1,4 +1,4 @@
-# Home Assistant app repository. Add the url under Settings > Apps >
+# Home Assistant app repository. Add the url under Settings → Apps →
 # Repositories; Home Assistant finds the app in ha-yt-to-upnp/ and builds it
 # there (see ha-yt-to-upnp/DOCS.md).
 name: YouTube to UPnP

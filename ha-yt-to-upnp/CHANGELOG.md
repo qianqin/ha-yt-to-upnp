@@ -16,7 +16,7 @@ Premium audio, installed from the repository.
   stays at a fixed 48 kHz because MPD's httpd output closes its clients when
   the sample rate changes between songs.
 - Install from the repository: add the repository URL in Home Assistant
-  (Settings > Apps > Repositories), and Home Assistant builds the app itself
+  (Settings → Apps → Repositories), and Home Assistant builds the app itself
   (base image and MPD via apt, nothing compiled) and offers updates. The
   prebuilt programs (receiver, adapter, Deno, PoToken helper) come from the
   GitHub release `v0.4.0` as one tarball, downloaded over https and checked
