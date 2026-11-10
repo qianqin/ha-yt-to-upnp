@@ -687,14 +687,89 @@ fn replace_n_param(url: &str, decoded_n: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// YouTube Music Premium audio (774: Opus ~256k, 141: AAC 256k). A ctt
-/// /player response lists them when the casting account has Premium, but the
-/// SABR session (anonymous visitor + ctt) is not entitled to them: requesting
-/// one gets only RELOAD_PLAYER_RESPONSE back, never media.
+/// /player response lists them when the casting account has Premium. Before
+/// RELOAD_PLAYER_RESPONSE was answered, requesting one got only reload
+/// requests (UMP parts 46/47/35), never media, so they are skipped unless
+/// the opt-in `PremiumExperiment` asks for one.
 const PREMIUM_ONLY_AUDIO_ITAGS: [i32; 2] = [774, 141];
 
+/// Opt-in experiment: does SABR serve Premium audio once reloads are
+/// answered? Off by default; production format selection is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PremiumExperiment {
+    /// The premium itag to prefer (774 or 141); `None` = experiment off.
+    itag: Option<i32>,
+    /// Send no PoToken in SABR requests (yt-dlp: GVS PoToken not required
+    /// for Premium). Only with the experiment on.
+    no_pot: bool,
+}
+
+const PREMIUM_AUDIO_ENV: &str = "YTCAST_PREMIUM_AUDIO";
+const PREMIUM_NO_POT_ENV: &str = "YTCAST_PREMIUM_NO_POT";
+
+impl PremiumExperiment {
+    fn from_env() -> Self {
+        Self::parse(
+            std::env::var(PREMIUM_AUDIO_ENV).ok().as_deref(),
+            std::env::var(PREMIUM_NO_POT_ENV).ok().as_deref(),
+        )
+    }
+
+    fn parse(audio: Option<&str>, no_pot: Option<&str>) -> Self {
+        let itag = match audio.map(str::trim) {
+            None | Some("") | Some("off") => None,
+            Some(value) => match value.parse::<i32>() {
+                Ok(itag) if PREMIUM_ONLY_AUDIO_ITAGS.contains(&itag) => Some(itag),
+                _ => {
+                    tracing::warn!(
+                        "[sabr] ignoring {}={:?}: expected 774, 141 or off",
+                        PREMIUM_AUDIO_ENV, value,
+                    );
+                    None
+                }
+            },
+        };
+        Self { itag, no_pot: itag.is_some() && no_pot.map(str::trim) == Some("1") }
+    }
+}
+
+/// The PoToken for SABR requests, unless the experiment's no-PoToken variant
+/// is on.
+fn sabr_po_token(experiment: PremiumExperiment, po_token: Option<String>) -> Option<String> {
+    if experiment.no_pot {
+        None
+    } else {
+        po_token
+    }
+}
+
+/// The experiment's one-line result for the song, e.g.
+/// `premium experiment: itag 774 → media OK (reloads 1, sps [1], ...)`.
+/// Media is OK only if audio bytes of the premium itag itself arrived.
+fn premium_verdict(itag: i32, state: &SabrState) -> String {
+    let stats = &state.stats;
+    let media = if stats.audio_bytes_by_itag.get(&itag).is_some_and(|&n| n > 0) { "OK" } else { "NO" };
+    let fallback = match state.fell_back_from {
+        Some(_) => format!(", fell back to itag {}", state.audio_itag),
+        None => String::new(),
+    };
+    format!(
+        "premium experiment: itag {} → media {} (reloads {}, sps {:?}, media headers {:?}, audio bytes {:?}{})",
+        itag, media, stats.reloads, stats.protection_statuses,
+        stats.media_headers_by_itag, stats.audio_bytes_by_itag, fallback,
+    )
+}
+
 /// Choose the best audio format, preferring Opus/WebM at the highest bitrate.
-fn choose_audio_format(formats: &[AdaptiveFormat]) -> Result<&AdaptiveFormat, SabrError> {
+/// `premium` (experiment only) wins when the response lists it.
+fn choose_audio_format(
+    formats: &[AdaptiveFormat],
+    premium: Option<i32>,
+) -> Result<&AdaptiveFormat, SabrError> {
     let audio = formats.iter().filter(|f| f.mime_type.starts_with("audio/"));
+    if let Some(chosen) = premium.and_then(|itag| audio.clone().find(|f| f.itag == itag)) {
+        return Ok(chosen);
+    }
     if !formats.iter().any(|f| f.mime_type.starts_with("audio/")) {
         return Err("no suitable audio format found".into());
     }
@@ -1453,10 +1528,22 @@ pub async fn stream_audio(
     // - Attempt 1 (WEB_REMIX + ctt): no PoToken
     // - Attempt 2 (bgutil-pot): session-bound PoToken for SABR
     // - Attempt 3/fallback: no PoToken
-    let gvs_po_token = result.gvs_token.map(|g| g.po_token);
+    let experiment = PremiumExperiment::from_env();
+    let gvs_po_token = sabr_po_token(experiment, result.gvs_token.map(|g| g.po_token));
+    if let Some(itag) = experiment.itag {
+        tracing::info!(
+            "[sabr] premium experiment: want itag {}, PoToken {}; /player lists itags {:?}",
+            itag,
+            if experiment.no_pot { "omitted" } else if gvs_po_token.is_some() { "sent" } else { "unavailable" },
+            listed_itags(&player.formats),
+        );
+    }
 
     // 2. Pick the best audio format + a video format for the discard trick.
-    let audio_fmt = choose_audio_format(&player.formats)?.clone();
+    let audio_fmt = choose_audio_format(&player.formats, experiment.itag)?.clone();
+    if let Some(itag) = experiment.itag.filter(|&itag| itag != audio_fmt.itag) {
+        tracing::info!("[sabr] premium experiment: itag {} → media NO (not listed by /player)", itag);
+    }
     let video_fmt = choose_video_format(&player.formats)
         .ok_or("no video format found (needed for SABR discard trick)")?
         .clone();
@@ -1503,7 +1590,7 @@ pub async fn stream_audio(
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, gvs_po_token, &tx, &mut reloader,
+            ustreamer_config, client_config, gvs_po_token, &tx, &mut reloader, experiment,
         ).await;
 
         match result {
@@ -1531,10 +1618,13 @@ async fn sabr_loop(
     po_token: Option<String>,
     tx: &mpsc::Sender<Bytes>,
     reloader: &mut HttpReloader,
+    experiment: PremiumExperiment,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
+    state.verbose = experiment.itag.is_some();
+    state.premium_itag = experiment.itag.filter(|&itag| itag == audio_format.itag);
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
     // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
@@ -1555,7 +1645,11 @@ async fn sabr_loop(
         }
     }
 
-    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }, reloader).await
+    let result = drive_loop(&mut state, tx, &mut HttpCycle { http, tx }, reloader).await;
+    if let Some(itag) = state.premium_itag.or(state.fell_back_from) {
+        tracing::info!("[sabr] {}", premium_verdict(itag, &state));
+    }
+    result
 }
 
 /// One SABR request/response round trip, boxed so `drive_loop` stays `Send`.
@@ -1662,7 +1756,7 @@ async fn handle_reload(
 
     let player = reloader.fetch(None).await?;
     apply_reload(state, &player)?;
-    let regular = choose_audio_format(&player.formats)?;
+    let regular = choose_audio_format(&player.formats, None)?;
     tracing::info!(
         "[sabr] premium experiment: itag {} still asks for a reload after {} reloads, falling back to itag {}",
         premium, MAX_RELOADS_PER_SONG, regular.itag,
@@ -2151,20 +2245,105 @@ mod tests {
             audio(251, OPUS, 146_272),
             audio(250, OPUS, 73_493),
         ];
-        assert_eq!(choose_audio_format(&formats).map(|f| f.itag).unwrap(), 251);
+        assert_eq!(choose_audio_format(&formats, None).map(|f| f.itag).unwrap(), 251);
+    }
+
+    // -- premium audio experiment -------------------------------------------------
+
+    #[test]
+    fn premium_flag_is_off_unless_set_to_a_premium_itag() {
+        let off = PremiumExperiment::default();
+        assert_eq!(PremiumExperiment::parse(None, None), off);
+        assert_eq!(PremiumExperiment::parse(Some("off"), Some("1")), off);
+        assert_eq!(PremiumExperiment::parse(Some(""), None), off);
+        assert_eq!(PremiumExperiment::parse(Some("251"), None), off);
+        assert_eq!(PremiumExperiment::parse(Some("loud"), None), off);
+        assert_eq!(
+            PremiumExperiment::parse(Some("774"), None),
+            PremiumExperiment { itag: Some(774), no_pot: false }
+        );
+        assert_eq!(
+            PremiumExperiment::parse(Some(" 141 "), Some("1")),
+            PremiumExperiment { itag: Some(141), no_pot: true }
+        );
+        assert_eq!(
+            PremiumExperiment::parse(Some("774"), Some("0")),
+            PremiumExperiment { itag: Some(774), no_pot: false }
+        );
+    }
+
+    #[test]
+    fn unknown_premium_flag_value_is_logged_and_ignored() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        assert_eq!(PremiumExperiment::parse(Some("999"), None), PremiumExperiment::default());
+        assert!(logs.text().contains("YTCAST_PREMIUM_AUDIO"), "{}", logs.text());
+    }
+
+    #[test]
+    fn premium_itag_is_chosen_when_listed() {
+        let formats = [
+            audio(774, OPUS, 272_644),
+            audio(141, AAC, 262_000),
+            audio(251, OPUS, 146_272),
+        ];
+        assert_eq!(choose_audio_format(&formats, Some(774)).unwrap().itag, 774);
+        assert_eq!(choose_audio_format(&formats, Some(141)).unwrap().itag, 141);
+    }
+
+    #[test]
+    fn premium_itag_not_listed_gets_the_regular_choice() {
+        let formats = [audio(140, AAC, 134_111), audio(251, OPUS, 146_272)];
+        assert_eq!(choose_audio_format(&formats, Some(774)).unwrap().itag, 251);
+    }
+
+    #[test]
+    fn no_pot_variant_drops_the_potoken() {
+        let pot = || Some("pot".to_owned());
+        assert_eq!(sabr_po_token(PremiumExperiment::default(), pot()), pot());
+        assert_eq!(sabr_po_token(PremiumExperiment { itag: Some(774), no_pot: false }, pot()), pot());
+        assert_eq!(sabr_po_token(PremiumExperiment { itag: Some(774), no_pot: true }, pot()), None);
+    }
+
+    #[test]
+    fn premium_verdict_reports_media_for_the_premium_itag() {
+        let mut state = premium_state();
+        state.stats.reloads = 1;
+        state.stats.protection_statuses = vec![1];
+        state.stats.media_headers_by_itag.insert(774, 3);
+        state.stats.audio_bytes_by_itag.insert(774, 300);
+
+        assert_eq!(
+            premium_verdict(774, &state),
+            "premium experiment: itag 774 → media OK (reloads 1, sps [1], media headers {774: 3}, audio bytes {774: 300})"
+        );
+    }
+
+    #[test]
+    fn premium_verdict_after_fallback_says_no() {
+        let mut state = premium_state();
+        switch_audio(&mut state, &audio(251, OPUS, 146_272));
+        state.premium_itag = None;
+        state.fell_back_from = Some(774);
+        state.stats.reloads = 2;
+        state.stats.audio_bytes_by_itag.insert(251, 500);
+
+        assert_eq!(
+            premium_verdict(774, &state),
+            "premium experiment: itag 774 → media NO (reloads 2, sps [], media headers {}, audio bytes {251: 500}, fell back to itag 251)"
+        );
     }
 
     #[test]
     fn audio_selection_with_only_premium_formats_says_so() {
         let formats = [audio(774, OPUS, 272_644), audio(141, AAC, 262_000)];
-        let err = choose_audio_format(&formats).unwrap_err();
+        let err = choose_audio_format(&formats, None).unwrap_err();
         assert!(err.to_string().contains("Premium"), "{err}");
     }
 
     #[test]
     fn audio_selection_without_audio_formats_is_a_plain_error() {
         let formats = [audio(160, "video/mp4", 100_000)];
-        let err = choose_audio_format(&formats).unwrap_err();
+        let err = choose_audio_format(&formats, None).unwrap_err();
         assert_eq!(err.to_string(), "no suitable audio format found");
     }
 
