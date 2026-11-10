@@ -31,6 +31,18 @@ ytcast_stream_mime() {
     esac
 }
 
+# MPD's configuration: the template (text) with its one @STREAM_ENCODER@
+# replaced by the encoder settings. Called directly, not in $(...), so that
+# exit.nok ends the caller.
+ytcast_mpd_conf() {
+    local template="$1" encoder="$2" placeholder='@STREAM_ENCODER@' rest
+    # Occurrences, not lines: two on one line would also be wrong.
+    rest="${template//"${placeholder}"/}"
+    [ $(( (${#template} - ${#rest}) / ${#placeholder} )) = 1 ] \
+        || bashio::exit.nok "/etc/ytcast/mpd.conf.template must name @STREAM_ENCODER@ exactly once"
+    printf '%s\n' "${template/"${placeholder}"/${encoder}}"
+}
+
 # True if the option is set (not missing, null or empty).
 ytcast_has_option() {
     jq -e --arg k "$1" '.[$k] != null and .[$k] != ""' "${YTCAST_OPTIONS}" >/dev/null
