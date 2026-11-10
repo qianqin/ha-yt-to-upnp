@@ -119,6 +119,15 @@ class PackTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "points out of"):
                     pack_artefacts.pack(src, src + ".tar.gz", MTIME)
 
+    def test_an_absolute_link_is_refused_even_into_the_tree(self):
+        # On the build machine it resolves inside; unpacked elsewhere it points
+        # at that path on the other machine.
+        src = os.path.join(self.tmp, "abs", "artefacts")
+        make_tree(src, 1)
+        os.symlink(os.path.join(os.path.realpath(src), "deno"), os.path.join(src, "adapter", "deno"))
+        with self.assertRaisesRegex(ValueError, "points out of"):
+            pack_artefacts.pack(src, src + ".tar.gz", MTIME)
+
     def test_a_link_through_another_link_out_of_the_tree_is_refused(self):
         # "up" points to the tree's root (inside). "esc" -> "up/../x" stays
         # inside when read as text (node_modules/x), but once "up" is followed
