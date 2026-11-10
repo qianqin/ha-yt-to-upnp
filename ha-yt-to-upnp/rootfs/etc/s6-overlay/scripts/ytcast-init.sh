@@ -42,7 +42,10 @@ state_dir "${YTCAST_ADAPTER_STATE_DIR}" adapter
 stream_format="$(ytcast_option stream_format)"
 encoder="$(ytcast_stream_encoder "${stream_format}")"
 template="$(< /etc/ytcast/mpd.conf.template)"
-[ "$(grep -c '@STREAM_ENCODER@' <<<"${template}")" = 1 ] \
+placeholder='@STREAM_ENCODER@'
+# Occurrences, not lines: two on one line would also be wrong.
+rest="${template//"${placeholder}"/}"
+[ $(( (${#template} - ${#rest}) / ${#placeholder} )) = 1 ] \
     || bashio::exit.nok "/etc/ytcast/mpd.conf.template must name @STREAM_ENCODER@ exactly once"
 mkdir -p "$(dirname "${YTCAST_MPD_CONF}")"
 printf '%s\n' "${template/@STREAM_ENCODER@/${encoder}}" > "${YTCAST_MPD_CONF}"
