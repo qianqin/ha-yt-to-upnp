@@ -65,6 +65,29 @@ pub fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<
     decode_nsig_cached_at(player_js, n_value, player_hash, cache_path(player_hash))
 }
 
+/// Which base.js challenge the solver answers: the `n` throttling parameter
+/// or the `s` signature of a `signatureCipher` format URL. Both come from the
+/// same preprocessed player, so they share its cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Challenge {
+    N,
+    Sig,
+}
+
+impl Challenge {
+    fn request_type(self) -> &'static str {
+        match self {
+            Challenge::N => "n",
+            Challenge::Sig => "sig",
+        }
+    }
+}
+
+/// Decipher a `signatureCipher` `s` value (same solver and cache as nsig).
+pub fn decode_sig(player_js: &str, s_value: &str, player_hash: &str) -> Result<String, String> {
+    decode_challenge_cached_at(player_js, Challenge::Sig, s_value, player_hash, cache_path(player_hash))
+}
+
 /// [`decode_nsig`] with an explicit disk cache file.
 pub fn decode_nsig_cached_at(
     player_js: &str,
@@ -72,7 +95,18 @@ pub fn decode_nsig_cached_at(
     player_hash: &str,
     disk_cache: Option<PathBuf>,
 ) -> Result<String, String> {
-    decode_with_limits(player_js, n_value, player_hash, disk_cache, MEM_LIMITS)
+    decode_challenge_cached_at(player_js, Challenge::N, n_value, player_hash, disk_cache)
+}
+
+/// Any [`Challenge`] with an explicit disk cache file.
+pub fn decode_challenge_cached_at(
+    player_js: &str,
+    challenge: Challenge,
+    value: &str,
+    player_hash: &str,
+    disk_cache: Option<PathBuf>,
+) -> Result<String, String> {
+    decode_with_limits(player_js, challenge, value, player_hash, disk_cache, MEM_LIMITS)
 }
 
 /// QuickJS heap limits per decode; each decode gets a fresh runtime.
@@ -99,6 +133,7 @@ const NULL_EXCEPTION: &str = "null exception (OOM?)";
 
 fn decode_with_limits(
     player_js: &str,
+    challenge: Challenge,
     n_value: &str,
     player_hash: &str,
     disk_cache: Option<PathBuf>,
@@ -127,9 +162,12 @@ fn decode_with_limits(
         .name("nsig-solver".into())
         .stack_size(SOLVER_STACK_SIZE)
         .spawn(move || {
-            let result = run_solver(&player_js, &n_value, cached.as_deref(), limits)?;
+            let result = run_solver(&player_js, challenge, &n_value, cached.as_deref(), limits)?;
             // An unusable answer from a player that ran is not a cache fault.
-            check_decoded(&n_value, &result.decoded)?;
+            match challenge {
+                Challenge::N => check_decoded(&n_value, &result.decoded)?,
+                Challenge::Sig => check_sig_decoded(&n_value, &result.decoded)?,
+            }
 
             // A preprocessed player comes back only from a fresh parse; it
             // replaces whatever was cached.
@@ -145,6 +183,15 @@ fn decode_with_limits(
         .map_err(|e| format!("spawn solver thread: {}", e))?
         .join()
         .map_err(|_| "solver thread panicked".to_string())?
+}
+
+/// Signatures are request credentials: only lengths are logged.
+fn check_sig_decoded(s_value: &str, decoded: &str) -> Result<(), String> {
+    if decoded.is_empty() || decoded == s_value {
+        return Err(format!("sig decode returned an invalid result (len {})", decoded.len()));
+    }
+    tracing::info!("[nsig] sig deciphered: len {} -> {}", s_value.len(), decoded.len());
+    Ok(())
 }
 
 fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
@@ -169,20 +216,21 @@ fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
 /// cache; if it fails too, the cache is left alone.
 fn run_solver(
     player_js: &str,
+    challenge: Challenge,
     n_value: &str,
     cached: Option<&str>,
     limits: MemLimits,
 ) -> Result<DecodeResult, String> {
     if let Some(preprocessed) = cached {
         for limit in [limits.cached, limits.fresh] {
-            match decode_nsig_inner(player_js, n_value, Some(preprocessed), limit) {
+            match decode_nsig_inner(player_js, challenge, n_value, Some(preprocessed), limit) {
                 Ok(result) => return Ok(result),
                 Err(e) => tracing::warn!("[nsig] cached player failed at {} MiB: {}", limit >> 20, e),
             }
         }
         tracing::warn!("[nsig] re-parsing base.js; the cache is replaced only if that succeeds");
     }
-    decode_nsig_inner(player_js, n_value, None, limits.fresh)
+    decode_nsig_inner(player_js, challenge, n_value, None, limits.fresh)
 }
 
 /// Runs a cached player with 3/4 of the cached-path limit, so a live test
@@ -191,7 +239,7 @@ fn run_solver(
 #[cfg(test)]
 #[allow(dead_code)] // used by the binary crate's network test
 pub(crate) fn decode_cached_below_limit(preprocessed: &str, n_value: &str) -> Result<String, String> {
-    decode_nsig_inner("", n_value, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|r| r.decoded)
+    decode_nsig_inner("", Challenge::N, n_value, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|r| r.decoded)
 }
 
 struct DecodeResult {
@@ -201,6 +249,7 @@ struct DecodeResult {
 
 fn decode_nsig_inner(
     player_js: &str,
+    challenge: Challenge,
     n_value: &str,
     cached_preprocessed: Option<&str>,
     mem_limit: usize,
@@ -229,6 +278,8 @@ fn decode_nsig_inner(
         let global = ctx.globals();
         global.set("_n_value", n_value)
             .map_err(|e| fmt_js_error(&ctx, e, "set _n_value"))?;
+        global.set("_challenge_type", challenge.request_type())
+            .map_err(|e| fmt_js_error(&ctx, e, "set _challenge_type"))?;
 
         let result_json: String = if let Some(preprocessed) = cached_preprocessed {
             // Fast path: use cached preprocessed player (~0.6s, ~65MB)
@@ -241,7 +292,7 @@ fn decode_nsig_inner(
                     var _r = jsc({
                         type: "preprocessed",
                         preprocessed_player: _preprocessed,
-                        requests: [{type: "n", challenges: [_n_value]}],
+                        requests: [{type: _challenge_type, challenges: [_n_value]}],
                         output_preprocessed: false
                     });
                     JSON.stringify(_r);
@@ -263,7 +314,7 @@ fn decode_nsig_inner(
                     var _r = jsc({
                         type: "player",
                         player: _player_js,
-                        requests: [{type: "n", challenges: [_n_value]}],
+                        requests: [{type: _challenge_type, challenges: [_n_value]}],
                         output_preprocessed: true
                     });
                     JSON.stringify(_r);
@@ -300,7 +351,11 @@ fn decode_nsig_inner(
             .and_then(|r| r.get("error"))
             .and_then(|e| e.as_str())
         {
-            return Err(format!("jsc n error: {}", &err[..err.floor_char_boundary(300)]));
+            return Err(format!(
+                "jsc {} error: {}",
+                challenge.request_type(),
+                &err[..err.floor_char_boundary(300)]
+            ));
         }
 
         // Extract decoded n from responses[0].data[n_value]
@@ -441,7 +496,7 @@ var Q = function(u){ this.p = {}; };
 Q.prototype.set = function(k, v){ this.p[k] = v; };
 Q.prototype.get = function(k){ return this.p[k]; };
 Q.prototype.clone = function(){ return this; };
-Q.prototype.mutate = function(){ var n = this.p.n; if (n) this.p.n = n.split("").reverse().join(""); };
+Q.prototype.mutate = function(){ var n = this.p.n; if (n) this.p.n = n.split("").reverse().join(""); var s = this.p.s; if (s) this.p.s = s.toUpperCase(); };
 g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val) u.set(key, val); return u; };
 }).call(this, {});"#;
 
@@ -487,7 +542,7 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         let limits = MemLimits { cached: STARVED.cached, fresh: MEM_LIMITS.fresh };
 
         // No player JS: only the retry of the cached player can succeed.
-        let decoded = decode_with_limits("", "xyz", "test-retry-disk", Some(path.clone()), limits);
+        let decoded = decode_with_limits("", Challenge::N, "xyz", "test-retry-disk", Some(path.clone()), limits);
 
         assert_eq!(decoded.unwrap(), "zyx");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -520,7 +575,7 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         let (_tmp, path) = cache_synthetic_player("nsig-starved");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let decoded = decode_with_limits(SYNTHETIC_PLAYER, "xyz", "test-starved-disk", Some(path.clone()), STARVED);
+        let decoded = decode_with_limits(SYNTHETIC_PLAYER, Challenge::N, "xyz", "test-starved-disk", Some(path.clone()), STARVED);
 
         assert!(decoded.is_err(), "{decoded:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -541,6 +596,34 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
             });
             assert_eq!(err, format!("stage failed: {NULL_EXCEPTION}"), "{script}");
         }
+    }
+
+    #[test]
+    fn solver_deciphers_sig() {
+        let tmp = TempDir::new("sig-synthetic");
+        let path = tmp.path().join("nsig-preprocessed-sig.js");
+
+        let sig = decode_challenge_cached_at(SYNTHETIC_PLAYER, Challenge::Sig, "secretsig", "test-sig", Some(path));
+
+        assert_eq!(sig.unwrap(), "SECRETSIG");
+    }
+
+    #[test]
+    fn sig_check_logs_lengths_only() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        check_sig_decoded("secretsig", "SECRETSIG").unwrap();
+        let err = check_sig_decoded("secretsig", "secretsig").unwrap_err();
+        let logs = logs.text();
+        assert!(logs.contains("sig deciphered: len 9 -> 9"), "{logs}");
+        for text in [logs, err] {
+            assert!(!text.contains("secretsig") && !text.contains("SECRETSIG"), "{text}");
+        }
+    }
+
+    #[test]
+    fn player_without_sig_function_reports_sig_error() {
+        let err = decode_challenge_cached_at(PLAYER_WITHOUT_N, Challenge::Sig, "abc", "test-no-sig", None).unwrap_err();
+        assert!(err.starts_with("jsc sig error"), "{err}");
     }
 
     #[test]
