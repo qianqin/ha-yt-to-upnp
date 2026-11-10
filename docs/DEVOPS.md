@@ -177,12 +177,32 @@ programs, which its first stage (`fetch-artefacts.sh`) takes from:
   (`version`, `url`, `sha256`), downloaded with `curl` over https only
   (redirects too) from
   `https://github.com/<owner>/<repo>/releases/download/v<version>/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz`.
-  It fails closed: a sha256 other than the lock's, a lock for another version
-  than the `BUILD_VERSION` the Supervisor passes, a failed download or a
-  missing entry stops the build. No secret is needed (public release).
+  It fails closed: a sha256 other than the lock's, a lock for another
+  version than `config.yaml`'s (copied into the stage; a `BUILD_VERSION`
+  from the Supervisor must agree with it too), a failed download, more than
+  512 MB or a missing entry stops the build. Files are extracted without
+  their owners or stored permissions, and no setuid or setgid bit is kept.
+  No secret is needed (public release). The build argument `ARTEFACTS_URL`
+  is for `scripts/smoke-ha-app.sh --release-path` only: it may name
+  `https://` or plain http to `host.docker.internal` or `127.0.0.1` with a
+  port, nothing else, and a `build.yaml` must never set it.
 
 `ha-yt-to-upnp/artefacts/` is gitignored, so the repository's app folder never
-holds programs. There are no GitHub Actions and no image registry.
+holds programs; `scripts/release-check.sh` and `scripts/publish-release.sh`
+stop if it is tracked anyway. There are no GitHub Actions and no image
+registry.
+
+**What the installation trusts.** Home Assistant builds whatever `master`
+says: the `Dockerfile`, the run scripts and `artefacts.lock`, whose sha256
+decides which tarball is accepted. The sha256 only guards the release asset
+(a replaced or corrupted asset fails the build); it does not guard the
+repository: whoever can push to `master` (or change the lock there) decides
+what every installation runs at its next update. The integrity of an
+installation therefore rests on the `master` commit and on the GitHub
+account that can push it. Recommended, the owner decides: two-factor
+authentication on that account, branch protection on `master` (no force
+pushes, no deletion), immutable releases (GitHub's repository setting, so a
+published asset cannot be replaced), and optionally signed commits.
 
 Target: Home Assistant OS on x86-64 (`amd64`), host networking (SSDP/DIAL
 multicast and the Raumfeld's UPnP).
@@ -230,7 +250,7 @@ the `version` in `ha-yt-to-upnp/config.yaml` at `HEAD`
 scripts/pack_artefacts_test.py`). The tarball is reproducible: sorted
 entries, every mtime the commit's time, owner `0:0` without names, modes
 `0755`/`0644`, a gzip header without time or name; links must stay inside
-the folder. It then writes `ha-yt-to-upnp/artefacts.lock` (version, asset
+the folder, also when followed through other links (realpath). It then writes `ha-yt-to-upnp/artefacts.lock` (version, asset
 URL, sha256; also into the assembled folder). Owner and repository of the
 URL come from `git remote get-url origin` (a GitHub URL without credentials;
 anything else stops the script before the build).
@@ -248,7 +268,8 @@ scripts/smoke-ha-app.sh --release-path       # Home Assistant's build from the r
 scripts/smoke-ha-app.sh --clean-cache        # removes --quick's cached base image
 ```
 
-The full run is the one reviews and releases need; `--quick` (below) is a
+The full run is the one reviews and releases need (its build must log that
+the artefacts stage took `artefacts/` from the build context); `--quick` (below) is a
 check before a live test; `--release-path` (below) is needed for a release,
 after the full run.
 
@@ -337,10 +358,13 @@ checks it against `artefacts.lock`; the tarball must be the lock's. It serves
 the tarball with `python3 -m http.server` on `127.0.0.1` of this machine,
 which the build reaches as `host.docker.internal` (Docker Desktop) through
 the build argument `ARTEFACTS_URL`: set only by this test, it replaces the
-lock's URL (and allows plain http), never its sha256. First, building the
-artefacts stage alone must fail with `sha256 mismatch` for a tampered copy of
-the tarball (a gzip member appended: still a valid tarball) and with a
-version error for `BUILD_VERSION` `0.0.0`. Then the full image is built from
+lock's URL (and allows plain http to this machine), never its sha256.
+First, building the artefacts stage alone must fail: with `sha256 mismatch`
+for a tampered copy of the tarball (a gzip member appended: still a valid
+tarball); with a version error for `BUILD_VERSION` `0.0.0`; for a stale lock
+(a copy of the folder whose lock says another version, no `BUILD_VERSION`);
+for a lock naming the genuine tarball over plain http (no override: https
+only); and for an `ARTEFACTS_URL` to another host. Then the full image is built from
 the genuine tarball and gets the quick run's checks, plus: `/opt/BUILD-INFO`
 is the tarball's, and the receiver, the adapter and `deno` in the image have
 the SHA-256 that `BUILD-INFO` records. The server, builder (with its cache),
@@ -446,16 +470,33 @@ forward):
    scripts/publish-release.sh
    ```
 
-   It checks that the tree is clean, that `artefacts.lock` at `HEAD` is for
-   the version in `config.yaml`, names the asset URL of the `origin`
-   repository and has the sha256 of `dist/release/<asset>`, and that the
-   CHANGELOG has the version's section. Then it pushes the tag `v<version>`
-   (`HEAD`, no `--force`), creates a **draft** release from it with the
-   tarball and the CHANGELOG section, downloads the draft's asset and checks
-   its sha256, publishes the draft (`--latest`), and downloads the asset from
-   its public URL (the lock's) and checks it again. By hand, the same is:
+   It checks that the tree is clean and `ha-yt-to-upnp/artefacts` is not
+   tracked; that `artefacts.lock` at `HEAD` is for the version in
+   `config.yaml`, names the asset URL of the `origin` repository and has the
+   sha256 of `dist/release/<asset>`; that the tarball belongs to `HEAD`: the
+   commits its `artefacts/BUILD-INFO` names have the same receiver sources
+   (`src/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `build.rs`,
+   `proto/`), `adapter/raumfeld_adapter.py` and app folder (all of
+   `ha-yt-to-upnp/` but `artefacts.lock` and `*.md`) as `HEAD`; that the
+   CHANGELOG has the version's section; and that no local tag `v<version>`
+   exists. `--dry-run` stops there and prints the commands. The real run
+   then requires branch `master`, fetches origin's `master` and requires it
+   to be an ancestor of `HEAD`, and requires that neither the tag on origin
+   (`git ls-remote` exit 2; any other failure stops it) nor the release
+   (`release not found`; any other answer stops it) exists. Then it pushes
+   the tag `v<version>` (`HEAD`, no `--force`), creates a **draft** release
+   from it with the tarball and the CHANGELOG section, downloads the draft's
+   asset and checks its sha256 (a mismatch stops it before publishing),
+   publishes the draft (`--latest`), and downloads the asset from its public
+   URL (the lock's) and checks it again, trying up to 6 times 10 s apart
+   while GitHub does not serve it yet; if that keeps failing, the release is
+   published and only the check needs repeating (the message says how).
+   `scripts/publish_release_test.py` tests all of this with fake `gh`,
+   `curl` and `sleep` and a `git` that keeps everything off origin. By hand,
+   the same is:
 
    ```sh
+   git fetch origin master && git merge-base --is-ancestor origin/master HEAD
    git ls-remote --exit-code --tags origin refs/tags/v<version>  # must find nothing (exit 2)
    git push origin HEAD:refs/tags/v<version>
    gh release create v<version> dist/release/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz \
