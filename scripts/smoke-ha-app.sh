@@ -71,11 +71,12 @@ step() { echo; echo "==> $*"; }
 # Removes an image and then its untagged parents, child first: the classic
 # builder leaves one per step, and with the containerd image store removing an
 # image leaves them. Stops at a tagged parent (the cached base image, or a base
-# image that was there before) or one that another image still uses.
+# image that was there before) or one that another image still uses. An image
+# loaded from BuildKit has no Parent field at all (not an empty one).
 rm_image_chain() {
   local id="$1" parent
   while :; do
-    parent="$(docker image inspect -f '{{.Parent}}' "$id" 2>/dev/null)" || return 0
+    parent="$(docker image inspect -f '{{with index . "Parent"}}{{.}}{{end}}' "$id" 2>/dev/null)" || return 0
     docker image rm "$id" >/dev/null 2>&1 || return 0
     [ -n "$parent" ] || return 0
     [ "$(docker image inspect -f '{{len .RepoTags}}' "$parent" 2>/dev/null)" = 0 ] || return 0
