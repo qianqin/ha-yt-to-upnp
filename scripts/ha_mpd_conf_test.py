@@ -1,7 +1,8 @@
 """Tests of MPD's configuration as ytcast-init writes it (ytcast_mpd_conf in
 ha-yt-to-upnp/rootfs/usr/lib/ytcast/common.sh, with the app's mpd.conf.template).
 
-Runs on the host with bash (4 or later), no Docker: python3 -I scripts/ha_mpd_conf_test.py
+Runs on the host with bash 4.3 or later (as in the image; not macOS's 3.2),
+no Docker: python3 -I scripts/ha_mpd_conf_test.py
 """
 import os
 import subprocess
@@ -47,6 +48,20 @@ class MpdConfTest(unittest.TestCase):
         result = mpd_conf("a\n  @STREAM_ENCODER@\nb")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "a\n  %s\nb\n" % ENCODER)
+
+    def test_one_placeholder_on_a_long_line_is_replaced(self):
+        line = "    # the stream's encoder, as stream_format says: @STREAM_ENCODER@ (here)"
+        result = mpd_conf("a\n%s\nb" % line)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "a\n%s\nb\n" % line.replace("@STREAM_ENCODER@", ENCODER))
+
+    def test_the_encoder_is_put_in_as_it_is(self):
+        # bash 5.2's patsub_replacement turns an unquoted & into the match.
+        for encoder in ('encoder "a&b"', "&", "\\&", "\\"):
+            with self.subTest(encoder=encoder):
+                result = mpd_conf("x @STREAM_ENCODER@ y", encoder)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "x %s y\n" % encoder)
 
     def test_no_placeholder_is_refused(self):
         for template in ("a\nb", "@STREAM_ENCODER", "STREAM_ENCODER@", ""):

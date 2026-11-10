@@ -17,6 +17,8 @@
   (exactly one `@STREAM_ENCODER@` in `mpd.conf.template`, now checked by
   `ytcast_mpd_conf` in `common.sh`), both run by `scripts/smoke-ha-app.sh`;
   more cases for `scripts/publish-release.sh` and `scripts/pack_artefacts.py`.
+- `ytcast_mpd_conf` puts the encoder settings in as they are (quoted
+  replacement: bash 5.2 would turn an `&` into the placeholder).
 
 ## 0.4.0
 

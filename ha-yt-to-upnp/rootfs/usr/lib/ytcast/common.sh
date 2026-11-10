@@ -40,7 +40,8 @@ ytcast_mpd_conf() {
     rest="${template//"${placeholder}"/}"
     [ $(( (${#template} - ${#rest}) / ${#placeholder} )) = 1 ] \
         || bashio::exit.nok "/etc/ytcast/mpd.conf.template must name @STREAM_ENCODER@ exactly once"
-    printf '%s\n' "${template/"${placeholder}"/${encoder}}"
+    # Quoted: with bash 5.2's patsub_replacement an & would be the match.
+    printf '%s\n' "${template/"${placeholder}"/"${encoder}"}"
 }
 
 # True if the option is set (not missing, null or empty).
