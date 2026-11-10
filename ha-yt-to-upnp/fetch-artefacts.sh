@@ -49,11 +49,19 @@ proto='=https'
 # Set only by scripts/smoke-ha-app.sh --release-path, which serves the tarball
 # over plain http on the build machine; the sha256 still comes from the lock.
 # Plain http only to this machine; a build.yaml must never set it.
+nl='
+'
+# The whole value, as one line: grep matches line by line, and echo would act
+# on backslash escapes (\c ends the output) so that only a part were checked.
+artefacts_url_is() {
+  case "$ARTEFACTS_URL" in *"$nl"*) return 1 ;; esac
+  printf '%s\n' "$ARTEFACTS_URL" | grep -Eqx "$1"
+}
 if [ -n "${ARTEFACTS_URL:-}" ]; then
   # Strict: no user info, so "http://127.0.0.1:1@elsewhere/" cannot pass.
-  if echo "$ARTEFACTS_URL" | grep -Eqx 'http://(host\.docker\.internal|127\.0\.0\.1):[0-9]{1,5}/[A-Za-z0-9._/-]*'; then
+  if artefacts_url_is 'http://(host\.docker\.internal|127\.0\.0\.1):[0-9]{1,5}/[A-Za-z0-9._/-]*'; then
     proto='=http'
-  elif ! echo "$ARTEFACTS_URL" | grep -Eqx 'https://[^@[:space:]]+'; then
+  elif ! artefacts_url_is 'https://[^@[:space:]]+'; then
     die "ARTEFACTS_URL must be https:// or http://host.docker.internal:<port>/ or http://127.0.0.1:<port>/"
   fi
   url="$ARTEFACTS_URL"
