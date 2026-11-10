@@ -1,5 +1,7 @@
 # MPD for the receiver and the Raumfeld adapter. Control stays on loopback;
 # only the httpd stream (port 8000) is reachable from the LAN.
+# ytcast-init writes it to /run/ytcast/mpd.conf at each start, with the encoder
+# for the stream_format option in place of @STREAM_ENCODER@.
 # Loopback is the HA host's loopback (host network); MPD has no password because
 # neither the receiver nor the adapter can send one (see DOCS.md).
 music_directory     "/data/mpd/music"
@@ -18,12 +20,13 @@ auto_update         "no"
 audio_output {
     type        "httpd"
     name        "ytcast stream"
-    encoder     "lame"
+    @STREAM_ENCODER@
     port        "8000"
-    bitrate     "192"
     # The speaker needs one connection; a few more for reconnects, no more.
     max_clients "4"
-    format      "44100:16:2"
+    # 16-bit also for FLAC: the Raumfeld connects to a 24-bit FLAC stream but
+    # never plays it.
+    format      "48000:16:2"
     # Keep the stream open between tracks and while paused (silence), so the
     # speaker neither drops it nor stalls during the adapter's start gate.
     always_on   "yes"

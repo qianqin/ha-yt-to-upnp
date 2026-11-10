@@ -5,8 +5,9 @@
 # BUILD_VERSION/BUILD_ARCH), runs it with test options and checks that all four
 # services come up and stay up, run as their own users, listen where they
 # should, get the options as environment and cannot read the Supervisor token;
-# that the receiver's /silence answers on loopback only; that the PoToken helper
-# mints a token; that the adapter keeps running whether it looks for the
+# that the receiver's /silence answers on loopback only; that MPD's stream on
+# port 8000 is FLAC 48 kHz 16-bit or MP3 320 kbit/s as stream_format says, under
+# a URL that names it; that the PoToken helper mints a token; that the adapter keeps running whether it looks for the
 # Raumfeld host by SSDP or is given an unreachable raumfeld_host; and that
 # invalid options stop the app with one clear error.
 #
@@ -211,6 +212,54 @@ def play_silence():
         time.sleep(0.5)
     return mpd("clear", "add smoke.wav", "repeat 1", "play")
 
+# What the start of a stream says about itself: FLAC's STREAMINFO block, or the
+# first MP3 frame header (after an ID3v2 tag, if there is one).
+def stream_params(head):
+    if head[:4] == b"fLaC":
+        if len(head) < 42 or head[4] & 0x7f != 0:
+            return {"codec": "flac", "error": "no STREAMINFO first"}
+        si = head[8:42]
+        return {"codec": "flac", "rate": si[10] << 12 | si[11] << 4 | si[12] >> 4,
+                "channels": (si[12] >> 1 & 7) + 1, "bits": ((si[12] & 1) << 4 | si[13] >> 4) + 1}
+    start = 0
+    if head[:3] == b"ID3" and len(head) >= 10:
+        start = 10 + (head[6] << 21 | head[7] << 14 | head[8] << 7 | head[9])
+    for i in range(start, len(head) - 3):
+        if head[i] == 0xff and head[i + 1] & 0xe0 == 0xe0:
+            h1, h2, h3 = head[i + 1], head[i + 2], head[i + 3]
+            if h1 & 0x1e != 0x1a:  # MPEG-1 Layer III
+                return {"codec": "mpeg", "error": "not MPEG-1 Layer III (0x%02x)" % h1}
+            return {"codec": "mp3", "kbit": [None, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
+                                             192, 224, 256, 320, None][h2 >> 4],
+                    "rate": [44100, 48000, 32000, None][h2 >> 2 & 3],
+                    "channels": 1 if h3 >> 6 == 3 else 2}
+    return {"codec": None, "error": "unknown start %r" % head[:8]}
+
+# The stream as the speaker gets it, from the URL the adapter hands it (the
+# adapter's STREAM_URL may name another host; MPD listens on all of them).
+def check_stream(want):
+    played = play_silence()
+    check(all(l == "OK" for l in played), "MPD plays a test file (%s)" % played)
+    url = "http://%s:8000%s" % (ip, want["path"])
+    status, ctype, head = None, "", b""
+    for _ in range(20):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                status, ctype = r.status, r.headers.get("Content-Type", "")
+                while len(head) < 8192:
+                    chunk = r.read(8192 - len(head))
+                    if not chunk:
+                        break
+                    head += chunk
+            break
+        except Exception as e:
+            status = repr(e)
+            time.sleep(0.5)
+    check(status == 200 and ctype == want["mime"],
+          "MPD httpd serves %s (%s, %s)" % (url, status, ctype))
+    params = stream_params(head)
+    check(params == want["params"], "stream is %s (got %s)" % (want["params"], params))
+
 ip = lan_ip()
 ps = procs()
 services = {"mpd": "mpd", "receiver": "ytcast-lite", "potoken": "deno",
@@ -234,22 +283,6 @@ if mode == "full":
         hello = str(e)
     check(hello.startswith("OK MPD"), "MPD answers on 127.0.0.1:6600 (%s)" % hello.strip())
     check(not can_connect(ip, 6600), "MPD control is not reachable on %s:6600" % ip)
-
-    played = play_silence()
-    check(all(l == "OK" for l in played), "MPD plays a test file (%s)" % played)
-    status, ctype = None, ""
-    for _ in range(20):
-        try:
-            r = urllib.request.urlopen("http://%s:8000/stream.mp3" % ip, timeout=5)
-            ctype = r.headers.get("Content-Type", "")
-            status = r.status
-            r.close()
-            break
-        except Exception as e:
-            status = repr(e)
-            time.sleep(0.5)
-    check(status == 200 and ctype == "audio/mpeg",
-          "MPD httpd serves on %s:8000 (%s, %s)" % (ip, status, ctype))
 
     try:
         desc = urllib.request.urlopen("http://%s:8008/ssdp/device-desc.xml" % ip, timeout=5).read().decode()
@@ -330,6 +363,9 @@ if "adapter" in pids:
     for key in expect.get("adapter_env_absent", []):
         check(key not in env, "adapter env has no %s (adapter default)" % key)
 
+if "stream" in expect and "mpd" in pids:
+    check_stream(expect["stream"])
+
 print("PIDS " + json.dumps(pids, sort_keys=True))
 sys.exit(1 if failed else 0)
 PY
@@ -353,18 +389,21 @@ wait_for_checks() {
 
 pids_of() { sed -n 's/^PIDS //p' "$tmp/$1.out"; }
 
-step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected"
+step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected, FLAC stream (default)"
 main="$run_id-main"
 start_app "$main" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
-  "start_gate_seconds": 7, "stuck_seconds": 20, "log_level": "debug"}'
+  "start_gate_seconds": 7, "stuck_seconds": 20, "stream_format": "flac", "log_level": "debug"}'
 expect_main='{"cast_name": "Smoke Test",
+  "stream": {"path": "/stream.flac", "mime": "audio/flac",
+             "params": {"codec": "flac", "rate": 48000, "channels": 2, "bits": 16}},
   "receiver_env": {"DEVICE_NAME": "Smoke Test", "MPD_HOST": "127.0.0.1", "MPD_PORT": "6600",
                    "YTCAST_DATA_DIR": "/data/ytcast", "RUST_LOG": "info,ytcast_lite=debug"},
   "adapter_env": {"RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001",
                   "RAUMFELD_SPEAKER_UDN": "uuid:00000000-0000-0000-0000-000000000002",
-                  "STREAM_URL": "http://{ip}:8000/stream.mp3", "MPD_HOST": "127.0.0.1",
+                  "STREAM_URL": "http://{ip}:8000/stream.flac", "STREAM_MIME": "audio/flac",
+                  "MPD_HOST": "127.0.0.1",
                   "MPD_PORT": "6600", "START_GATE_SECONDS": "7", "STUCK_SECONDS": "20",
                   "LOG_LEVEL": "DEBUG", "ADAPTER_STATE_DIR": "/data/adapter"},
   "adapter_env_absent": ["RAUMFELD_HOST"]}'
@@ -400,16 +439,19 @@ wait_for_log() {
   done
 }
 
-step "run 2: raumfeld_host (unreachable) without speaker UDN, explicit stream_host, optional timings unset"
+step "run 2: raumfeld_host (unreachable) without speaker UDN, explicit stream_host, optional timings unset, MP3 stream"
 second="$run_id-host"
 start_app "$second" '{"cast_name": "Smoke Test 2",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_host": "192.0.2.20",
-  "stream_host": "192.0.2.10", "log_level": "warning"}'
+  "stream_host": "192.0.2.10", "stream_format": "mp3", "log_level": "warning"}'
 expect_host='{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
+  "stream": {"path": "/stream.mp3", "mime": "audio/mpeg",
+             "params": {"codec": "mp3", "kbit": 320, "rate": 48000, "channels": 2}},
   "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "ADAPTER_STATE_DIR": "/data/adapter",
                   "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001",
-                  "STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "LOG_LEVEL": "WARNING"},
+                  "STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "STREAM_MIME": "audio/mpeg",
+                  "LOG_LEVEL": "WARNING"},
   "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN", "START_GATE_SECONDS", "STUCK_SECONDS"]}'
 wait_for_checks "$second" env "$expect_host"
 host_pids="$(pids_of "$second")"
@@ -454,7 +496,7 @@ step "run 3: an invalid cast_name stops the app with one clear error"
 expect_fatal "$run_id-bad" '{"cast_name": "Bad <name>",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
-  "log_level": "info"}' "option 'cast_name' is invalid"
+  "stream_format": "flac", "log_level": "info"}' "option 'cast_name' is invalid"
 grep -qF 'must match ^[^<>&"\x00-\x1f]{1,60}$' <<<"$(docker logs "$run_id-bad" 2>&1)" \
   || die "the error does not show the rule as written"
 echo "PASS the error shows the rule as written"
@@ -462,17 +504,17 @@ echo "PASS the error shows the rule as written"
 step "run 4: an invalid raumfeld_host stops the app with one clear error"
 expect_fatal "$run_id-badhost" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
-  "raumfeld_host": "192.0.2.20:47365", "log_level": "info"}' "option 'raumfeld_host' is invalid"
+  "raumfeld_host": "192.0.2.20:47365", "stream_format": "flac", "log_level": "info"}' "option 'raumfeld_host' is invalid"
 
 step "run 5: neither raumfeld_speaker_udn nor raumfeld_host stops the app with one clear error"
 expect_fatal "$run_id-nohost" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
-  "log_level": "info"}' "option 'raumfeld_speaker_udn' is required when raumfeld_host is not set"
+  "stream_format": "flac", "log_level": "info"}' "option 'raumfeld_speaker_udn' is required when raumfeld_host is not set"
 
 step "run 6: a symbolic link at /data/adapter stops the app with one clear error"
 expect_fatal "$run_id-link" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
-  "raumfeld_host": "192.0.2.20", "log_level": "info"}' \
+  "raumfeld_host": "192.0.2.20", "stream_format": "flac", "log_level": "info"}' \
   "/data/adapter is a symbolic link; remove it and start the app again" adapter
 # The link's target in the stopped container must be untouched: still root's
 # world-writable sticky /tmp, not the adapter's 0700 directory.
@@ -482,5 +524,11 @@ m = tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read())).next()
 print("mode %o uid %d gid %d" % (m.mode, m.uid, m.gid))')"
 [ "$tmp_entry" = "mode 1777 uid 0 gid 0" ] || die "the link's target /tmp was changed: $tmp_entry"
 echo "PASS the link's target was left alone (/tmp: $tmp_entry)"
+
+step "run 7: an invalid stream_format stops the app with one clear error"
+expect_fatal "$run_id-badformat" '{"cast_name": "Smoke Test",
+  "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
+  "raumfeld_host": "192.0.2.20", "stream_format": "flac24", "log_level": "info"}' \
+  "option 'stream_format' is invalid: must be one of flac, mp3"
 
 step "smoke test passed"

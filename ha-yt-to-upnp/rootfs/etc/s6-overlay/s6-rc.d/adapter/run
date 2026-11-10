@@ -10,7 +10,9 @@ if ytcast_has_option stream_host; then
 else
     stream_host="$(ytcast_lan_ipv4)" || bashio::exit.nok "Cannot detect the LAN IPv4 address; set stream_host"
 fi
-stream_url="http://${stream_host}:8000/stream.mp3"
+stream_format="$(ytcast_option stream_format)"
+stream_url="http://${stream_host}:8000/stream.${stream_format}"
+stream_mime="$(ytcast_stream_mime "${stream_format}")"
 
 # Plain assignments, so that set -e stops on a missing option.
 room_udn="$(ytcast_option raumfeld_room_udn)"
@@ -21,6 +23,7 @@ env=(
     PATH=/usr/bin:/bin HOME=/nonexistent
     RAUMFELD_ROOM_UDN="${room_udn}"
     STREAM_URL="${stream_url}"
+    STREAM_MIME="${stream_mime}"
     MPD_HOST="${YTCAST_MPD_HOST}" MPD_PORT="${YTCAST_MPD_PORT}"
     LOG_LEVEL="${log_level}"
     ADAPTER_STATE_DIR="${YTCAST_ADAPTER_STATE_DIR}"

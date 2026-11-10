@@ -36,3 +36,12 @@ state_dir /data/mpd mpd
 state_dir /data/mpd/music mpd
 state_dir /data/mpd/playlists mpd
 state_dir "${YTCAST_ADAPTER_STATE_DIR}" adapter
+
+# MPD's configuration with the stream encoder for stream_format. No secrets in
+# it; root's, readable by MPD.
+stream_format="$(ytcast_option stream_format)"
+encoder="$(ytcast_stream_encoder "${stream_format}")"
+template="$(< /etc/ytcast/mpd.conf.template)"
+mkdir -p "$(dirname "${YTCAST_MPD_CONF}")"
+printf '%s\n' "${template/@STREAM_ENCODER@/${encoder}}" > "${YTCAST_MPD_CONF}"
+chmod 0644 "${YTCAST_MPD_CONF}"

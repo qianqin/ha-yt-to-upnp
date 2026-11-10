@@ -9,6 +9,27 @@ readonly YTCAST_OPTIONS=/data/options.json
 # The adapter's state directory: made by ytcast-init, passed by the adapter's run.
 # shellcheck disable=SC2034
 readonly YTCAST_ADAPTER_STATE_DIR=/data/adapter
+# MPD's configuration as ytcast-init writes it for the stream_format option.
+# shellcheck disable=SC2034
+readonly YTCAST_MPD_CONF=/run/ytcast/mpd.conf
+
+# MPD's httpd encoder settings and the stream's MIME type for stream_format.
+# The stream's URL ends in .<stream_format>; MPD ignores the path.
+ytcast_stream_encoder() {
+    case "$1" in
+        # Level 5 is libFLAC's default: a fraction of a core, ~1-1.5 Mbit/s.
+        flac) printf '%s\n    %s' 'encoder     "flac"' 'compression "5"' ;;
+        mp3) printf '%s\n    %s' 'encoder     "lame"' 'bitrate     "320"' ;;
+        *) bashio::exit.nok "unknown stream format '$1'" ;;
+    esac
+}
+ytcast_stream_mime() {
+    case "$1" in
+        flac) echo audio/flac ;;
+        mp3) echo audio/mpeg ;;
+        *) bashio::exit.nok "unknown stream format '$1'" ;;
+    esac
+}
 
 # True if the option is set (not missing, null or empty).
 ytcast_has_option() {
