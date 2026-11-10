@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1
+
+- Artefacts stage: the test-only `ARTEFACTS_URL` is checked as a whole and
+  as one line; before, a second line or a backslash escape such as `\c`
+  (which `echo` in dash acts on) left part of the value unchecked, so user
+  info could slip into an https URL. The build from the repository never sets
+  it.
+- Tests: `scripts/fetch_artefacts_test.py` (URL check, sha256 in the lock,
+  512 MB cap, no setuid/setgid bits) and `scripts/ha_mpd_conf_test.py`
+  (exactly one `@STREAM_ENCODER@` in `mpd.conf.template`, now checked by
+  `ytcast_mpd_conf` in `common.sh`), both run by `scripts/smoke-ha-app.sh`;
+  more cases for `scripts/publish-release.sh` and `scripts/pack_artefacts.py`.
+
 ## 0.4.0
 
 Premium audio, installed from the repository.

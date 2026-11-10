@@ -185,7 +185,14 @@ programs, which its first stage (`fetch-artefacts.sh`) takes from:
   No secret is needed (public release). The build argument `ARTEFACTS_URL`
   is for `scripts/smoke-ha-app.sh --release-path` only: it may name
   `https://` or plain http to `host.docker.internal` or `127.0.0.1` with a
-  port, nothing else, and a `build.yaml` must never set it.
+  port, nothing else (no user info, one line, checked as a whole), and a
+  `build.yaml` must never set it. `scripts/fetch_artefacts_test.py` tests
+  all of this on the host against a local http server (the smoke test runs
+  it first); on the Mac `sh` is bash and `tar` is bsdtar, so for dash and
+  GNU tar as in the build also run it as root in the smoke test's cached
+  base image (`docker run --rm --platform linux/amd64 -v "$PWD":/src:ro
+  --entrypoint python3 ytcast-ha-smoke-base:<hash> -I
+  /src/scripts/fetch_artefacts_test.py`).
 
 `ha-yt-to-upnp/artefacts/` is gitignored, so the repository's app folder never
 holds programs; `scripts/release-check.sh` and `scripts/publish-release.sh`
@@ -276,7 +283,10 @@ after the full run.
 
 It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
-exactly the schema in `config.yaml` and accepts and rejects the right values.
+exactly the schema in `config.yaml` and accepts and rejects the right values;
+`scripts/ha_mpd_conf_test.py`: MPD's configuration gets the encoder in place
+of the template's one `@STREAM_ENCODER@` (none or two stop the app);
+`scripts/fetch_artefacts_test.py` (see the artefacts stage above).
 Then it builds the image from the assembled folder for `linux/amd64` the way
 the Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
 `config.yaml`, `BUILD_ARCH=amd64`) in a buildx builder of its own, and runs it

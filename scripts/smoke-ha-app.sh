@@ -161,8 +161,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-step "option validator matches config.yaml's schema (host)"
+step "option validator matches config.yaml's schema, MPD's configuration, the artefacts stage (host)"
 python3 -I "$root/scripts/ha_options_test.py"
+python3 -I "$root/scripts/ha_mpd_conf_test.py"
+python3 -I "$root/scripts/fetch_artefacts_test.py"
 
 # The full run builds as the Supervisor does: BuildKit, on a builder of its own
 # so that the build cache stays out of the default builder.
