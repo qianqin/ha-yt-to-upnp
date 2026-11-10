@@ -25,6 +25,21 @@
 # makes it when there is none for the hash (replacing an older one) and keeps
 # it; only the steps after the boundary run each time, on a build context
 # without the files the base image already holds. --clean-cache removes it.
+# Quick runs build the Dockerfile's last stage alone, with its
+# COPY --from=artefacts /artefacts/... lines copying from artefacts/ in the
+# build context instead.
+#
+# --release-path [TARBALL]: the build Home Assistant makes from the repository.
+# The image is built with BuildKit from ha-yt-to-upnp/ as committed (no
+# artefacts/ folder), so its artefacts stage downloads the release tarball
+# (default dist/release/<asset of config.yaml's version>, made by
+# scripts/build-ha-app.sh --release) and checks it against artefacts.lock. The
+# tarball is served over http on 127.0.0.1 of this machine and reached as
+# host.docker.internal (Docker Desktop), through the test-only ARTEFACTS_URL
+# build argument. Before that, a tampered copy of the tarball and a
+# BUILD_VERSION other than the lock's must each fail the build. The image then
+# gets the quick run's checks, and its programs must be the tarball's
+# (BUILD-INFO and checksums).
 #
 # Nothing is announced on the LAN: the container runs on its own Docker bridge
 # network (no host networking, no published ports), so the receiver's SSDP and
@@ -42,6 +57,8 @@ set -euo pipefail
 usage() {
   cat >&2 <<'USAGE'
 usage: scripts/smoke-ha-app.sh [--quick] [APP_DIR]  (default dist/ha-yt-to-upnp)
+       scripts/smoke-ha-app.sh --release-path [TARBALL]
+                                  (default dist/release/<asset of the app version>)
        scripts/smoke-ha-app.sh --clean-cache        (remove --quick's base image)
 USAGE
 }
@@ -66,7 +83,7 @@ rm_image_chain() {
   done
 }
 
-quick=0
+mode=full
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --clean-cache)
@@ -76,26 +93,40 @@ case "${1:-}" in
     for ref in $cached; do rm_image_chain "$ref"; echo "removed $ref"; done
     [ -n "$cached" ] || echo "no cached base image"
     exit 0 ;;
-  --quick) quick=1; shift ;;
+  --quick) mode=quick; shift ;;
+  --release-path) mode=release; shift ;;
 esac
 [ $# -le 1 ] || { usage; exit 2; }
 
 root="$(git rev-parse --show-toplevel)"
-dir="${1:-$root/dist/ha-yt-to-upnp}"
-
-[ -f "$dir/artefacts/BUILD-INFO" ] || die "$dir is not an assembled app folder; run scripts/build-ha-app.sh first"
+if [ "$mode" = release ]; then
+  # The folder as Home Assistant takes it from the repository.
+  dir="$root/ha-yt-to-upnp"
+  if [ -n "$(git -C "$root" status --porcelain --untracked-files=all --ignored -- ha-yt-to-upnp)" ]; then
+    git -C "$root" status --short --untracked-files=all --ignored -- ha-yt-to-upnp >&2
+    die "ha-yt-to-upnp/ differs from the commit (or holds ignored files); commit or remove that first"
+  fi
+else
+  dir="${1:-$root/dist/ha-yt-to-upnp}"
+  [ -f "$dir/artefacts/BUILD-INFO" ] || die "$dir is not an assembled app folder; run scripts/build-ha-app.sh first"
+fi
 docker info >/dev/null 2>&1 || die "Docker daemon not running"
 
 readonly PLATFORM=linux/amd64
 readonly BUILDKIT_IMAGE=moby/buildkit:buildx-stable-1
 readonly STABLE_S=20
-if [ "$quick" = 1 ]; then
+if [ "$mode" != full ]; then
   readonly UP_TIMEOUT_S=60 POLL_S=0.5
 else
   readonly UP_TIMEOUT_S=180 POLL_S=3
 fi
 version="$(sed -n 's/^version: "\(.*\)"$/\1/p' "$dir/config.yaml")"
 [ -n "$version" ] || die "no version in $dir/config.yaml"
+if [ "$mode" = release ]; then
+  asset="ha-yt-to-upnp-artefacts-$version-amd64.tar.gz"
+  tarball="${1:-$root/dist/release/$asset}"
+  [ -f "$tarball" ] || die "no release tarball $tarball; run scripts/build-ha-app.sh --release first"
+fi
 
 run_id="ytcast-smoke-$$"
 image="ytcast-smoke:$$"
@@ -106,10 +137,12 @@ builder=""
 image_built=0
 buildkit_pulled=0
 from_pulled=""
+server_pid=""
 
 cleanup() {
   status=$?
   set +e
+  [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
   for c in $containers; do docker rm -fv "$c" >/dev/null 2>&1; done
   [ -n "$network" ] && docker network rm "$network" >/dev/null 2>&1
   [ "$image_built" = 1 ] && rm_image_chain "$image"
@@ -129,10 +162,14 @@ python3 -I "$root/scripts/ha_options_test.py"
 
 # The full run builds as the Supervisor does: BuildKit, on a builder of its own
 # so that the build cache stays out of the default builder.
-build_full() {
+create_builder() {
   docker image inspect "$BUILDKIT_IMAGE" >/dev/null 2>&1 || buildkit_pulled=1
   builder="$run_id"
   docker buildx create --name "$builder" --driver docker-container >/dev/null
+}
+
+build_full() {
+  create_builder
   image_built=1
   docker buildx build --builder "$builder" --platform "$PLATFORM" --load \
     --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
@@ -144,10 +181,14 @@ build_full() {
 # files it copies, and the rest is built on it. The classic builder keeps no
 # build cache: removing the image removes all it made.
 build_quick() {
-  local split sources base from old
-  split="$(grep -n '^# smoke-quick-cache-boundary$' "$dir/Dockerfile" | cut -d: -f1)"
+  local last split sources base from old
+  last="$(grep -n '^FROM ' "$dir/Dockerfile" | tail -n 1 | cut -d: -f1)"
+  tail -n "+$last" "$dir/Dockerfile" \
+    | sed 's|^COPY --from=artefacts /artefacts/|COPY artefacts/|' > "$tmp/Dockerfile.last"
+  if grep -q -- '--from=' "$tmp/Dockerfile.last"; then die "unexpected COPY --from in the last stage"; fi
+  split="$(grep -n '^# smoke-quick-cache-boundary$' "$tmp/Dockerfile.last" | cut -d: -f1)"
   [ -n "$split" ] || die "no '# smoke-quick-cache-boundary' line in $dir/Dockerfile"
-  head -n "$split" "$dir/Dockerfile" > "$tmp/Dockerfile.base"
+  head -n "$split" "$tmp/Dockerfile.last" > "$tmp/Dockerfile.base"
   # COPY's sources in the base part (the last word is the destination).
   sources="$(awk '/^COPY /{for (i = 2; i < NF; i++) print $i}' "$tmp/Dockerfile.base")"
   base="$BASE_REPO:$( { cat "$tmp/Dockerfile.base"
@@ -167,7 +208,7 @@ build_quick() {
     if [ -n "$from_pulled" ]; then docker image rm "$from_pulled" >/dev/null; from_pulled=""; fi
     for ref in $old; do rm_image_chain "$ref"; echo "removed older $ref"; done
   fi
-  { echo "FROM $base"; tail -n "+$((split + 1))" "$dir/Dockerfile"; } > "$tmp/Dockerfile.quick"
+  { echo "FROM $base"; tail -n "+$((split + 1))" "$tmp/Dockerfile.last"; } > "$tmp/Dockerfile.quick"
   # The classic builder sends the whole context: leave out what the base holds.
   mkdir "$tmp/context"
   (cd "$dir" && find . \( -type f -o -type l \) -print) \
@@ -180,8 +221,59 @@ build_quick() {
     -t "$image" -f "$tmp/Dockerfile.quick" "$tmp/context" >/dev/null
 }
 
-step "build $PLATFORM image from $dir (version $version$([ "$quick" = 1 ] && echo ", quick"))"
-if [ "$quick" = 1 ]; then build_quick; else build_full; fi
+# Builds only the artefacts stage with the given ARTEFACTS_URL and
+# BUILD_VERSION; the build must fail with a line containing the message.
+expect_artefacts_failure() {
+  local what="$1" url="$2" build_version="$3" message="$4" log="$tmp/build-$1.log"
+  if docker buildx build --builder "$builder" --platform "$PLATFORM" --no-cache --progress plain \
+      --target artefacts --build-arg BUILD_VERSION="$build_version" --build-arg BUILD_ARCH=amd64 \
+      --build-arg ARTEFACTS_URL="$url" "$dir" > "$log" 2>&1; then
+    tail -20 "$log"; die "the build with $what did not fail"
+  fi
+  grep -F "fetch-artefacts: error: $message" "$log" || { tail -20 "$log"; die "the build with $what failed, but not with: $message"; }
+  echo "PASS the build with $what fails: $message"
+}
+
+# The release path: the tarball is served over http on 127.0.0.1, which
+# containers on Docker Desktop reach as host.docker.internal.
+build_release() {
+  local lock_sha actual port url deadline
+  lock_sha="$(sed -n 's/^sha256: //p' "$dir/artefacts.lock")"
+  actual="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
+  [ "$actual" = "$lock_sha" ] || die "$tarball (sha256 $actual) is not the one in artefacts.lock ($lock_sha)"
+  echo "tarball $tarball, sha256 $actual (as in artefacts.lock)"
+  mkdir -p "$tmp/srv/genuine" "$tmp/srv/tampered"
+  cp "$tarball" "$tmp/srv/genuine/$asset"
+  # Still a valid gzip and tar file: gzip reads the appended member as more data.
+  cp "$tarball" "$tmp/srv/tampered/$asset"
+  printf 'tampered\n' | gzip -n >> "$tmp/srv/tampered/$asset"
+  python3 -I -u -m http.server 0 --bind 127.0.0.1 --directory "$tmp/srv" > "$tmp/server.log" 2>&1 &
+  server_pid=$!
+  deadline=$((SECONDS + 10))
+  until port="$(sed -n 's/^Serving HTTP on 127.0.0.1 port \([0-9]*\).*/\1/p' "$tmp/server.log")" && [ -n "$port" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || { cat "$tmp/server.log"; die "the http server did not start"; }
+    sleep 0.2
+  done
+  url="http://host.docker.internal:$port"
+  create_builder
+  expect_artefacts_failure "a tampered tarball" "$url/tampered/$asset" "$version" "sha256 mismatch"
+  expect_artefacts_failure "BUILD_VERSION 0.0.0" "$url/genuine/$asset" 0.0.0 \
+    "artefacts.lock is for version $version, the app is 0.0.0"
+  image_built=1
+  docker buildx build --builder "$builder" --platform "$PLATFORM" --load --progress plain \
+    --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
+    --build-arg ARTEFACTS_URL="$url/genuine/$asset" -t "$image" "$dir" > "$tmp/build-genuine.log" 2>&1 \
+    || { tail -40 "$tmp/build-genuine.log"; die "the build from the release tarball failed"; }
+  grep -F "fetch-artefacts: sha256 $actual matches artefacts.lock" "$tmp/build-genuine.log"
+  echo "PASS the build downloads the release tarball and checks its sha256"
+}
+
+step "build $PLATFORM image from $dir (version $version, $mode)"
+case "$mode" in
+  quick) build_quick ;;
+  release) build_release ;;
+  full) build_full ;;
+esac
 docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' "$image"
 
 network="$run_id"
@@ -515,7 +607,7 @@ expect_stopped() {
   echo "PASS no service started"
 }
 
-if [ "$quick" = 1 ]; then
+if [ "$mode" != full ]; then
   step "quick run: default options (flac), raumfeld_host given; an invalid stream_format in parallel"
   started=$SECONDS
   start_app "$run_id-quick" '{"cast_name": "Smoke Test",
@@ -533,6 +625,19 @@ if [ "$quick" = 1 ]; then
     "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"]}'
   echo "services up and checked $((SECONDS - started))s after the start"
   expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of flac, mp3"
+  if [ "$mode" = release ]; then
+    step "release path: the image's programs are the tarball's"
+    expected_info="$(tar -xzOf "$tarball" artefacts/BUILD-INFO)"
+    [ "$(docker exec "$run_id-quick" cat /opt/BUILD-INFO)" = "$expected_info" ] || die "/opt/BUILD-INFO is not the tarball's"
+    echo "PASS /opt/BUILD-INFO is the tarball's"
+    for pair in "receiver sha256=/usr/local/bin/ytcast-lite" \
+        "adapter sha256=/opt/ytcast-adapter/raumfeld_adapter.py" "deno binary sha256=/usr/local/bin/deno"; do
+      want="$(sed -n "s/^${pair%%=*}: //p" <<<"$expected_info")"
+      got="$(docker exec "$run_id-quick" sha256sum "${pair#*=}" | cut -d' ' -f1)"
+      [ -n "$want" ] && [ "$got" = "$want" ] || die "${pair#*=}: sha256 $got, BUILD-INFO says $want"
+      echo "PASS ${pair#*=} has the ${pair%%=*} from BUILD-INFO ($got)"
+    done
+  fi
   step "quick smoke test passed ($((SECONDS - started))s after the start; the full run is still needed for review)"
   exit 0
 fi
