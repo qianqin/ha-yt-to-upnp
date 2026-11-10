@@ -12,6 +12,10 @@ Lossless stream to the speaker.
 - FLAC is 16-bit because a Raumfeld connects to a 24-bit FLAC stream but
   never plays it (stays `TRANSITIONING`); 16-bit FLAC and MP3 320 kbit/s
   both play (checked on a Raumfeld speaker).
+- The stream's sample rate is fixed at 48 kHz (44.1 kHz sources are
+  resampled): with the source's own rate (`format "*:16:2"`), MPD's httpd
+  output closes its clients whenever the rate changes between songs (MPD
+  0.23.12 and 0.24.18, FLAC and MP3 alike).
 - MPD's configuration is written to `/run/ytcast/mpd.conf` at each start
   from `/etc/ytcast/mpd.conf.template`; an invalid `stream_format` stops the
   app with one error naming it, like any other option.

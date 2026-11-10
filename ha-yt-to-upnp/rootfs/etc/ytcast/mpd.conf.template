@@ -25,7 +25,9 @@ audio_output {
     # The speaker needs one connection; a few more for reconnects, no more.
     max_clients "4"
     # 16-bit also for FLAC: the Raumfeld connects to a 24-bit FLAC stream but
-    # never plays it.
+    # never plays it. A fixed rate, not "*": when the output's sample rate
+    # changes (a 44.1 kHz song after a 48 kHz one), httpd closes every client,
+    # so the speaker would lose the stream between songs.
     format      "48000:16:2"
     # Keep the stream open between tracks and while paused (silence), so the
     # speaker neither drops it nor stalls during the adapter's start gate.

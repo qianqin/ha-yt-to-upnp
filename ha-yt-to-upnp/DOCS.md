@@ -60,7 +60,11 @@ set`). Fix the option and start the app again.
 
 MPD re-encodes the song (YouTube's Opus, or AAC if no Opus is offered; lossy
 already) into the stream the speaker fetches on port `8000`. Both formats are
-48 kHz, 16-bit stereo; 48 kHz is Opus's own rate, so Opus needs no resampling:
+48 kHz, 16-bit stereo. 48 kHz is Opus's own rate, so Opus needs no
+resampling; AAC (44.1 kHz) is resampled to 48 kHz. The rate is fixed on
+purpose: whenever the stream's sample rate changes, MPD's HTTP stream closes
+the speaker's connection, so following each song's own rate would cut the
+stream between a 44.1 kHz and a 48 kHz song.
 
 | `stream_format` | Stream | URL | MIME type | On the LAN |
 | --- | --- | --- | --- | --- |
