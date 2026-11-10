@@ -846,6 +846,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_seek_is_500_but_no_song_failure() {
+        let state = test_state();
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |_, _, _, _| async {
+            Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("no media via url".into())
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.stream_failure.lock().unwrap().is_none());
+
+        // The same failure at byte 0 is the song failing.
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, _| async {
+            Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("no media via url".into())
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.stream_failure.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn whole_song_request_starts_at_zero_and_is_200() {
         let state = test_state();
         let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, start| async move {

@@ -666,7 +666,13 @@ async fn solve_nsig(
     tracing::info!("[sabr] decoding nsig: n len={}", n_val.len());
     let n_clone = n_val.clone();
     let hash = session.player_hash.clone().unwrap_or_default();
-    match tokio::task::spawn_blocking(move || decode_nsig(&js, &n_clone, &hash)).await {
+    let permit = solver_permit().await?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_nsig(&js, &n_clone, &hash)
+    })
+    .await
+    {
         Ok(Ok(decoded)) => {
             tracing::info!("[sabr] nsig decoded: len {} -> {}", n_val.len(), decoded.len());
             Ok(replace_n_param(&server_url, &decoded))
@@ -880,6 +886,14 @@ struct StreamStats {
 }
 
 impl SabrState {
+    /// Use the page session's client version (WEB_REMIX) in clientInfo.
+    fn with_client_version(mut self, version: Option<String>) -> Self {
+        if let Some(version) = version {
+            self.client_version = version;
+        }
+        self
+    }
+
     fn new(
         server_url: String,
         audio_format: &AdaptiveFormat,
@@ -1579,10 +1593,33 @@ pub async fn stream_audio(
     yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     start_offset: u64,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
+    stream_audio_in(pins::global(), video_id, ctt, yt_session, start_offset).await
+}
+
+/// Forget every pinned format: the cast ended or changed hands, and a pin
+/// holds that cast's ctt.
+pub fn clear_pins() {
+    pins::global().clear();
+}
+
+/// [`stream_audio`] with an explicit pin store.
+async fn stream_audio_in(
+    store: &std::sync::Arc<pins::PinStore>,
+    video_id: &str,
+    ctt: Option<&str>,
+    yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
+    start_offset: u64,
+) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     let started = std::time::Instant::now();
-    if start_offset > 0 {
-        return stream_pinned(video_id, start_offset, started).await;
+    // A song this cast already streams via url (a seek, or MPD reopening it
+    // at byte 0) continues with the same file.
+    if let Some(pin) = ctt.and_then(|ctt| store.pinned(video_id, ctt)) {
+        return stream_pinned(store, pin, start_offset, started).await;
     }
+    if start_offset > 0 {
+        return Err(format!("seek to byte {start_offset}: no pinned format for this song and cast").into());
+    }
+    store.unpin(video_id);
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
@@ -1596,41 +1633,22 @@ pub async fn stream_audio(
 
     // 2. Premium formats via their URL, best first.
     let with_ctt = client_config.client_name == "WEB_REMIX";
-    let candidates = premium_plan(&player.formats, with_ctt, env_var);
-    if let (Some(ctt), Some(session), false) = (ctt, yt_session.as_ref(), candidates.is_empty()) {
+    if let (Some(ctt), Some(session)) = (ctt, yt_session.as_ref()) {
         let url_source = PremiumUrlSource::new(client.clone(), video_id, ctt, session.clone(), gvs_po_token.clone());
-        let source = pick_source(&candidates, |format| {
+        let song = SongMeta { title: player.title.clone(), duration_secs: player.duration_secs };
+        let premium = start_premium(store, &url_source, &player.formats, with_ctt, env_var, &song, |format| {
             tracing::debug!("[audio] {}", describe_variants(&player.formats, format.itag));
-            url_source.clone().stream(format, 0)
+            url_source.clone().stream(format, store.clone())
         })
         .await;
-        if let AudioSource::Premium(format, (rx, url)) = source {
+        if let Some((itag, info, rx)) = premium {
             tracing::info!(
                 "audio: itag {} (premium) via url, first bytes after {} ms",
-                format.itag, started.elapsed().as_millis(),
+                itag, started.elapsed().as_millis(),
             );
-            let info = SabrStreamInfo {
-                title: player.title.clone(),
-                duration_secs: player.duration_secs,
-                mime_type: format.mime_type.clone(),
-                content_length: format.content_length,
-                start_offset: 0,
-            };
-            pins::pin(pins::PinnedFormat {
-                video_id: video_id.to_owned(),
-                itag: format.itag,
-                url,
-                content_length: format.content_length.unwrap_or_default(),
-                last_modified: format.last_modified,
-                mime_type: format.mime_type.clone(),
-                title: player.title.clone(),
-                duration_secs: player.duration_secs,
-                source: url_source,
-            });
             return Ok((info, rx));
         }
     }
-    pins::unpin(video_id);
 
     // 3. SABR: the regular audio format + a video format for the discard trick.
     let audio_fmt = choose_audio_format(&player.formats)?.clone();
@@ -1727,6 +1745,54 @@ fn sabr_client_version(
     }
 }
 
+/// Title and duration for the stream info and the pin.
+struct SongMeta {
+    title: String,
+    duration_secs: u64,
+}
+
+/// The byte-0 Premium step after /player: no pin survives from before (a
+/// new start), the Premium formats from the setting are tried in order, and
+/// the one that delivers is pinned for this song and cast. `None` = SABR.
+async fn start_premium<'f, F, Fut>(
+    store: &pins::PinStore,
+    source: &PremiumUrlSource,
+    formats: &'f [AdaptiveFormat],
+    with_ctt: bool,
+    env: impl Fn(&str) -> Option<String>,
+    song: &SongMeta,
+    attempt: F,
+) -> Option<(i32, SabrStreamInfo, mpsc::Receiver<Bytes>)>
+where
+    F: FnMut(&'f AdaptiveFormat) -> Fut,
+    Fut: std::future::Future<Output = Result<(mpsc::Receiver<Bytes>, String), SabrError>>,
+{
+    store.unpin(&source.video_id);
+    let candidates = premium_plan(formats, with_ctt, env);
+    let AudioSource::Premium(format, (rx, url)) = pick_source(&candidates, attempt).await else {
+        return None;
+    };
+    store.pin(pins::PinnedFormat {
+        video_id: source.video_id.clone(),
+        itag: format.itag,
+        url,
+        content_length: format.content_length.unwrap_or_default(),
+        last_modified: format.last_modified,
+        mime_type: format.mime_type.clone(),
+        title: song.title.clone(),
+        duration_secs: song.duration_secs,
+        source: source.clone(),
+    });
+    let info = SabrStreamInfo {
+        title: song.title.clone(),
+        duration_secs: song.duration_secs,
+        mime_type: format.mime_type.clone(),
+        content_length: format.content_length,
+        start_offset: 0,
+    };
+    Some((format.itag, info, rx))
+}
+
 /// The outcome of trying the Premium formats.
 enum AudioSource<'f, T> {
     Premium(&'f AdaptiveFormat, T),
@@ -1758,14 +1824,14 @@ where
     AudioSource::Sabr
 }
 
-/// A seek: continue the pinned format from `start_offset`, nothing else.
+/// Continue the pinned format from `start_offset` (a seek, or byte 0 again):
+/// same file, no /player call, no solver run, never another format.
 async fn stream_pinned(
-    video_id: &str,
+    store: &std::sync::Arc<pins::PinStore>,
+    pin: pins::PinnedFormat,
     start_offset: u64,
     started: std::time::Instant,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
-    let pin = pins::pinned(video_id)
-        .ok_or_else(|| format!("seek to byte {start_offset}: no pinned format for this song"))?;
     if start_offset >= pin.content_length {
         return Err(RangeNotSatisfiable { content_length: pin.content_length }.into());
     }
@@ -1776,7 +1842,7 @@ async fn stream_pinned(
         chunk_size: URL_CHUNK_SIZE,
         itag: pin.itag,
         start_offset,
-        refresher: Box::new(PremiumUrlRefresher::for_pin(&pin)),
+        refresher: Box::new(PremiumUrlRefresher::for_pin(&pin, store.clone())),
         read_timeout: super::url_transport::READ_TIMEOUT,
     }
     .start()
@@ -1810,15 +1876,13 @@ impl std::fmt::Display for RangeNotSatisfiable {
 impl std::error::Error for RangeNotSatisfiable {}
 
 /// Which format a song streams with, so a seek (byte range request) gets
-/// the same file. In memory only, a few entries, expiring 5 minutes after
-/// last use (the download touches it at every range). Holds the cast's ctt
-/// for the URL refresh, like the stream itself; the URL is never logged.
+/// the same file. In memory only, at most 4 songs, each expiring 5 minutes
+/// after last use (the download touches it at every range), keyed by video
+/// and the cast's ctt, and cleared when the cast ends. A pin holds that ctt
+/// for the URL refresh, like the stream itself; its URL is never logged.
 mod pins {
-    use std::sync::Mutex;
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, Instant};
-
-    const TTL: Duration = Duration::from_secs(5 * 60);
-    const MAX_PINS: usize = 4;
 
     #[derive(Clone)]
     pub(super) struct PinnedFormat {
@@ -1833,53 +1897,103 @@ mod pins {
         pub source: super::PremiumUrlSource,
     }
 
-    static PINS: Mutex<Vec<(PinnedFormat, Instant)>> = Mutex::new(Vec::new());
-
-    fn prune(pins: &mut Vec<(PinnedFormat, Instant)>) {
-        pins.retain(|(_, touched)| touched.elapsed() < TTL);
-    }
-
-    pub(super) fn pin(format: PinnedFormat) {
-        let mut pins = PINS.lock().unwrap();
-        prune(&mut pins);
-        pins.retain(|(p, _)| p.video_id != format.video_id);
-        if pins.len() >= MAX_PINS {
-            pins.remove(0);
-        }
-        pins.push((format, Instant::now()));
-    }
-
-    pub(super) fn unpin(video_id: &str) {
-        PINS.lock().unwrap().retain(|(p, _)| p.video_id != video_id);
-    }
-
-    /// The pin for `video_id`, refreshing its expiry.
-    pub(super) fn pinned(video_id: &str) -> Option<PinnedFormat> {
-        let mut pins = PINS.lock().unwrap();
-        prune(&mut pins);
-        let (pin, touched) = pins.iter_mut().find(|(p, _)| p.video_id == video_id)?;
-        *touched = Instant::now();
-        Some(pin.clone())
-    }
-
-    /// Keep the pin alive while its song downloads.
-    pub(super) fn touch(video_id: &str) {
-        if let Some((_, touched)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
-            *touched = Instant::now();
+    impl PinnedFormat {
+        fn ctt(&self) -> &str {
+            &self.source.ctt
         }
     }
 
-    /// A refreshed URL for the pinned song.
-    pub(super) fn update_url(video_id: &str, url: &str) {
-        if let Some((pin, _)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
-            pin.url = url.to_owned();
+    pub(super) struct PinStore {
+        pins: Mutex<Vec<(PinnedFormat, Instant)>>,
+        max_pins: usize,
+        ttl: Duration,
+    }
+
+    impl Default for PinStore {
+        fn default() -> Self {
+            Self { pins: Mutex::new(Vec::new()), max_pins: 4, ttl: Duration::from_secs(5 * 60) }
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn age(video_id: &str, by: Duration) {
-        if let Some((_, touched)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
-            *touched -= by;
+    pub(super) fn global() -> &'static Arc<PinStore> {
+        static GLOBAL: LazyLock<Arc<PinStore>> = LazyLock::new(Arc::default);
+        &GLOBAL
+    }
+
+    impl PinStore {
+        fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(PinnedFormat, Instant)>> {
+            let mut pins = self.pins.lock().unwrap();
+            let ttl = self.ttl;
+            pins.retain(|(_, touched)| touched.elapsed() < ttl);
+            pins
+        }
+
+        /// Pin `format` for its song, replacing an older pin for it; when full,
+        /// the least recently used pin goes.
+        pub(super) fn pin(&self, format: PinnedFormat) {
+            let mut pins = self.locked();
+            pins.retain(|(p, _)| p.video_id != format.video_id);
+            if pins.len() >= self.max_pins {
+                if let Some(oldest) = pins.iter().enumerate().min_by_key(|(_, (_, t))| *t).map(|(i, _)| i) {
+                    pins.remove(oldest);
+                }
+            }
+            pins.push((format, Instant::now()));
+        }
+
+        pub(super) fn unpin(&self, video_id: &str) {
+            self.locked().retain(|(p, _)| p.video_id != video_id);
+        }
+
+        pub(super) fn clear(&self) {
+            self.pins.lock().unwrap().clear();
+        }
+
+        /// The pin for `video_id` made by the cast with `ctt`, refreshing its
+        /// expiry. A pin from another cast is dropped.
+        pub(super) fn pinned(&self, video_id: &str, ctt: &str) -> Option<PinnedFormat> {
+            let mut pins = self.locked();
+            let i = pins.iter().position(|(p, _)| p.video_id == video_id)?;
+            if pins[i].0.ctt() != ctt {
+                pins.remove(i);
+                return None;
+            }
+            pins[i].1 = Instant::now();
+            Some(pins[i].0.clone())
+        }
+
+        /// Keep the pin alive while its song downloads.
+        pub(super) fn touch(&self, video_id: &str, ctt: &str) {
+            if let Some((_, touched)) = self.locked().iter_mut().find(|(p, _)| p.video_id == video_id && p.ctt() == ctt) {
+                *touched = Instant::now();
+            }
+        }
+
+        /// A refreshed URL, stored only into the pin for the same song, cast
+        /// and file.
+        pub(super) fn update_url(&self, video_id: &str, ctt: &str, itag: i32, last_modified: u64, url: &str) {
+            if let Some((pin, _)) = self.locked().iter_mut().find(|(p, _)| {
+                p.video_id == video_id && p.ctt() == ctt && p.itag == itag && p.last_modified == last_modified
+            }) {
+                pin.url = url.to_owned();
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn age(&self, video_id: &str, by: Duration) {
+            if let Some((_, touched)) = self.pins.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
+                *touched -= by;
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn video_ids(&self) -> Vec<String> {
+            self.locked().iter().map(|(p, _)| p.video_id.clone()).collect()
+        }
+
+        #[cfg(test)]
+        pub(super) fn url_of(&self, video_id: &str) -> Option<String> {
+            self.locked().iter().find(|(p, _)| p.video_id == video_id).map(|(p, _)| p.url.clone())
         }
     }
 }
@@ -1887,9 +2001,15 @@ mod pins {
 /// Byte-range size for the url transport (the web player uses ~0.5-1 MiB).
 const URL_CHUNK_SIZE: u64 = 1024 * 1024;
 
-/// One solver run at a time for /stream requests: each runs QuickJS with
-/// up to 128-256 MiB, and parallel requests (seeks, probes) must not stack.
-static SOLVER_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// One solver run at a time (Premium URLs and SABR nsig): each runs QuickJS
+/// with up to 128-256 MiB, and parallel requests must not stack. The permit
+/// is held by the blocking solver task itself, so a cancelled request does
+/// not release it while QuickJS still runs.
+async fn solver_permit() -> Result<tokio::sync::OwnedSemaphorePermit, SabrError> {
+    static PERMITS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    Ok(PERMITS.clone().acquire_owned().await.map_err(|_| "solver closed")?)
+}
 
 /// Everything needed to (re)resolve a Premium format URL for one song: the
 /// cast's ctt stays here, in memory, only while the song (or its pin) lives.
@@ -1931,9 +2051,10 @@ impl PremiumUrlSource {
         let decipher = self.decipher.clone();
         let cver = self.cver.clone();
         let pot = self.po_token.clone();
-        let _permit = SOLVER_PERMITS.acquire().await.map_err(|_| "solver closed")?;
+        let permit = solver_permit().await?;
         let started = std::time::Instant::now();
         let url = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             ut::resolve_url(&source, decipher.as_ref(), pot.as_deref(), &cver, &ut::generate_cpn())
         })
         .await
@@ -1946,12 +2067,12 @@ impl PremiumUrlSource {
         Ok(url)
     }
 
-    /// Start streaming `format` from `start_offset`; `Err` before any byte.
-    /// Also returns the resolved URL, for the pin.
+    /// Start streaming `format` from byte 0; `Err` before any byte. Also
+    /// returns the resolved URL, for the pin.
     async fn stream(
         self,
         format: &AdaptiveFormat,
-        start_offset: u64,
+        store: std::sync::Arc<pins::PinStore>,
     ) -> Result<(mpsc::Receiver<Bytes>, String), SabrError> {
         let url = self.resolve(format).await?;
         let rx = super::url_transport::RangeFetch {
@@ -1960,12 +2081,13 @@ impl PremiumUrlSource {
             content_length: format.content_length,
             chunk_size: URL_CHUNK_SIZE,
             itag: format.itag,
-            start_offset,
+            start_offset: 0,
             refresher: Box::new(PremiumUrlRefresher {
                 itag: format.itag,
                 content_length: format.content_length.unwrap_or_default(),
                 last_modified: format.last_modified,
                 source: self,
+                store,
             }),
             read_timeout: super::url_transport::READ_TIMEOUT,
         }
@@ -1984,16 +2106,24 @@ struct PremiumUrlRefresher {
     itag: i32,
     content_length: u64,
     last_modified: u64,
+    store: std::sync::Arc<pins::PinStore>,
 }
 
 impl PremiumUrlRefresher {
-    fn for_pin(pin: &pins::PinnedFormat) -> Self {
+    fn for_pin(pin: &pins::PinnedFormat, store: std::sync::Arc<pins::PinStore>) -> Self {
         Self {
             source: pin.source.clone(),
             itag: pin.itag,
             content_length: pin.content_length,
             last_modified: pin.last_modified,
+            store,
         }
+    }
+
+    /// Store a refreshed URL in this song's pin.
+    fn record_url(&self, url: &str) {
+        let src = &self.source;
+        self.store.update_url(&src.video_id, &src.ctt, self.itag, self.last_modified, url);
     }
 
     /// The listed format that is the same file as the one streaming.
@@ -2014,13 +2144,13 @@ impl super::url_transport::UrlRefresher for PremiumUrlRefresher {
             let player = innertube_player(&src.http, &src.video_id, PlayerTarget::WebRemix(auth), None, None, None).await?;
             let format = self.same_file(&player.formats)?;
             let url = src.resolve(format).await?;
-            pins::update_url(&src.video_id, &url);
+            self.record_url(&url);
             Ok(url)
         })
     }
 
     fn keep_alive(&self) {
-        pins::touch(&self.source.video_id);
+        self.store.touch(&self.source.video_id, &self.source.ctt);
     }
 }
 
@@ -2045,11 +2175,9 @@ async fn sabr_loop(
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
-    );
+    )
+    .with_client_version(session_version);
     state.started = started;
-    if let Some(version) = session_version {
-        state.client_version = version;
-    }
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
     // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
@@ -2301,7 +2429,6 @@ mod tests {
         state.audio_end_segment = 0;
         state.header_map.clear();
     }
-
 
     fn test_state(server_url: &str) -> SabrState {
         let fmt = AdaptiveFormat {
@@ -2721,8 +2848,9 @@ mod tests {
         AdaptiveFormat { content_length: len, ..audio(itag, mime, bitrate) }
     }
 
-    /// Runs `pick_source` over 774, 141: itags in `ok` deliver, 774 fails with
-    /// `fail_774` (HTTP-like unless it is a decipher failure).
+    /// Runs `pick_source` over 774, 141: itags in `ok` deliver; the others
+    /// fail with no media, except 774 with a decipher failure when
+    /// `decipher_fails`.
     async fn chain(ok: &[i32], decipher_fails: bool) -> (Option<i32>, Vec<i32>) {
         let formats = premium_listing();
         let candidates = premium_candidates(&formats, AudioQuality::Max, true);
@@ -2846,7 +2974,7 @@ mod tests {
 
     #[test]
     fn refresh_accepts_only_the_same_file() {
-        let refresher = PremiumUrlRefresher { source: url_source("vid00000002"), itag: 774, content_length: 1000, last_modified: 1 };
+        let refresher = PremiumUrlRefresher { source: url_source("vid00000002"), itag: 774, content_length: 1000, last_modified: 1, store: Arc::default() };
         let same = listed(774, OPUS, 272_644, Some(1000));
         let longer = listed(774, OPUS, 272_644, Some(2000));
         let mut newer = listed(774, OPUS, 272_644, Some(1000));
@@ -2881,53 +3009,97 @@ mod tests {
         seen
     }
 
-    async fn pin_local(video_id: &str, status: u16, content: Vec<u8>) -> Arc<Mutex<Vec<String>>> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let len = content.len() as u64;
-        let seen = spawn_ranges(listener, content, status);
+    const CAST: &str = "CTT-OF-THIS-CAST";
+
+    fn pinned_format(video_id: &str, ctt: &str, url: String, content_length: u64) -> pins::PinnedFormat {
         let mut source = url_source(video_id);
         source.http = reqwest::Client::new();
-        pins::pin(pins::PinnedFormat {
+        source.ctt = ctt.to_owned();
+        pins::PinnedFormat {
             video_id: video_id.to_owned(),
             itag: 141,
-            url: format!("http://{addr}/videoplayback?itag=141&sig=PINNED-URL-SECRET"),
-            content_length: len,
+            url,
+            content_length,
             last_modified: 1,
             mime_type: AAC.to_owned(),
             title: "Song".to_owned(),
             duration_secs: 200,
             source,
-        });
-        seen
+        }
+    }
+
+    /// A fresh pin store with one pin for `video_id` (cast `CAST`) whose URL
+    /// points at a local server.
+    async fn pin_local(video_id: &str, status: u16, content: Vec<u8>) -> (Arc<pins::PinStore>, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let len = content.len() as u64;
+        let seen = spawn_ranges(listener, content, status);
+        let store = Arc::new(pins::PinStore::default());
+        let url = format!("http://{addr}/videoplayback?itag=141&sig=PINNED-URL-SECRET");
+        store.pin(pinned_format(video_id, CAST, url, len));
+        (store, seen)
+    }
+
+    async fn drain(mut rx: mpsc::Receiver<Bytes>) -> Vec<u8> {
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        got
+    }
+
+    fn song_content() -> Vec<u8> {
+        (0..3000u32).map(|i| (i % 251) as u8).collect()
     }
 
     #[tokio::test]
     async fn a_seek_continues_the_pinned_format_from_the_offset() {
         let logs = crate::storage::test_util::LogCapture::start();
-        let content: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
-        let seen = pin_local("seekvideo01", 200, content.clone()).await;
+        let (store, seen) = pin_local("seekvideo01", 200, song_content()).await;
 
-        let (info, mut rx) = stream_audio("seekvideo01", None, None, 1500).await.unwrap();
+        let (info, rx) = stream_audio_in(&store, "seekvideo01", Some(CAST), None, 1500).await.unwrap();
 
         assert_eq!((info.start_offset, info.content_length), (1500, Some(3000)));
         assert_eq!(info.mime_type, AAC);
-        let mut got = Vec::new();
-        while let Some(chunk) = rx.recv().await {
-            got.extend_from_slice(&chunk);
-        }
-        assert_eq!(got, content[1500..]);
+        assert_eq!(drain(rx).await, song_content()[1500..]);
         assert!(seen.lock().unwrap().iter().all(|l| l.contains("itag=141")));
         let logs = logs.text();
         assert!(logs.contains("audio: itag 141 (premium) via url from byte 1500"), "{logs}");
-        assert!(!logs.contains("PINNED-URL-SECRET"), "{logs}");
+        assert!(!logs.contains("PINNED-URL-SECRET") && !logs.contains(CAST), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn byte_zero_again_is_served_from_the_pin_without_a_player_call() {
+        // No session and no reachable /player: only the pin can serve this.
+        let (store, seen) = pin_local("seekvideo05", 200, song_content()).await;
+
+        let (info, rx) = within_2s("byte-0 reopen", stream_audio_in(&store, "seekvideo05", Some(CAST), None, 0))
+            .await
+            .unwrap();
+
+        assert_eq!((info.start_offset, info.mime_type.as_str()), (0, AAC));
+        assert_eq!(drain(rx).await, song_content());
+        assert!(seen.lock().unwrap()[0].contains("range=0-"));
+        assert_eq!(store.video_ids(), ["seekvideo05"]);
+    }
+
+    #[tokio::test]
+    async fn a_pin_of_another_cast_is_not_used_and_is_dropped() {
+        let (store, seen) = pin_local("seekvideo06", 200, song_content()).await;
+
+        let err = stream_audio_in(&store, "seekvideo06", Some("CTT-OF-ANOTHER-CAST"), None, 1500).await.unwrap_err();
+
+        assert!(err.to_string().contains("no pinned format"), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(store.video_ids().is_empty());
     }
 
     #[tokio::test]
     async fn a_failing_pinned_seek_is_an_error_not_another_format() {
-        let seen = pin_local("seekvideo02", 403, vec![0; 3000]).await;
+        let (store, seen) = pin_local("seekvideo02", 403, vec![0; 3000]).await;
 
-        let err = stream_audio("seekvideo02", Some("ctt"), None, 1500).await.unwrap_err();
+        let err = stream_audio_in(&store, "seekvideo02", Some(CAST), None, 1500).await.unwrap_err();
 
         assert!(err.to_string().contains("HTTP 403"), "{err}");
         let lines = seen.lock().unwrap().clone();
@@ -2938,9 +3110,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_seek_past_the_end_is_not_satisfiable() {
-        let seen = pin_local("seekvideo03", 200, vec![0; 3000]).await;
+        let (store, seen) = pin_local("seekvideo03", 200, vec![0; 3000]).await;
 
-        let err = stream_audio("seekvideo03", None, None, 3000).await.unwrap_err();
+        let err = stream_audio_in(&store, "seekvideo03", Some(CAST), None, 3000).await.unwrap_err();
 
         assert_eq!(err.downcast_ref::<RangeNotSatisfiable>().map(|e| e.content_length), Some(3000));
         assert!(seen.lock().unwrap().is_empty());
@@ -2948,18 +3120,249 @@ mod tests {
 
     #[tokio::test]
     async fn a_seek_without_a_pin_fails_without_a_player_call() {
-        let err = stream_audio("nopinvideo1", Some("ctt"), None, 1500).await.unwrap_err();
+        let store = Arc::new(pins::PinStore::default());
+        let err = stream_audio_in(&store, "nopinvideo1", Some(CAST), None, 1500).await.unwrap_err();
         assert!(err.to_string().contains("no pinned format"), "{err}");
     }
 
+    #[test]
+    fn using_a_pin_refreshes_its_expiry() {
+        let store = pins::PinStore::default();
+        store.pin(pinned_format("ttlvideo001", CAST, String::new(), 10));
+        store.age("ttlvideo001", std::time::Duration::from_secs(4 * 60));
+        assert!(store.pinned("ttlvideo001", CAST).is_some());
+        store.age("ttlvideo001", std::time::Duration::from_secs(4 * 60));
+        assert!(store.pinned("ttlvideo001", CAST).is_some(), "use restarted the 5 minutes");
+        store.age("ttlvideo001", std::time::Duration::from_secs(5 * 60 + 1));
+        assert!(store.pinned("ttlvideo001", CAST).is_none());
+    }
+
+    #[test]
+    fn the_download_keeps_its_pin_alive_at_every_range() {
+        use super::super::url_transport::UrlRefresher;
+        let store = Arc::new(pins::PinStore::default());
+        let pin = pinned_format("ttlvideo002", CAST, String::new(), 10);
+        store.pin(pin.clone());
+        let refresher = PremiumUrlRefresher::for_pin(&pin, store.clone());
+
+        store.age("ttlvideo002", std::time::Duration::from_secs(4 * 60));
+        refresher.keep_alive();
+        store.age("ttlvideo002", std::time::Duration::from_secs(4 * 60));
+
+        assert_eq!(store.video_ids(), ["ttlvideo002"]);
+    }
+
+    #[test]
+    fn at_most_four_pins_and_the_least_recently_used_goes() {
+        let store = pins::PinStore::default();
+        for id in ["lruvideo001", "lruvideo002", "lruvideo003", "lruvideo004"] {
+            store.pin(pinned_format(id, CAST, String::new(), 10));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The oldest pin was used last, so the second oldest goes.
+        assert!(store.pinned("lruvideo001", CAST).is_some());
+        store.pin(pinned_format("lruvideo005", CAST, String::new(), 10));
+
+        let mut ids = store.video_ids();
+        ids.sort();
+        assert_eq!(ids, ["lruvideo001", "lruvideo003", "lruvideo004", "lruvideo005"]);
+    }
+
+    #[test]
+    fn clear_forgets_every_pin() {
+        let store = pins::PinStore::default();
+        store.pin(pinned_format("clrvideo001", CAST, String::new(), 10));
+        store.clear();
+        assert!(store.video_ids().is_empty());
+    }
+
+    #[test]
+    fn a_refreshed_url_goes_into_the_matching_pin_only() {
+        let store = Arc::new(pins::PinStore::default());
+        let pin = pinned_format("urlvideo001", CAST, "old-url".to_owned(), 10);
+        store.pin(pin.clone());
+        let refresher = PremiumUrlRefresher::for_pin(&pin, store.clone());
+
+        refresher.record_url("new-url");
+        assert_eq!(store.url_of("urlvideo001").as_deref(), Some("new-url"));
+
+        store.update_url("urlvideo001", CAST, 141, 99, "other-file-url");
+        store.update_url("urlvideo001", "CTT-OF-ANOTHER-CAST", 141, 1, "other-cast-url");
+        store.update_url("urlvideo001", CAST, 774, 1, "other-itag-url");
+        assert_eq!(store.url_of("urlvideo001").as_deref(), Some("new-url"));
+    }
+
+    #[test]
+    fn a_pinned_refresher_checks_the_pinned_file() {
+        let store = Arc::new(pins::PinStore::default());
+        let mut pin = pinned_format("lenvideo001", CAST, String::new(), 123_456);
+        pin.last_modified = 77;
+        let refresher = PremiumUrlRefresher::for_pin(&pin, store);
+        assert_eq!((refresher.itag, refresher.content_length, refresher.last_modified), (141, 123_456, 77));
+    }
+
+    fn song() -> SongMeta {
+        SongMeta { title: "Song".to_owned(), duration_secs: 200 }
+    }
+
+    fn premium_listing_with_lengths() -> Vec<AdaptiveFormat> {
+        vec![
+            listed(774, OPUS, 272_644, Some(9_000_000)),
+            listed(141, AAC, 262_000, Some(7_000_000)),
+            listed(251, OPUS, 146_272, Some(4_000_000)),
+        ]
+    }
+
     #[tokio::test]
-    async fn pins_expire_after_five_idle_minutes() {
-        pin_local("seekvideo04", 200, vec![0; 10]).await;
-        assert!(pins::pinned("seekvideo04").is_some());
-        pins::age("seekvideo04", std::time::Duration::from_secs(4 * 60));
-        assert!(pins::pinned("seekvideo04").is_some(), "use refreshes the expiry");
-        pins::age("seekvideo04", std::time::Duration::from_secs(5 * 60 + 1));
-        assert!(pins::pinned("seekvideo04").is_none());
+    async fn premium_start_pins_the_format_that_delivers() {
+        let store = pins::PinStore::default();
+        let source = url_source("startvideo1");
+        let formats = premium_listing_with_lengths();
+
+        let started = start_premium(&store, &source, &formats, true, |_| None, &song(), |f| {
+            let itag = f.itag;
+            async move {
+                if itag == 774 {
+                    return Err::<(mpsc::Receiver<Bytes>, String), SabrError>("no media via url".into());
+                }
+                let (_tx, rx) = mpsc::channel(1);
+                Ok((rx, "resolved-141-url".to_owned()))
+            }
+        })
+        .await;
+
+        let (itag, info, _rx) = started.expect("141 delivers");
+        assert_eq!((itag, info.content_length, info.mime_type.as_str()), (141, Some(7_000_000), AAC));
+        let pin = store.pinned("startvideo1", "CTT-SECRET").unwrap();
+        assert_eq!((pin.itag, pin.url.as_str(), pin.content_length), (141, "resolved-141-url", 7_000_000));
+    }
+
+    #[tokio::test]
+    async fn premium_start_falling_back_to_sabr_leaves_no_pin() {
+        let store = pins::PinStore::default();
+        let source = url_source("startvideo2");
+        store.pin(pinned_format("startvideo2", "CTT-SECRET", "stale".to_owned(), 10));
+        let formats = premium_listing_with_lengths();
+        let mut tried = Vec::new();
+
+        let started = start_premium(&store, &source, &formats, true, |_| None, &song(), |f| {
+            tried.push(f.itag);
+            async { Err::<(mpsc::Receiver<Bytes>, String), SabrError>("no media via url".into()) }
+        })
+        .await;
+
+        assert!(started.is_none());
+        assert_eq!(tried, [774, 141]);
+        assert!(store.video_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn standard_quality_never_tries_a_premium_format() {
+        let store = pins::PinStore::default();
+        let source = url_source("startvideo3");
+        let formats = premium_listing_with_lengths();
+        let standard = |name: &str| (name == "YTCAST_AUDIO_QUALITY").then(|| "standard".to_owned());
+        let mut tried = 0;
+
+        let started = start_premium(&store, &source, &formats, true, standard, &song(), |_| {
+            tried += 1;
+            async { Err::<(mpsc::Receiver<Bytes>, String), SabrError>("unexpected".into()) }
+        })
+        .await;
+
+        assert!(started.is_none());
+        assert_eq!(tried, 0);
+    }
+
+    #[test]
+    fn sabr_state_takes_the_session_client_version() {
+        let state = test_state(GOOD_URL).with_client_version(Some("1.20261104.00.00".to_owned()));
+        assert_eq!(state.client_version, "1.20261104.00.00");
+        let state = test_state(GOOD_URL).with_client_version(None);
+        assert_eq!(state.client_version, WEB_REMIX_CLIENT.client_version);
+    }
+
+    /// Fails or answers per call; flags overlapping solver runs.
+    struct ProbingDecipher {
+        fail_first: std::sync::atomic::AtomicBool,
+        busy: std::sync::atomic::AtomicBool,
+        overlapped: std::sync::atomic::AtomicBool,
+    }
+
+    impl super::super::url_transport::Decipher for ProbingDecipher {
+        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.busy.swap(true, SeqCst) {
+                self.overlapped.store(true, SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.busy.store(false, SeqCst);
+            if self.fail_first.swap(false, SeqCst) {
+                return Err("jsc n error: no solutions".to_owned());
+            }
+            Ok((n.map(|_| "n".to_owned()), sig.map(|_| "s".to_owned())))
+        }
+    }
+
+    fn probing_source(decipher: Arc<ProbingDecipher>) -> PremiumUrlSource {
+        let mut source = url_source("permvideo01");
+        source.decipher = decipher;
+        source
+    }
+
+    fn trusted_format() -> AdaptiveFormat {
+        AdaptiveFormat {
+            url: Some("https://rr1---sn-abc.googlevideo.com/videoplayback?itag=774&n=abc".to_owned()),
+            ..listed(774, OPUS, 272_644, Some(1000))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_solver_run_releases_its_permit() {
+        let decipher = Arc::new(ProbingDecipher {
+            fail_first: true.into(),
+            busy: false.into(),
+            overlapped: false.into(),
+        });
+        let source = probing_source(decipher);
+
+        assert!(source.resolve(&trusted_format()).await.is_err());
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), source.resolve(&trusted_format())).await;
+
+        assert!(second.expect("permit leaked").is_ok());
+    }
+
+    #[tokio::test]
+    async fn solver_runs_never_overlap() {
+        let decipher = Arc::new(ProbingDecipher {
+            fail_first: false.into(),
+            busy: false.into(),
+            overlapped: false.into(),
+        });
+        let source = probing_source(decipher.clone());
+        let format = trusted_format();
+
+        let (a, b, c) = tokio::join!(source.resolve(&format), source.resolve(&format), source.resolve(&format));
+
+        assert!(a.is_ok() && b.is_ok() && c.is_ok());
+        assert!(!decipher.overlapped.load(std::sync::atomic::Ordering::SeqCst), "two solver runs overlapped");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_keeps_the_permit_until_the_solver_finishes() {
+        let decipher = Arc::new(ProbingDecipher {
+            fail_first: false.into(),
+            busy: false.into(),
+            overlapped: false.into(),
+        });
+        let source = probing_source(decipher.clone());
+        let format = trusted_format();
+
+        // Cancel one resolve while its solver runs, then start another.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(5), source.resolve(&format)).await;
+        source.resolve(&format).await.unwrap();
+
+        assert!(!decipher.overlapped.load(std::sync::atomic::Ordering::SeqCst), "permit released on cancel");
     }
 
     // -- format variants and client info ---------------------------------------------

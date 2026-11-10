@@ -62,11 +62,11 @@ Casting from a YouTube Music **Premium** account gives Premium audio; any other 
 | itag 251 | Opus ~160 kbit/s, 48 kHz (WebM), via SABR | everything else, and the fallback |
 
 How it works: the phone sends a per-video credential transfer token (ctt) with each cast. The `/player` call made with it lists 774 and 141 when the casting account has Premium. SABR does not serve these formats to this receiver. Instead the receiver fetches them through their own googlevideo URL, as the music.youtube.com web player does:
-- the format's `signatureCipher` signature is deciphered into `sp` and `n` is solved, both in one run of the embedded yt-dlp/ejs solver with its per-player-version cache (one solver run at a time);
+- the format's `signatureCipher` signature is deciphered into `sp` and `n` is solved, both in one run of the embedded yt-dlp/ejs solver with its per-player-version cache. The solver runs one at a time, for SABR's nsig too;
 - the PoToken (`pot`), a client playback nonce (`cpn`) and the client version (`cver`) are added;
 - the audio is fetched in sequential 1 MiB byte ranges with plain GET. If the first range gives no bytes, the web player's POST form (`ump=1`) is tried.
 
-Nothing is stored: the ctt lives in memory only while its song streams. No cookie or OAuth token is read or sent, and logs show URL hosts and parameter names, never values.
+Nothing is stored: the ctt lives in memory only, while its song streams and in that song's seek pin (see below), which is dropped when the cast ends or another cast takes over. No cookie or OAuth token is read or sent, and logs show URL hosts and parameter names, never values.
 
 **Fallback chain, per song:** 774 via URL, then 141 via URL, then 251 via SABR. Only Premium formats with a known length are tried. A format counts as failed if no audio byte arrives (HTTP error or 403, no media); a warning names what is tried next. A deciphering failure goes straight to 251 via SABR, since 141 would use the same base.js. Without a ctt (no cast token, IOS client), or when `/player` lists no Premium format, the song goes straight to 251 via SABR, as before.
 
@@ -78,7 +78,10 @@ Nothing is stored: the ctt lives in memory only while its song streams. No cooki
 - **Expiry:** if a range is refused (HTTP 401/403/410, e.g. an expired URL), the receiver makes one fresh `/player` call per song with the same ctt, deciphers again and resumes at the same byte. This happens only if the refreshed `/player` lists the same file (same itag, length and last-modified); otherwise the song ends.
 - **Broken ranges:** a range that breaks off or ends short is resumed at the exact byte, up to 2 times per range. The budget starts again for each range that completes.
 - **Seeking:** `/stream/<id>` answers with `Content-Length` and `Accept-Ranges: bytes`, so MPD can seek within the song. A seek from the phone (`seekcur`) makes MPD request `Range: bytes=N-`.
-  - The format chosen at byte 0 is pinned in memory for that song: same itag and resolved URL, no new `/player` call, no new solver run. The pin expires 5 minutes after last use, and the download touches it at every range.
+  - The format chosen at byte 0 is pinned in memory for that song and cast: same itag and resolved URL, no new `/player` call, no new solver run. That covers seeks and MPD reopening the song at byte 0.
+  - At most 4 songs are pinned; the least recently used pin goes first.
+  - A pin expires 5 minutes after last use, and the download touches it at every range.
+  - All pins are dropped when the cast ends (remote disconnect, release by the speaker) or a cast with another ctt starts. A pin is only used by the cast that made it.
   - The ranges then start at byte N and the answer is `206`. A start at or past the end gets `416` with `Content-Range: bytes */<length>`.
   - A seek never switches format: if the pinned format fails, or no pin exists, the request fails, and MPD reports the seek as failed.
   - SABR songs stay chunked and unseekable (no `Accept-Ranges`), as before; MPD does not send them range requests.

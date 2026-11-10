@@ -438,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     tracing::info!("[player] released by speaker (adapter) — ending cast session");
                     has_remote = false;
                     let end_msgs = release_cast(&mut playlist, &mut play_started);
-                    *dial_state.ctt.write().unwrap() = None;
+                    set_cast_ctt(&dial_state, None, sabr::stream::clear_pins);
                     dial_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
                     if let Err(e) = mpd_client.stop().await {
                         tracing::warn!("[player] release: mpd stop failed: {e}");
@@ -643,7 +643,7 @@ async fn handle_command(
             if ctt.is_some() {
                 tracing::info!("[player] ctt received from cast session");
             }
-            *dial_state.ctt.write().unwrap() = ctt;
+            set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
@@ -667,7 +667,7 @@ async fn handle_command(
             if ctt.is_some() {
                 tracing::info!("[player] ctt received from cast session");
             }
-            *dial_state.ctt.write().unwrap() = ctt;
+            set_cast_ctt(dial_state, ctt, sabr::stream::clear_pins);
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
@@ -847,6 +847,7 @@ async fn handle_command(
 
         PlayerCommand::RemoteDisconnected { .. } => {
             tracing::info!("[player] Remote disconnected, stopping playback");
+            set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
             *play_started = false;
             end_preroll(&mut playlist.preroll, "remote disconnected");
             mpd.stop().await?;
@@ -963,6 +964,19 @@ fn reported_playback(preroll_active: bool, status: &mpd::MpdStatus) -> (messages
 /// "Notifies senders that their Cast session with the receiver has ended").
 /// The empty `nowPlaying` before it clears the phone's mini-player, as
 /// yt-cast-receiver's player reset does.
+/// Store the cast's ctt for `/stream`. When it changes (another cast, or the
+/// cast ended), `clear_pins` drops the pinned formats, which hold the old ctt.
+/// Returns whether it changed.
+fn set_cast_ctt(dial_state: &dial::DialState, ctt: Option<String>, clear_pins: impl FnOnce()) -> bool {
+    let mut current = dial_state.ctt.write().unwrap();
+    let changed = *current != ctt;
+    if changed {
+        clear_pins();
+    }
+    *current = ctt;
+    changed
+}
+
 fn release_cast(playlist: &mut PlaylistState, play_started: &mut bool) -> Vec<messages::OutgoingMessage> {
     *play_started = false;
     *playlist = PlaylistState::default();
@@ -1430,6 +1444,43 @@ mod preroll_wiring_tests {
 
     fn arg<'a>(msg: &'a messages::OutgoingMessage, key: &str) -> Option<&'a str> {
         msg.args.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_changed_ctt_clears_the_pins() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let clears = std::cell::Cell::new(0);
+        let clear = || clears.set(clears.get() + 1);
+
+        assert!(set_cast_ctt(&dial_state, Some("ctt-a".into()), clear));
+        assert!(!set_cast_ctt(&dial_state, Some("ctt-a".into()), clear));
+        assert!(set_cast_ctt(&dial_state, Some("ctt-b".into()), clear));
+        assert!(set_cast_ctt(&dial_state, None, clear));
+        assert_eq!(clears.get(), 3);
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn remote_disconnect_forgets_the_cast_ctt() {
+        let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        let (state_tx, _state_rx) = tokio::sync::mpsc::channel(16);
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        *dial_state.ctt.write().unwrap() = Some("cast-ctt".into());
+        let mut playlist = PlaylistState::default();
+
+        handle_command(
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into() },
+            &mut mpd, &state_tx, &mut playlist, &mut false, &dial_state, None,
+        )
+        .await
+        .unwrap();
+        drop(mpd);
+        server.await.unwrap();
+
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
     }
 
     #[tokio::test]

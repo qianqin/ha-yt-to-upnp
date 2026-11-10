@@ -23,17 +23,26 @@ pub(crate) trait Decipher: Send + Sync {
     fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String>;
 }
 
+/// The solver entry point: [`crate::nsig::solve_cached_at`].
+pub(crate) type SolverFn = fn(
+    &str,
+    &[(crate::nsig::Challenge, &str)],
+    &str,
+    Option<std::path::PathBuf>,
+) -> Result<Vec<String>, String>;
+
 /// The real solver, on the anonymous page session's base.js, with the
 /// per-player-version cache (keyed by the player hash).
 pub(crate) struct PlayerJsDecipher {
     pub session: std::sync::Arc<crate::music_session::YtMusicSession>,
     pub disk_cache: Option<std::path::PathBuf>,
+    pub solver: SolverFn,
 }
 
 impl PlayerJsDecipher {
     pub(crate) fn new(session: std::sync::Arc<crate::music_session::YtMusicSession>) -> Self {
         let disk_cache = crate::nsig::cache_path(session.player_hash.as_deref().unwrap_or_default());
-        Self { session, disk_cache }
+        Self { session, disk_cache, solver: crate::nsig::solve_cached_at }
     }
 }
 
@@ -49,7 +58,7 @@ impl Decipher for PlayerJsDecipher {
         if requests.is_empty() {
             return Ok((None, None));
         }
-        let mut answers = crate::nsig::solve_cached_at(js, &requests, hash, self.disk_cache.clone())?.into_iter();
+        let mut answers = (self.solver)(js, &requests, hash, self.disk_cache.clone())?.into_iter();
         let n = n.map(|_| answers.next().unwrap_or_default());
         let sig = sig.map(|_| answers.next().unwrap_or_default());
         Ok((n, sig))
@@ -623,6 +632,7 @@ mod tests {
         let decipher = PlayerJsDecipher {
             session: Arc::new(session),
             disk_cache: Some(tmp.join("pp.js")),
+            solver: crate::nsig::solve_cached_at,
         };
 
         let (n, sig) = decipher.solve(Some("abc"), Some("sig")).unwrap();
@@ -633,9 +643,75 @@ mod tests {
         let mut other = crate::music_session::test_fixtures::session();
         other.player_js = Some(String::new());
         other.player_hash = Some("test-decipher-other-hash".to_owned());
-        let other = PlayerJsDecipher { session: Arc::new(other), disk_cache: None };
+        let other = PlayerJsDecipher { session: Arc::new(other), disk_cache: None, solver: crate::nsig::solve_cached_at };
         assert!(other.solve(Some("abc"), None).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Counts `solve` calls and records what each was asked.
+    #[derive(Default)]
+    struct CountingDecipher {
+        calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    impl Decipher for CountingDecipher {
+        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+            self.calls.lock().unwrap().push((n.map(str::to_owned), sig.map(str::to_owned)));
+            FakeDecipher.solve(n, sig)
+        }
+    }
+
+    #[test]
+    fn resolve_solves_n_and_sig_in_exactly_one_call() {
+        let decipher = CountingDecipher::default();
+        let source = format_source(None, Some(&cipher())).unwrap();
+
+        resolve_url(&source, &decipher, None, "v", "c").unwrap();
+
+        let calls = decipher.calls.lock().unwrap().clone();
+        assert_eq!(calls, [(Some(N_SECRET.to_owned()), Some(S_SECRET.to_owned()))]);
+    }
+
+    static SOLVER_CALLS: Mutex<Vec<(Vec<(crate::nsig::Challenge, String)>, String, Option<std::path::PathBuf>)>> =
+        Mutex::new(Vec::new());
+
+    fn recording_solver(
+        _js: &str,
+        requests: &[(crate::nsig::Challenge, &str)],
+        hash: &str,
+        disk_cache: Option<std::path::PathBuf>,
+    ) -> Result<Vec<String>, String> {
+        SOLVER_CALLS.lock().unwrap().push((
+            requests.iter().map(|(c, v)| (*c, (*v).to_owned())).collect(),
+            hash.to_owned(),
+            disk_cache,
+        ));
+        Ok(requests.iter().map(|(_, v)| format!("solved-{v}")).collect())
+    }
+
+    #[test]
+    fn player_js_decipher_makes_one_solver_run_keyed_by_the_player_hash() {
+        use crate::nsig::Challenge;
+        let mut session = crate::music_session::test_fixtures::session();
+        session.player_hash = Some("recording-hash-1".to_owned());
+        let mut decipher = PlayerJsDecipher::new(Arc::new(session));
+        assert_eq!(decipher.disk_cache, crate::nsig::cache_path("recording-hash-1"));
+        assert_ne!(decipher.disk_cache, crate::nsig::cache_path(""));
+        decipher.solver = recording_solver;
+
+        let answers = decipher.solve(Some("nn"), Some("ss")).unwrap();
+
+        assert_eq!(answers, (Some("solved-nn".to_owned()), Some("solved-ss".to_owned())));
+        let calls: Vec<_> = SOLVER_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, hash, _)| hash == "recording-hash-1")
+            .cloned()
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, [(Challenge::N, "nn".to_owned()), (Challenge::Sig, "ss".to_owned())]);
+        assert_eq!(calls[0].2, crate::nsig::cache_path("recording-hash-1"));
     }
 
     // -- fake googlevideo ---------------------------------------------------------
@@ -672,81 +748,87 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
-                let mut buf = vec![0u8; 8192];
-                let mut req = Vec::new();
-                loop {
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    req.extend_from_slice(&buf[..n]);
-                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&req[..pos]).to_ascii_lowercase();
-                        let len: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        if req.len() >= pos + 4 + len {
+                let content = content.clone();
+                let record = record.clone();
+                // Each connection on its own task: a stalled one must not
+                // block the next request.
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut req = Vec::new();
+                    loop {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
                             break;
                         }
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&req[..pos]).to_ascii_lowercase();
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if req.len() >= pos + 4 + len {
+                                break;
+                            }
+                        }
                     }
-                }
-                let text = String::from_utf8_lossy(&req).into_owned();
-                let line = text.lines().next().unwrap_or("").to_owned();
-                let index = {
-                    let mut seen = record.lock().unwrap();
-                    seen.push(line.clone());
-                    seen.len() - 1
-                };
-                let is_post = line.starts_with("POST");
-                let expired = behaviour.expire_from.is_some_and(|from| index >= from) && !line.contains("fresh=1");
-                let status = if expired {
-                    403
-                } else if is_post {
-                    status_or_ok(behaviour.post_status)
-                } else {
-                    status_or_ok(behaviour.get_status)
-                };
-                let path = line.split(' ').nth(1).unwrap_or("");
-                let pairs: Vec<(String, String)> =
-                    serde_urlencoded::from_str(path.split_once('?').map_or("", |(_, q)| q)).unwrap_or_default();
-                let range = pairs.iter().find(|(k, _)| k == "range").map(|(_, v)| v.clone()).unwrap_or_default();
-                let (a, b) = range.split_once('-').unwrap_or(("0", "0"));
-                let (a, b): (usize, usize) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
-                let mut slice = content.get(a..=b.min(content.len().saturating_sub(1))).unwrap_or(&[]).to_vec();
-                if let Some((at, keep)) = behaviour.short {
-                    if at == index {
-                        slice.truncate(keep);
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let line = text.lines().next().unwrap_or("").to_owned();
+                    let index = {
+                        let mut seen = record.lock().unwrap();
+                        seen.push(line.clone());
+                        seen.len() - 1
+                    };
+                    let is_post = line.starts_with("POST");
+                    let expired = behaviour.expire_from.is_some_and(|from| index >= from) && !line.contains("fresh=1");
+                    let status = if expired {
+                        403
+                    } else if is_post {
+                        status_or_ok(behaviour.post_status)
+                    } else {
+                        status_or_ok(behaviour.get_status)
+                    };
+                    let path = line.split(' ').nth(1).unwrap_or("");
+                    let pairs: Vec<(String, String)> =
+                        serde_urlencoded::from_str(path.split_once('?').map_or("", |(_, q)| q)).unwrap_or_default();
+                    let range = pairs.iter().find(|(k, _)| k == "range").map(|(_, v)| v.clone()).unwrap_or_default();
+                    let (a, b) = range.split_once('-').unwrap_or(("0", "0"));
+                    let (a, b): (usize, usize) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
+                    let mut slice = content.get(a..=b.min(content.len().saturating_sub(1))).unwrap_or(&[]).to_vec();
+                    if let Some((at, keep)) = behaviour.short {
+                        if at == index {
+                            slice.truncate(keep);
+                        }
                     }
-                }
-                let (ctype, body) = if is_post {
-                    let mut out = Vec::new();
-                    ump::write_varint(&mut out, ump::MEDIA_HEADER);
-                    ump::write_varint(&mut out, 0);
-                    ump::write_varint(&mut out, ump::MEDIA);
-                    ump::write_varint(&mut out, slice.len() as u32 + 1);
-                    out.push(0);
-                    out.extend_from_slice(&slice);
-                    ("application/vnd.yt-ump", out)
-                } else {
-                    ("audio/mp4", slice)
-                };
-                let body = if status == 200 { body } else { Vec::new() };
-                let head = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let send = match (behaviour.truncate, behaviour.stall_after) {
-                    (Some((at, keep)), _) if at == index => keep.min(body.len()),
-                    (_, Some(keep)) => keep.min(body.len()),
-                    _ => body.len(),
-                };
-                let _ = sock.write_all(&body[..send]).await;
-                if behaviour.stall_after.is_some() && send < body.len() {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
+                    let (ctype, body) = if is_post {
+                        let mut out = Vec::new();
+                        ump::write_varint(&mut out, ump::MEDIA_HEADER);
+                        ump::write_varint(&mut out, 0);
+                        ump::write_varint(&mut out, ump::MEDIA);
+                        ump::write_varint(&mut out, slice.len() as u32 + 1);
+                        out.push(0);
+                        out.extend_from_slice(&slice);
+                        ("application/vnd.yt-ump", out)
+                    } else {
+                        ("audio/mp4", slice)
+                    };
+                    let body = if status == 200 { body } else { Vec::new() };
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let send = match (behaviour.truncate, behaviour.stall_after) {
+                        (Some((at, keep)), _) if at == index => keep.min(body.len()),
+                        (_, Some(keep)) => keep.min(body.len()),
+                        _ => body.len(),
+                    };
+                    let _ = sock.write_all(&body[..send]).await;
+                    if behaviour.stall_after.is_some() && send < body.len() {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
             }
         });
         seen
@@ -886,19 +968,26 @@ mod tests {
     async fn the_break_budget_is_per_range_not_per_song() {
         // Three separate ranges each break once; each is resumed.
         let data = content(4000);
-        let (mut fetch, seen) = fetcher(OK, &data, Some(4000)).await;
-        fetch.chunk_size = 1000;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Requests 1, 3 and 5 break off after 100 bytes.
-        let seen2 = spawn_multi_truncate(listener, data.clone(), vec![1, 3, 5]);
-        fetch.url = format!("http://{addr}/videoplayback?itag=141");
-        let _ = seen;
+        let seen = spawn_multi_truncate(listener, data.clone(), vec![1, 3, 5]);
+        let url = format!("http://{addr}/videoplayback?itag=141");
+        let fetch = RangeFetch {
+            http: reqwest::Client::new(),
+            url: url.clone(),
+            content_length: Some(4000),
+            chunk_size: 1000,
+            itag: 141,
+            start_offset: 0,
+            refresher: Box::new(SameUrl { url, calls: Arc::default() }),
+            read_timeout: std::time::Duration::from_millis(500),
+        };
 
         let rx = fetch.start().await.unwrap();
 
         assert_eq!(collect(rx).await, data);
-        assert_eq!(seen2.lock().unwrap().len(), 7);
+        assert_eq!(seen.lock().unwrap().len(), 7);
     }
 
     /// Like `spawn_videoplayback` with OK behaviour, but the listed requests
@@ -1032,7 +1121,7 @@ mod tests {
     async fn a_stalled_server_times_out() {
         let logs = crate::storage::test_util::LogCapture::start();
         let data = content(3000);
-        let (fetch, _seen) = fetcher(Behaviour { stall_after: Some(200), ..OK }, &data, Some(3000)).await;
+        let (fetch, seen) = fetcher(Behaviour { stall_after: Some(200), ..OK }, &data, Some(3000)).await;
 
         let started = std::time::Instant::now();
         let rx = fetch.start().await.unwrap();
@@ -1045,6 +1134,43 @@ mod tests {
         let logs = logs.text();
         assert!(logs.contains("read timed out"), "{logs}");
         assert!(logs.contains("failed after"), "{logs}");
+        // The first request, then RANGE_RETRIES resumes of the same range.
+        assert_eq!(ranges(&seen), ["GET 0-999", "GET 200-1199", "GET 400-1399"]);
+    }
+
+    /// Drops the consumer when the next range is about to be opened.
+    struct DropAtBoundary {
+        rx: Arc<Mutex<Option<mpsc::Receiver<Bytes>>>>,
+    }
+
+    impl UrlRefresher for DropAtBoundary {
+        fn refresh(&mut self) -> RefreshFuture<'_> {
+            Box::pin(async { Err("not expected".into()) })
+        }
+        fn keep_alive(&self) {
+            self.rx.lock().unwrap().take();
+        }
+    }
+
+    #[tokio::test]
+    async fn no_new_range_is_opened_after_a_drop_at_a_range_boundary() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(3000);
+        let (mut fetch, seen) = fetcher(OK, &data, Some(3000)).await;
+        let slot: Arc<Mutex<Option<mpsc::Receiver<Bytes>>>> = Arc::default();
+        fetch.refresher = Box::new(DropAtBoundary { rx: slot.clone() });
+
+        let rx = fetch.start().await.unwrap();
+        *slot.lock().unwrap() = Some(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !logs.text().contains("stopped by the player") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("download did not stop");
+
+        assert_eq!(ranges(&seen), ["GET 0-999"]);
     }
 
     #[tokio::test]
