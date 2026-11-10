@@ -1,8 +1,10 @@
 # DevOps
 
-The runtime deployment target is a Home Assistant **local app**, built on the
-release machine and copied to the Home Assistant host; see
-[Home Assistant app](#home-assistant-app) below. No image registry is used.
+The runtime deployment target is a Home Assistant **app installed from this
+repository**: Home Assistant builds a thin image from `ha-yt-to-upnp/` on its
+host, with programs prebuilt on the release machine and published as a GitHub
+release asset; see [Home Assistant app](#home-assistant-app) below. No image
+registry, no GitHub Actions, no compile on the Home Assistant host.
 
 There is no hosted pipeline. Every check runs locally: natively on macOS
 (Apple Silicon) and in a temporary Linux container for platform coverage.
@@ -27,7 +29,9 @@ One-time setup on the release machine:
 
 ## Release
 
-A release is a push to `master`. Commit everything (clean working tree), then
+A release is a push to `master`. A new version of the Home Assistant app
+also needs its GitHub release, published before that push: see
+[App release](#app-release). Commit everything (clean working tree), then
 run from the repository root:
 
 ```sh
@@ -152,17 +156,33 @@ plus cleanup).
 The push to `master` succeeded, `git ls-remote origin master` matches the
 local commit, and `scripts/release-check.sh` exited 0 on that commit (macOS
 build and tests, Linux container build and tests, `cargo audit`, adapter
-tests). There is no pipeline to watch.
+tests). There is no pipeline to watch. For a new app version also: the
+GitHub release `v<version>` is published, its asset has the sha256 in
+`artefacts.lock` at that commit, and Home Assistant offers the update (see
+[App release](#app-release), Check).
 
 ## Home Assistant app
 
 The app folder `ha-yt-to-upnp/` (Home Assistant app layout: `config.yaml`,
-`Dockerfile`, s6-overlay services under `rootfs/`, `DOCS.md`) is completed by
-prebuilt artefacts and installed as a **local app**: the Supervisor builds its
-image on the Home Assistant host from the copied folder. That build only
-installs Debian packages (`mpd`, `python3`) on the pinned base image and copies
-files; nothing is compiled or fetched from GitHub on the host. There are no
-GitHub Actions and no image registry.
+`Dockerfile`, s6-overlay services under `rootfs/`, `DOCS.md`) is what Home
+Assistant installs once the repository is added (`repository.yaml` at the
+root names it). The Supervisor builds the image on the Home Assistant host
+from that folder. The build compiles nothing: on the pinned base image it
+installs Debian packages (`mpd`, `python3`) with apt and copies the prebuilt
+programs, which its first stage (`fetch-artefacts.sh`) takes from:
+
+- `artefacts/` in the build context, if there is one: a folder assembled with
+  `scripts/build-ha-app.sh` (local app, smoke tests);
+- otherwise the release tarball named in `ha-yt-to-upnp/artefacts.lock`
+  (`version`, `url`, `sha256`), downloaded with `curl` over https only
+  (redirects too) from
+  `https://github.com/<owner>/<repo>/releases/download/v<version>/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz`.
+  It fails closed: a sha256 other than the lock's, a lock for another version
+  than the `BUILD_VERSION` the Supervisor passes, a failed download or a
+  missing entry stops the build. No secret is needed (public release).
+
+`ha-yt-to-upnp/artefacts/` is gitignored, so the repository's app folder never
+holds programs. There are no GitHub Actions and no image registry.
 
 Target: Home Assistant OS on x86-64 (`amd64`), host networking (SSDP/DIAL
 multicast and the Raumfeld's UPnP).
@@ -176,6 +196,7 @@ refuses uncommitted or untracked changes there and takes the folder from
 ```sh
 scripts/build-ha-app.sh                      # receiver and adapter from HEAD
 scripts/build-ha-app.sh --receiver-ref <ref> --adapter-ref <ref> --out <dir>
+scripts/build-ha-app.sh --release            # also the release tarball and artefacts.lock
 ```
 
 By default the receiver and the adapter are built from `HEAD`, the same commit
@@ -183,8 +204,8 @@ as the app folder, so the run scripts and the programs they start (and the
 environment they pass, e.g. `RAUMFELD_HOST`, `ADAPTER_STATE_DIR`) are in step.
 Only uncommitted changes in `ha-yt-to-upnp/` are refused; the receiver and the
 adapter are taken from the commit too (`git archive`, `git show`), so commit
-them before building. Pass other refs only to rebuild an older release (see
-Rollback).
+them before building. Pass other refs only to rebuild an older version
+locally; `--release` refuses them.
 
 The result is `dist/ha-yt-to-upnp/` (gitignored): the app folder files plus
 `artefacts/`:
@@ -202,6 +223,18 @@ an `--out` folder that is not a previous build, and removes its temp dir,
 containers, the target volume and every image it had to pull. The amd64 Rust
 build runs emulated on Apple Silicon and takes a while.
 
+With `--release` it also packs `artefacts/` (as `artefacts/` at the tarball's
+top) into `dist/release/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz`, for
+the `version` in `ha-yt-to-upnp/config.yaml` at `HEAD`
+(`scripts/pack_artefacts.py`, tested by `python3 -I
+scripts/pack_artefacts_test.py`). The tarball is reproducible: sorted
+entries, every mtime the commit's time, owner `0:0` without names, modes
+`0755`/`0644`, a gzip header without time or name; links must stay inside
+the folder. It then writes `ha-yt-to-upnp/artefacts.lock` (version, asset
+URL, sha256; also into the assembled folder). Owner and repository of the
+URL come from `git remote get-url origin` (a GitHub URL without credentials;
+anything else stops the script before the build).
+
 To move to another Rust release, update `RUST_CHANNEL` and `RUST_IMAGE`
 (`docker buildx imagetools inspect rust:<channel>-bookworm` shows the index
 digest) together with the receiver's `rust-toolchain.toml`.
@@ -211,11 +244,13 @@ digest) together with the receiver's `rust-toolchain.toml`.
 ```sh
 scripts/smoke-ha-app.sh                      # tests dist/ha-yt-to-upnp
 scripts/smoke-ha-app.sh --quick              # seconds, before a live test
+scripts/smoke-ha-app.sh --release-path       # Home Assistant's build from the repository
 scripts/smoke-ha-app.sh --clean-cache        # removes --quick's cached base image
 ```
 
 The full run is the one reviews and releases need; `--quick` (below) is a
-check before a live test.
+check before a live test; `--release-path` (below) is needed for a release,
+after the full run.
 
 It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
@@ -288,11 +323,33 @@ bgutil. The cached base image is the one thing a quick run leaves behind;
 containerd image store, removing an image does not remove the untagged
 images the classic builder made for each step, so both modes remove them
 too (child first, stopping at a tagged image or one that is still used).
+A quick run builds only the `Dockerfile`'s last stage, with its
+`COPY --from=artefacts /artefacts/...` lines turned into copies from
+`artefacts/` in the build context; the full run builds both stages, so the
+artefacts stage takes the folder's `artefacts/`.
+
+**`--release-path [TARBALL]`** tests the build Home Assistant makes from the
+repository. It builds `ha-yt-to-upnp/` as committed (it refuses changed,
+untracked or ignored files there, such as an `artefacts/` folder) with
+BuildKit in a builder of its own, so the artefacts stage downloads the
+release tarball (default `dist/release/<asset of config.yaml's version>`) and
+checks it against `artefacts.lock`; the tarball must be the lock's. It serves
+the tarball with `python3 -m http.server` on `127.0.0.1` of this machine,
+which the build reaches as `host.docker.internal` (Docker Desktop) through
+the build argument `ARTEFACTS_URL`: set only by this test, it replaces the
+lock's URL (and allows plain http), never its sha256. First, building the
+artefacts stage alone must fail with `sha256 mismatch` for a tampered copy of
+the tarball (a gzip member appended: still a valid tarball) and with a
+version error for `BUILD_VERSION` `0.0.0`. Then the full image is built from
+the genuine tarball and gets the quick run's checks, plus: `/opt/BUILD-INFO`
+is the tarball's, and the receiver, the adapter and `deno` in the image have
+the SHA-256 that `BUILD-INFO` records. The server, builder (with its cache),
+containers, network and image are removed at the end.
 
 Run `shellcheck` on the scripts if it is installed:
 
 ```sh
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh ha-yt-to-upnp/fetch-artefacts.sh
 shellcheck -x -s bash ha-yt-to-upnp/rootfs/usr/lib/ytcast/common.sh \
   ha-yt-to-upnp/rootfs/etc/s6-overlay/scripts/*.sh \
   ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/run ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/*/finish
@@ -327,11 +384,140 @@ its own environment. They run in the background; state and logs are in
 directory. Needs `mpd`, `deno` and `jq` (Homebrew) and `cargo` on `PATH`. The
 Mac's firewall must let the phone reach port 8008 and the speaker port 8000.
 
-### Copy to the Home Assistant host
+### Install from the repository
 
-Local apps live in `/local_apps` on the Home Assistant host (current Home
-Assistant OS; not `/addons`). Over SSH (the Terminal & SSH app maps
-`/local_apps`); `<ha-host>` is the Home Assistant host:
+1. Stop any other instance of the receiver on the LAN (only one device may
+   use the cast name).
+2. Settings → Apps → **Repositories**: add
+   `https://github.com/qianqin/ha-yt-to-upnp` (the URL in `repository.yaml`).
+3. The app **YouTube to UPnP** appears in the app store. Install it: the
+   Supervisor builds the image on the host (a few minutes: Debian packages
+   and the release tarball's download, nothing compiled).
+4. Configuration tab: set `cast_name`, `raumfeld_room_udn`, and
+   `raumfeld_speaker_udn` or `raumfeld_host` (or both; see `DOCS.md`), save,
+   start. Check the log for the four `Starting ...` lines.
+
+Updates: once `master` has a higher `version` in `ha-yt-to-upnp/config.yaml`,
+Home Assistant offers **Update** (Settings → Apps → App store → ⋮ → **Check
+for updates** looks right away); it rebuilds the image the same way and
+restarts the app, keeping the options and `/data`.
+
+### App release
+
+Each app version has one GitHub release `v<version>` with one asset,
+`ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz`. It is published **before**
+the push to `master`: Home Assistant reads `master`, so a version pushed
+first would be offered with no tarball to download (its build would fail
+closed until the release exists). A published release is never replaced:
+`scripts/publish-release.sh` stops if the tag or the release exists; a fix is
+a new version.
+
+From the repository root, on the commit that is to become `master` (fast
+forward):
+
+1. Bump `version` in `ha-yt-to-upnp/config.yaml`, add a `## <version>` section
+   to `ha-yt-to-upnp/CHANGELOG.md` (it becomes the release notes), commit.
+2. `scripts/release-check.sh` must exit 0 (see [Release](#release)).
+3. Build the folder, the tarball and the lock (the Rust build takes a while):
+
+   ```sh
+   scripts/build-ha-app.sh --release
+   ```
+
+4. Commit the lock:
+
+   ```sh
+   git add ha-yt-to-upnp/artefacts.lock
+   git commit -m "build(ha-app): artefacts.lock for <version>"
+   ```
+
+5. Smoke tests, both must pass:
+
+   ```sh
+   scripts/smoke-ha-app.sh                  # dist/ha-yt-to-upnp, local artefacts
+   scripts/smoke-ha-app.sh --release-path   # ha-yt-to-upnp/ as committed, tarball download
+   ```
+
+6. Publish the release (needs `gh auth login` with write access to the
+   repository; no other secret):
+
+   ```sh
+   scripts/publish-release.sh --dry-run     # local checks, prints the commands
+   scripts/publish-release.sh
+   ```
+
+   It checks that the tree is clean, that `artefacts.lock` at `HEAD` is for
+   the version in `config.yaml`, names the asset URL of the `origin`
+   repository and has the sha256 of `dist/release/<asset>`, and that the
+   CHANGELOG has the version's section. Then it pushes the tag `v<version>`
+   (`HEAD`, no `--force`), creates a **draft** release from it with the
+   tarball and the CHANGELOG section, downloads the draft's asset and checks
+   its sha256, publishes the draft (`--latest`), and downloads the asset from
+   its public URL (the lock's) and checks it again. By hand, the same is:
+
+   ```sh
+   git ls-remote --exit-code --tags origin refs/tags/v<version>  # must find nothing (exit 2)
+   git push origin HEAD:refs/tags/v<version>
+   gh release create v<version> dist/release/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz \
+     --verify-tag --draft --title <version> --notes-file <CHANGELOG section>
+   gh release download v<version> --pattern '*.tar.gz' --dir <tmp>   # shasum -a 256: the lock's
+   gh release edit v<version> --draft=false --latest
+   curl -fsSL --proto '=https' -o <tmp>/asset "$(sed -n 's/^url: //p' ha-yt-to-upnp/artefacts.lock)"
+   shasum -a 256 <tmp>/asset                                         # the lock's sha256
+   ```
+
+   If it stops after pushing the tag but before publishing, delete the draft
+   and the tag (`gh release delete v<version> --cleanup-tag`) only if the
+   release was never published; otherwise bump the version.
+
+7. Push `master`:
+
+   ```sh
+   git push origin master
+   ```
+
+#### Check
+
+```sh
+git ls-remote origin master                 # the local HEAD
+gh release view v<version>                  # published, one asset
+```
+
+The publish script has already compared the public asset with the lock. In
+Home Assistant: App store → ⋮ → **Check for updates**, then **Update** on the
+app's page; the log shows `fetch-artefacts: sha256 ... matches
+artefacts.lock` in the build output (Supervisor log) and the four
+`Starting ...` lines.
+
+#### Rollback
+
+Home Assistant only offers versions upward, so a rollback is a new version
+above the broken one; the broken release stays published (installs may use
+it, and its lock commit names it).
+
+- Usual way: revert the broken commits (`git revert`), bump `version`, add a
+  CHANGELOG entry naming the version it returns to, and do the whole
+  [App release](#app-release) from that commit: the programs are rebuilt from
+  the reverted source.
+- Without a rebuild, when the last good release's programs fit the reverted
+  app folder: revert, bump `version`, and write `artefacts.lock` by hand as
+  the last good one (`git show v<good>:ha-yt-to-upnp/artefacts.lock`) with
+  only `version:` changed to the new version (url and sha256 stay those of
+  `v<good>`). No new GitHub release then: smoke-test with
+  `gh release download v<good> --pattern '*.tar.gz' --dir <tmp>` and
+  `scripts/smoke-ha-app.sh --release-path <tmp>/<asset>` (a folder built with
+  the last good `BUILD-INFO`'s refs serves the full run), and push `master`.
+  `scripts/publish-release.sh` is not used (its URL check refuses this lock).
+
+In Home Assistant, **Update** to the new version.
+
+### Local app (without the repository)
+
+A folder assembled with `scripts/build-ha-app.sh` carries `artefacts/` and
+builds without any download, as a **local app**. Local apps live in
+`/local_apps` on the Home Assistant host (current Home Assistant OS; not
+`/addons`). Over SSH (the Terminal & SSH app maps `/local_apps`);
+`<ha-host>` is the Home Assistant host:
 
 ```sh
 tar -C dist -cf - ha-yt-to-upnp | ssh root@<ha-host> \
@@ -339,34 +525,12 @@ tar -C dist -cf - ha-yt-to-upnp | ssh root@<ha-host> \
 ```
 
 The Samba share app works as well: replace the folder
-`local_apps/ha-yt-to-upnp` as a whole.
-
-### Install
-
-1. Stop any other instance of the receiver on the LAN (only one device may
-   use the cast name).
-2. Settings → Apps → App store → ⋮ → **Check for updates**. The app appears
-   under **Local apps** (slug `local_yt_to_upnp`).
-3. Install it. The Supervisor builds the image on the host (a few minutes:
-   Debian packages).
-4. Configuration tab: set `cast_name`, `raumfeld_room_udn`, and
-   `raumfeld_speaker_udn` or `raumfeld_host` (or both; see `DOCS.md`), save,
-   start. Check the log for the four `Starting ...` lines.
-
-### Update
-
-1. Bump `version` in `ha-yt-to-upnp/config.yaml`, add a `CHANGELOG.md` entry,
-   commit.
-2. Build the folder and run the smoke test (above).
-3. Copy the folder to the host (above).
-4. App store → ⋮ → **Check for updates**; the app offers **Update**, which
-   rebuilds the image and restarts the app. Options and `/data` are kept.
-   Without a version bump, use **Rebuild** on the app's page instead.
-
-Rollback: revert the broken change in a new commit (`git revert`) that also
-bumps `version` above the broken one and adds a `CHANGELOG.md` entry, build
-the folder from that commit with the receiver and adapter refs of the last
-good `BUILD-INFO`, run the smoke test, copy it and update.
+`local_apps/ha-yt-to-upnp` as a whole. Then App store → ⋮ → **Check for
+updates**: the app appears under **Local apps** (slug `local_yt_to_upnp`),
+next to the repository's (they use the same ports: run only one). Install
+and configure it as above. To update it, copy a newly built folder with a
+higher `version` and use **Update** (without a version bump, **Rebuild** on
+the app's page).
 
 ### Open follow-ups
 

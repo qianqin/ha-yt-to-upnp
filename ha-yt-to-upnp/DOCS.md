@@ -36,6 +36,35 @@ software volume.
 - Optional, for a faster start: the LAN IPv4 address of that speaker device
   (the **Raumfeld host**), see [Finding the Raumfeld host](#finding-the-raumfeld-host).
 
+## Installation
+
+Home Assistant installs the app from this repository and builds its image
+itself, on the Home Assistant host:
+
+1. Settings → Apps → **Repositories**: add
+   `https://github.com/qianqin/ha-yt-to-upnp` and close the dialog.
+2. The app **YouTube to UPnP** appears in the app store (reload the page if
+   not). Open it and **Install**. The build takes a few minutes; nothing is
+   compiled: it installs MPD and Python from Debian (apt) on the pinned base
+   image, downloads the prebuilt programs (receiver, adapter, Deno and the
+   PoToken helper) as one tarball from the GitHub release of the app's version
+   over https, and uses them only if their SHA-256 is the one in the
+   repository's `artefacts.lock`. On any mismatch the build stops and the
+   app is not installed.
+3. **Configuration** tab: set the [options](#options), save, then **Start**
+   on the **Info** tab. Check the log for the four `Starting ...` lines (see
+   [Use](#use)).
+
+**Updates:** when a new version is in the repository, the app's page offers
+**Update** (Settings → Apps, or Settings → Updates). It rebuilds the image
+the same way and restarts the app; the options and `/data` are kept. The
+changelog of each version is on the app's page and in `CHANGELOG.md`.
+
+The app is built for x86-64 (`amd64`) hosts only. A folder assembled with
+`scripts/build-ha-app.sh` (it brings the programs along in `artefacts/`) can
+still be installed as a local app instead; see `docs/DEVOPS.md` in the
+repository.
+
 ## Options
 
 | Option | Required | Meaning |
