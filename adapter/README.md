@@ -138,9 +138,31 @@ Raumfeld room play the receiver's MPD stream automatically.
   (the phone, or the receiver ending the silence after 60 s), the adapter does
   not unpause. **Limit:** a pause from the phone during the gate can't be
   told apart from the adapter's own pause (MPD is already paused, so nothing
-  changes), and is undone when the gate opens. Song changes and resumes while
-  the adapter owns the room are not gated: the speaker already plays the stream.
-  The phone shows the position standing still during the gate.
+  changes), and is undone when the gate opens. Song changes while the adapter
+  owns the room are not gated: the speaker already plays the stream. The phone
+  shows the position standing still during the gate.
+- **Pause and resume from the phone reach the speaker.** The Raumfeld buffers
+  5-6 s of the stream, so a pause done only in MPD would be heard that much
+  later. On a user pause (MPD play -> pause with the same song, on a zone the
+  adapter owns; never the gate's own `pause 1`, nor the receiver's held
+  hand-over, which comes with a new song) the adapter asks the zone renderer
+  (`GetTransportInfo`/`GetMediaInfo`) and, if it plays `STREAM_URL`, sends
+  AVTransport `Pause` right away and logs it. While MPD stays paused, a renderer
+  `PAUSED_PLAYBACK` on our stream is the adapter's own pause: no takeover, no
+  restart, no yield (standby, another source or leaving the zone still count as
+  taken away, as before). On the resume (MPD pause -> play) it asks the renderer
+  again: still `PAUSED_PLAYBACK` on our stream, it holds MPD at the resume point
+  (`pause 1`), sends `Play` (the Raumfeld reconnects to the stream and its
+  position starts at 0:00) and sends `pause 0` once the renderer plays our
+  stream, with the start gate's timing, re-takeover and limits (a resume gate;
+  with `START_GATE_SECONDS=0` just `Play`). A `Play` that fails takes the room
+  over instead, still behind the gate. Playing another source by then (chosen
+  during the pause, before a poll saw it), the speaker is not taken back: the
+  adapter yields (pauses MPD, releases the cast). Anything else (stopped, in
+  standby, nothing loaded, no answer) is a resume as without the pause. A pause
+  then stop (the session ended) sends no `Play`. A pause done on the speaker
+  itself while MPD plays is not the adapter's: it counts as a stopped renderer,
+  as before. A failed `Pause` is logged; the speaker then plays its buffer out.
 - If the zone already plays the stream, it does nothing. **An explicit cast
   wins at takeover:** a new cast or a user resume takes the room over from any
   other source, e.g. the Raumfeld **line-in** (a Chromecast Audio or a karaoke

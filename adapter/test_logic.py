@@ -370,6 +370,8 @@ class RecordingController:
         self.decision = ra.TAKE_OVER
         self.verdict = ra.OURS
         self.restart_fail = None
+        self.pause_fail = None
+        self.play_fail = None
         self.plays = True
         self.plays_fail = None
         self.renderer = "STOPPED"  # what renderer_state reports while not playing
@@ -412,6 +414,17 @@ class RecordingController:
         if self.restart_fail:
             raise self.restart_fail
 
+    def pause_renderer(self):
+        self.calls.append("pause_renderer")
+        if self.pause_fail:
+            raise self.pause_fail
+        self.plays, self.renderer = False, "PAUSED_PLAYBACK"
+
+    def play_renderer(self):
+        self.calls.append("play_renderer")
+        if self.play_fail:
+            raise self.play_fail
+
 
 class FollowerTest(unittest.TestCase):
     def setUp(self):
@@ -433,11 +446,13 @@ class FollowerTest(unittest.TestCase):
 
     def test_owned_zone_is_polled_while_paused_and_stopped(self):
         self.f.on_mpd_state("play")
-        self.f.on_mpd_state("pause")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause")  # followed to the speaker (PauseFollowTest)
         self.advance(5)
         self.f.on_mpd_state("stop")
         self.advance(5)
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "check", "check"])
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "renderer_state", "pause_renderer",
+                                          "check", "check"])
 
     def test_taken_away_while_stopped_just_lets_go(self):
         self.f.on_mpd_state("play")
@@ -486,9 +501,10 @@ class FollowerTest(unittest.TestCase):
 
     def test_user_resume_wakes(self):
         self.f.on_mpd_state("play")
+        self.ctl.plays = False  # the renderer stopped meanwhile: nothing of ours to pause
         self.f.on_mpd_state("pause")
         self.f.on_mpd_state("play")
-        self.assertEqual(self.ctl.calls, ["ensure_playing", "ensure_playing"])
+        self.assertEqual(self.ctl.calls, ["ensure_playing", "renderer_state", "ensure_playing"])
 
     def test_taken_away_on_track_change_pauses_and_releases(self):
         self.f.on_mpd_state("play")
@@ -1613,7 +1629,9 @@ class StartGateTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.advance(ra.GATE_POLL_S)
         self.released()
-        self.f.on_mpd_state("pause", "1")  # the user pauses ...
+        self.ctl.pause_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")  # the user pauses, the speaker plays on ...
         self.f.on_mpd_state("play", "1")  # ... and resumes: the speaker kept the stream
         self.assertEqual(self.requests(), [])
 
@@ -1652,6 +1670,291 @@ class StartGateTest(unittest.TestCase):
         f.on_mpd_state("play", "1")
         self.assertEqual(self.ctl.calls, ["ensure_playing"])
         self.assertEqual(f.take_mpd_requests(), [])
+
+
+class PauseFollowTest(unittest.TestCase):
+    """The speaker buffers seconds of the stream: a user pause in MPD is followed to the zone
+    renderer (AVTransport Pause) at once, and the resume plays it again behind the start
+    gate, so its reconnect to the stream loses no audio."""
+
+    GATE_S = 15
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.ctl.clock = self.clock
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock,
+                             start_gate_seconds=self.GATE_S)
+
+    def advance(self, seconds):
+        self.clock.now += seconds
+        self.f.tick()
+
+    def requests(self):
+        return self.f.take_mpd_requests()
+
+    def owned(self, song="1"):
+        """A cast that plays: gated, the renderer plays at the first look."""
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", song)
+            self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+            self.f.on_mpd_state("pause", song)
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", song)
+        self.assertTrue(self.f.owned)
+        self.ctl.calls.clear()
+
+    def paused(self, song="1"):
+        """The user pauses on the phone: the speaker is paused too."""
+        self.owned(song)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", song)
+        self.ctl.calls.clear()
+
+    # -- pause
+
+    def test_user_pause_pauses_the_speaker_at_once_and_says_so(self):
+        self.owned()
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "pause_renderer"])
+        self.assertTrue(any("INFO" in m and "Pause" in m for m in logs.output), logs.output)
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.f.seconds_until_deadline(), 5)  # watched as usual
+
+    def test_the_gates_own_pause_is_not_followed_to_the_speaker(self):
+        self.ctl.plays = False
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.f.on_mpd_state("pause", "1")  # our pause 1
+        self.f.on_mpd_state("pause", "1")  # its late idle event
+        self.assertNotIn("pause_renderer", self.ctl.calls)
+
+    def test_the_receivers_held_handover_after_the_gate_is_not_followed(self):
+        self.owned()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "2", 0.0)  # playid; pause 1 at 0:00 of the song
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.assertEqual(self.ctl.calls, [])
+
+    def test_a_pause_that_comes_with_another_song_is_not_followed(self):
+        self.owned()
+        self.clock.now += ra.AFTER_GATE_HANDOVER_S + 1
+        self.f.on_mpd_state("pause", "2", 0.0)
+        self.assertEqual(self.ctl.calls, [])
+
+    def test_our_own_pause_after_a_yield_is_not_followed(self):
+        self.owned()
+        self.ctl.verdict = ra.STANDBY
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.calls, ["check"])
+
+    def test_a_speaker_not_playing_our_stream_is_not_paused(self):
+        self.owned()
+        self.ctl.plays = False
+        for seen in ("PLAYING" + ra.ANOTHER_SOURCE, "STOPPED", "TRANSITIONING"):
+            with self.subTest(seen=seen):
+                self.ctl.renderer = seen
+                self.ctl.calls.clear()
+                self.f.on_mpd_state("pause", "1")
+                self.assertEqual(self.ctl.calls, ["renderer_state"])
+                self.f.on_mpd_state("play", "1")
+
+    def test_a_failed_pause_is_logged_and_the_loop_goes_on(self):
+        self.owned()
+        self.ctl.pause_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.assertEqual(self.requests(), [])
+        # The speaker still plays: a resume is today's resume.
+        self.ctl.calls.clear()
+        self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["ensure_playing"])
+        self.assertEqual(self.requests(), [])
+
+    def test_a_failed_look_before_the_pause_is_logged_and_the_loop_goes_on(self):
+        self.owned()
+        self.ctl.plays_fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state"])
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+
+    # -- paused
+
+    def test_our_paused_speaker_is_left_alone_while_mpd_stays_paused(self):
+        self.paused()
+        self.ctl.verdict = ra.NOT_PLAYING  # PAUSED_PLAYBACK on our stream
+        for _ in range(ra.STOPPED_GRACE_POLLS + 5):
+            self.advance(5)
+        self.assertEqual(self.ctl.calls, ["check"] * (ra.STOPPED_GRACE_POLLS + 5))
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(self.f.yielded)
+        self.assertTrue(self.f.owned)
+
+    # -- resume
+
+    def test_user_resume_plays_the_paused_speaker_behind_the_gate(self):
+        self.paused()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state"])
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held at the resume point
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")  # our pause 1
+        self.assertEqual(self.ctl.calls, ["renderer_state", "play_renderer"])
+        self.ctl.renderer = "TRANSITIONING"  # reconnecting to the stream
+        self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [])
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", "1")  # our pause 0
+        self.f.on_mpd_state("play", "1")  # its idle event
+        self.assertEqual(self.requests(), [])
+        self.assertNotIn("ensure_playing", self.ctl.calls)  # no takeover, no wake
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        self.assertTrue(self.f.owned)
+
+    def test_a_resume_gate_is_bounded_by_the_configured_gate(self):
+        self.paused()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.ctl.renderer = "STOPPED"  # Play dropped
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(GATE_LOOKS):
+                self.advance(ra.GATE_POLL_S)
+                if self.f._requests:
+                    break
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.assertIn("ensure_playing(retake)", self.ctl.calls)  # the gate's re-takeover
+
+    def test_a_pause_from_the_phone_during_the_resume_gate_is_undone_like_at_a_start(self):
+        self.paused()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.f.on_mpd_state("pause", "1")
+        self.assertNotIn("pause_renderer", self.ctl.calls)
+
+    def test_resume_after_the_speaker_left_the_pause_takes_over_as_before(self):
+        for seen in ("STOPPED", "NO_MEDIA_PRESENT", "PAUSED_PLAYBACK" + ra.NOTHING_LOADED):
+            with self.subTest(seen=seen):
+                self.setUp()
+                self.paused()
+                self.ctl.renderer = seen
+                with self.assertLogs("raumfeld_adapter", "INFO"):
+                    self.f.on_mpd_state("play", "1")
+                self.assertEqual(self.ctl.calls, ["renderer_state", "ensure_playing"])
+                self.assertEqual(self.requests(), [])  # an owned room: not gated, as before
+
+    def test_resume_with_a_failing_look_takes_over_as_before(self):
+        self.paused()
+        self.ctl.plays_fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "ensure_playing"])
+
+    def test_resume_after_the_user_chose_another_source_does_not_take_it_back(self):
+        for seen in ra._OTHER_SOURCE_PLAYING + tuple(
+                s + ra.PREVIOUS_SOURCE for s in ra._PLAYING_STATES):
+            with self.subTest(seen=seen):
+                self.setUp()
+                self.paused()
+                self.ctl.renderer = seen
+                with self.assertLogs("raumfeld_adapter", "INFO"):
+                    self.f.on_mpd_state("play", "1")
+                self.assertEqual(self.ctl.calls, ["renderer_state"])
+                self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+                self.assertTrue(self.f.yielded)
+
+    def test_a_failed_play_on_resume_takes_over_within_the_gate(self):
+        self.paused()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.requests()
+        self.ctl.play_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "play_renderer", "ensure_playing"])
+        self.assertEqual(self.requests(), [])  # MPD stays held
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+
+    def test_a_failed_play_and_takeover_on_resume_release_mpd_and_retry(self):
+        self.paused()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+        self.requests()
+        self.ctl.play_fail = ra.RaumfeldError("HTTP 500")
+        self.ctl.fail = OSError("unreachable")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])  # never keep the phone waiting
+        self.assertFalse(self.f.owned)
+
+    # -- stop
+
+    def test_stop_while_the_speaker_is_paused_sends_no_play(self):
+        self.paused()
+        self.f.on_mpd_state("stop", None)
+        self.advance(5)
+        self.assertEqual(self.ctl.calls, ["check"])
+        self.assertEqual(self.requests(), [])
+        self.f.on_mpd_state("play", "2")  # a new session: as before
+        self.assertEqual(self.ctl.calls, ["check", "ensure_playing(no wake)"])
+
+    # -- the speaker's own pause
+
+    def test_a_pause_on_the_speaker_itself_is_not_taken_for_ours(self):
+        self.owned()
+        self.ctl.verdict = ra.NOT_PLAYING  # paused with its buttons; MPD still plays
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(ra.STOPPED_GRACE_POLLS + 1):
+                self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])  # as before
+        self.f.on_mpd_state("pause", "1")  # our pause 1
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")  # the user resumes from the phone
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # a gated takeover, as before
+        self.assertNotIn("pause_renderer", self.ctl.calls)
+        self.assertNotIn("play_renderer", self.ctl.calls)
+
+    # -- without the gate
+
+    def test_without_the_gate_a_resume_plays_the_speaker_at_once(self):
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
+        f.on_mpd_state("play", "1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("pause", "1")
+        self.ctl.calls.clear()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "play_renderer"])
+        self.assertEqual(f.take_mpd_requests(), [])
+        self.assertEqual(f.seconds_until_deadline(), 5)
+
+    def test_without_the_gate_a_failed_play_takes_over_as_before(self):
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
+        f.on_mpd_state("play", "1")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("pause", "1")
+        self.ctl.calls.clear()
+        self.ctl.play_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "play_renderer", "ensure_playing"])
 
 
 if __name__ == "__main__":

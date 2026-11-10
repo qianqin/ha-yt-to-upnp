@@ -1067,5 +1067,43 @@ class RendererRestartTest(unittest.TestCase):
         self.assertEqual(self.rf.requests, [])
 
 
+class RendererPauseTest(unittest.TestCase):
+    """Scenario: a user pause is followed to the zone renderer of the last look (Pause), its
+    resume plays it again (Play); the URI is left as it is, nothing else is sent."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def test_pause_then_play_on_the_checked_zone(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.assertEqual(self.ctl.check(), ra.OURS)
+        self.rf.requests.clear()
+        self.ctl.pause_renderer()
+        self.assertEqual(self.rf.soap_actions(), ["Pause"])
+        self.assertEqual(self.ctl.renderer_state(), "PAUSED_PLAYBACK")
+        self.rf.requests.clear()
+        self.ctl.play_renderer()
+        self.assertEqual(self.rf.soap_actions(), ["Play"])
+        self.assertIn("<Speed>1</Speed>", self.rf.soap_body("Play"))
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
+
+    def test_pause_and_play_without_a_checked_zone_raise(self):
+        for call in (self.ctl.pause_renderer, self.ctl.play_renderer):
+            with self.assertRaises(ra.RaumfeldError):
+                call()
+        self.assertEqual(self.rf.requests, [])
+
+
 if __name__ == "__main__":
     unittest.main()

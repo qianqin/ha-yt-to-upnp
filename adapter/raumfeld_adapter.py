@@ -829,6 +829,16 @@ class Controller:
         soap_call(control, "Play", [("Speed", "1")])
         log.info("zone %r restarted (Stop, Play)", self._zone)
 
+    def pause_renderer(self):
+        """Pause on the zone renderer of the last takeover or look: a user pause in MPD,
+        which the speaker would otherwise only hear once its buffer has run out."""
+        soap_call(self._known_control(), "Pause", [])
+
+    def play_renderer(self):
+        """Play on the zone renderer of the last takeover or look, the URI left as it is: the
+        resume of a renderer we paused. It reconnects to the stream."""
+        soap_call(self._known_control(), "Play", [("Speed", "1")])
+
     def _known_control(self):
         if self._control is None:
             raise RaumfeldError("no zone renderer known yet")
@@ -1178,8 +1188,10 @@ _RESUMING = "resuming"
 
 
 class _Gate:
-    def __init__(self, song, started, seconds):
+    def __init__(self, song, started, seconds, resume=False):
         self.phase = _PAUSING
+        # A user resume of a renderer we paused: Play instead of a takeover, and no pre-roll.
+        self.resume = resume
         self.song = song
         self.started = started
         self.deadline = started + seconds
@@ -1208,6 +1220,10 @@ class _Gate:
 # before the takeover: never taken over again. (Back on the source before the takeover, the
 # speaker dropped our takeover: that is taken over again.)
 _OTHER_SOURCE_PLAYING = tuple(state + ANOTHER_SOURCE for state in _PLAYING_STATES)
+# Any source but ours playing on the renderer, the one before the takeover included: at the
+# resume of a renderer we paused, someone chose it during the pause.
+_FOREIGN_PLAYING = _OTHER_SOURCE_PLAYING + tuple(state + PREVIOUS_SOURCE
+                                                 for state in _PLAYING_STATES)
 
 _REASONS = {
     STANDBY: "room went to standby",
@@ -1228,6 +1244,16 @@ class Follower:
     (pause -> stop). If the room goes away while MPD is stopped there is no cast to
     end: it just lets go (no pause, no release) and the next play wakes the room.
 
+    User pause and resume are followed to the speaker, which would otherwise play its
+    buffer (5-6 s) on: a user pause (MPD play -> pause, same song, on a zone we own) sends
+    AVTransport Pause at once if the renderer plays our stream. Its resume, with the
+    renderer still PAUSED_PLAYBACK on our stream, sends Play behind a resume gate (the
+    start gate's mechanics: MPD held at the resume point while the renderer reconnects to
+    the stream); a failed Play takes the speaker over instead, behind the same gate. A
+    renderer playing another source by then was chosen during the pause: not taken back
+    (yield). Anything else is a resume as without the pause. A pause on the speaker
+    itself (MPD still playing) is not ours: it counts as stopped, as before.
+
     Start gate: when MPD starts playing and the adapter doesn't own the zone, it first
     asks run() to pause MPD, takes over only once the pause is confirmed, and asks for
     pause 0 as soon as the renderer plays our stream (or after start_gate_seconds). A
@@ -1236,7 +1262,7 @@ class Follower:
     never played when the gate ends, it gets one more takeover before it counts as taken
     away. A renderer someone made play another source than the one before the takeover
     ends the gate at once: it yields (MPD stays paused, the cast is released). Its own
-    pause and resume are not followed; a failed takeover lets MPD play at once and is
+    pause and resume are not followed to the speaker; a failed takeover lets MPD play at once and is
     retried after PLAY_RETRY_S without the gate. Another song during the gate (the
     receiver's song replacing its pre-roll silence, or a skip) is held too, the gate
     carrying on: at 0:00 when the receiver hands it over held (MPD reports pause with the
@@ -1271,6 +1297,8 @@ class Follower:
         self.yielded = False
         self.wake = True
         self.stopped_polls = 0
+        # We paused the renderer on our stream (a user pause in MPD); its resume is ours.
+        self.speaker_paused = False
         self._requests = []
 
     def on_mpd_connected(self):
@@ -1287,7 +1315,8 @@ class Follower:
             # status read that already reported it, or a seek. Taken as a new start it would
             # hold MPD again at once.
             return
-        previous, self.mpd_state, self.mpd_song = self.mpd_state, state, songid
+        previous, previous_song = self.mpd_state, self.mpd_song
+        self.mpd_state, self.mpd_song = state, songid
         self.stopped_polls = 0
         if self._gate is not None:
             if self._gated(state, songid):
@@ -1317,6 +1346,8 @@ class Follower:
             self.yielded = False
         if state == "play" and not self.owned and self.start_gate_seconds > 0:
             self._start_gate(songid)
+        elif state == "play" and self.speaker_paused:
+            self._resume_speaker(songid)
         elif state == "play":
             # Only a user resume may wake a zone we own; a song change must not.
             self.wake = previous == "pause" or not self.owned
@@ -1325,6 +1356,12 @@ class Follower:
             # Keep watching a paused or stopped zone: the Raumfeld's auto power-off may end
             # a pause (that ends the cast), and after a stop it tells us the room is no
             # longer ours, so the next cast may wake it.
+            if state == "pause" and previous == "play" and songid == previous_song:
+                # The user's pause: the gate's and the hand-over's never get here, and a
+                # pause with another song is the receiver's doing.
+                self._pause_speaker()
+            elif state != "pause":
+                self.speaker_paused = False  # the session ended: no Play
             self._schedule(_POLL)
         else:
             self.pending = None
@@ -1346,10 +1383,59 @@ class Follower:
         if self.pending is not None and self.clock() >= self.deadline:
             self._attempt(self.pending)
 
-    def _start_gate(self, song):
-        log.info("holding MPD at the start of the song while the speaker wakes (at most %g s)",
-                 self.start_gate_seconds)
-        self._gate = _Gate(song, self.clock(), self.start_gate_seconds)
+    def _pause_speaker(self):
+        """Follow a user pause to the renderer, if it plays our stream: it would play its
+        buffer (seconds) on otherwise. Another source is not ours to pause."""
+        try:
+            seen = self.controller.renderer_state()
+            if seen != "PLAYING":
+                log.debug("MPD paused; speaker not paused (renderer %r)", seen)
+                return
+            self.controller.pause_renderer()
+        except _ERRORS as e:
+            log.warning("MPD paused; pausing the speaker failed: %r", e)
+            return
+        self.speaker_paused = True
+        log.info("MPD paused by the user; speaker paused too (AVTransport Pause)")
+
+    def _resume_speaker(self, song):
+        """A user resume of a renderer we paused. Still paused on our stream: Play, behind the
+        gate (the renderer reconnects to the stream). Playing another source: chosen during
+        the pause, so it is not taken back. Anything else: a play as without the pause."""
+        self.speaker_paused = False
+        try:
+            seen = self.controller.renderer_state()
+        except _ERRORS as e:
+            log.warning("MPD resumed; renderer check failed (%r); taking the speaker over", e)
+            seen = None
+        if seen in _FOREIGN_PLAYING:
+            log.info("MPD resumed; the speaker plays another source now (renderer %r)", seen)
+            return self._yield(OTHER_SOURCE)
+        if seen != "PAUSED_PLAYBACK":
+            if seen is not None:
+                log.info("MPD resumed; speaker no longer paused on our stream (renderer %r); "
+                         "taking it over", seen)
+            self.wake = True
+            return self._attempt(_PLAY)
+        if self.start_gate_seconds > 0:
+            return self._start_gate(song, resume=True)
+        try:
+            self.controller.play_renderer()
+        except _ERRORS as e:
+            log.warning("MPD resumed; resuming the speaker failed (%r); taking it over", e)
+            self.wake = True
+            return self._attempt(_PLAY)
+        log.info("MPD resumed by the user; speaker resumed (AVTransport Play)")
+        self._schedule(_POLL)
+
+    def _start_gate(self, song, resume=False):
+        if resume:
+            log.info("holding MPD at the resume point while the speaker resumes (at most %g s)",
+                     self.start_gate_seconds)
+        else:
+            log.info("holding MPD at the start of the song while the speaker wakes "
+                     "(at most %g s)", self.start_gate_seconds)
+        self._gate = _Gate(song, self.clock(), self.start_gate_seconds, resume)
         self._requests.append(PAUSE_PLAYER)
         # Should our pause never be confirmed, the gate deadline still takes over.
         self.pending, self.deadline = _GATE, self._gate.deadline
@@ -1426,8 +1512,10 @@ class Follower:
         now = self.clock()
         held = (" (song %r held %.1f s)" % (gate.song, now - gate.song_at)
                 if gate.song_at is not None else "")
-        log.info("start: MPD resumed at +%.1f s%s", now - gate.started, held)
-        self._after_gate = (gate, now)
+        log.info("%s: MPD resumed at +%.1f s%s", "resume" if gate.resume else "start",
+                 now - gate.started, held)
+        # After a resume there is no pre-roll to hand over.
+        self._after_gate = None if gate.resume else (gate, now)
 
     def _preroll_song(self, gate, state, previous, song):
         """The pre-roll's song, replacing the silence after the gate that started on it. The
@@ -1459,6 +1547,8 @@ class Follower:
                  "speaker already playing" if gate.playing else "speaker not playing")
 
     def _gate_take_over(self):
+        if self._gate.resume:
+            return self._gate_play()
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
@@ -1472,6 +1562,20 @@ class Follower:
         else:
             # The takeover failed and is retried later; never keep the phone waiting for it.
             self._release_gate("the takeover failed")
+
+    def _gate_play(self):
+        """The resume gate holds MPD: Play the renderer we paused. Should Play fail, the
+        speaker is taken over instead, still behind the gate."""
+        gate = self._gate
+        try:
+            self.controller.play_renderer()
+        except _ERRORS as e:
+            log.warning("resume: AVTransport Play failed (%r); taking the speaker over", e)
+            gate.resume = False
+            self.owned = False  # so a failed takeover releases the gate and is retried
+            return self._gate_take_over()
+        log.info("resume: AVTransport Play sent at +%.1f s", self.clock() - gate.started)
+        self._give_time()
 
     def _gate_check(self):
         if self._gate.phase == _PAUSING:
@@ -1601,6 +1705,7 @@ class Follower:
             log.info("%s while MPD is stopped; the next cast takes the room again",
                      _REASONS[verdict])
             self.owned = False
+            self.speaker_paused = False
             return
         if verdict in TAKEN_AWAY:
             return self._yield(verdict)
@@ -1667,6 +1772,7 @@ class Follower:
         self._requests.append(RELEASE_CAST)
         self.yielded = True
         self.owned = False
+        self.speaker_paused = False
 
     def _schedule(self, action):
         self.pending = action

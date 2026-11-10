@@ -764,5 +764,120 @@ class SpeakerYieldRunTest(unittest.TestCase):
         self.assertEqual(cmds, [])
 
 
+class PauseFollowScenarioTest(unittest.TestCase):
+    """Scenario: the phone pauses and resumes a cast. The speaker would play its buffer for
+    seconds more, so it is paused too (AVTransport Pause) and resumed with Play behind the
+    start gate: MPD is held at the resume point until the speaker plays again."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        self.clock = FakeClock()
+        self.follower = ra.Follower(make_controller(self.rf, FakeDiscovery(self.rf)),
+                                    poll_seconds=POLL_S, clock=self.clock, start_gate_seconds=15)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def requests(self):
+        return self.follower.take_mpd_requests()
+
+    def gate_tick(self):
+        self.clock.now += ra.GATE_POLL_S
+        self.follower.tick()
+
+    def poll(self):
+        self.clock.now += POLL_S
+        self.follower.tick()
+
+    def cast_plays(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+            self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+            self.follower.on_mpd_state("pause", "1")
+            self.gate_tick()
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.rf.requests.clear()
+
+    def user_pauses(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo", "Pause"])
+        self.assertEqual(self.rf.transport_state, "PAUSED_PLAYBACK")
+        self.rf.requests.clear()
+
+    def test_pause_and_resume_are_followed_to_the_speaker(self):
+        self.cast_plays()
+        self.user_pauses()
+        for _ in range(ra.STOPPED_GRACE_POLLS + 3):
+            self.poll()  # ours, paused: no takeover, no restart, no yield
+        self.assertEqual(self.requests(), [])
+        self.assertFalse(any(a in ("SetAVTransportURI", "Play", "Stop")
+                             for a in self.rf.soap_actions()))
+        self.rf.requests.clear()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")  # the user resumes
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")  # our pause 1 holds the resume point
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo", "Play"])
+        self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.gate_tick()
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertTrue(self.follower.owned)
+
+    def test_resume_after_auto_power_off_during_the_pause_is_a_new_takeover(self):
+        self.cast_plays()
+        self.user_pauses()
+        self.rf.power = "AUTOMATIC_STANDBY"
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.poll()
+        self.assertEqual(self.requests(), [ra.RELEASE_CAST])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # gated takeover as before
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("pause", "1")
+        self.assertIn("leaveStandby", self.rf.api_calls())
+
+    def test_resume_after_the_user_switched_to_line_in_does_not_take_it_back(self):
+        self.cast_plays()
+        self.user_pauses()
+        self.rf.current_uri, self.rf.transport_state = LINE_IN_URI, "PLAYING"
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")  # before the next poll saw it
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertEqual(self.rf.current_uri, LINE_IN_URI)
+        self.assertNotIn("Play", self.rf.soap_actions())
+
+    def test_failed_pause_is_logged_and_the_speaker_keeps_playing(self):
+        self.cast_plays()
+        self.rf.fail_actions.add("Pause")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.follower.on_mpd_state("pause", "1")
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.poll()
+        self.assertEqual(self.requests(), [])
+
+    def test_failed_play_on_resume_takes_the_speaker_over_within_the_gate(self):
+        self.cast_plays()
+        self.user_pauses()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.follower.on_mpd_state("play", "1")
+        self.requests()
+        self.rf.fail_actions.add("Play")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.follower.on_mpd_state("pause", "1")
+        self.rf.fail_actions.clear()
+        self.assertIn("SetAVTransportURI", self.rf.soap_actions())
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])  # the takeover failed too
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -93,8 +93,11 @@ formats (always 251 via SABR).
   pauses MPD, wakes the room (`leaveStandby`, waits until it is `ACTIVE`),
   points the zone renderer at MPD's stream and resumes MPD once the speaker
   plays. The song replaces the silence and starts at 0:00 on the speaker.
-- **Pause / resume / seek / skip** from the phone: done in MPD; the speaker
-  keeps playing the stream. Premium songs are seekable; SABR songs only once fully buffered.
+- **Pause / resume** from the phone: done in MPD and followed to the speaker
+  (UPnP `Pause`, then `Play` with MPD held until the speaker plays again), so a
+  pause is heard at once, not after the speaker's few seconds of buffer.
+- **Seek / skip** from the phone: done in MPD; the speaker keeps playing the
+  stream. Premium songs are seekable; SABR songs only once fully buffered.
 - **Speaker switched off, auto power-off, or switched to line-in or another
   source:** the adapter pauses MPD and tells the receiver to end the cast. It
   then leaves the room alone until you resume or cast again from the phone.

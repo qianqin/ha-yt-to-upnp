@@ -58,6 +58,7 @@ class FakeRaumfeld:
         self._rejoining = None
         self.on_get_zones = None  # called at every getZones, e.g. to model a slow answer
         self.fail_paths = set()  # substrings of paths that answer 500
+        self.fail_actions = set()  # SOAP actions that answer 500 (a UPnP fault)
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.description_udn = None  # the UDN the description names, if not the zone's
         self.room_listed = True  # False: a host that doesn't know our room (a wrong host)
@@ -192,6 +193,9 @@ class FakeRaumfeld:
         elif action == "Stop":
             self.transport_state = "STOPPED"
             self.stuck = False
+        elif action == "Pause":
+            if self.transport_state == "PLAYING":
+                self.transport_state = "PAUSED_PLAYBACK"
         else:
             raise AssertionError("unknown SOAP action " + action)
         return (
@@ -236,7 +240,8 @@ class FakeRaumfeld:
                 soap_action = self.headers.get("SOAPACTION", "")
                 with fake.lock:
                     fake.requests.append(("POST", self.path, soap_action.strip('"').split("#")[-1], body))
-                    if any(f in self.path for f in fake.fail_paths):
+                    if (any(f in self.path for f in fake.fail_paths)
+                            or fake.requests[-1][2] in fake.fail_actions):
                         return self._send(500, "boom")
                     if self.path != urlsplit(urljoin("/zone.xml", fake.control_url)).path:
                         return self._send(404, "no such control URL")  # the renderer moved

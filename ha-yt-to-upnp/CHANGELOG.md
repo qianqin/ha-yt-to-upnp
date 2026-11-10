@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1
+
+- Pause from the phone is heard at once: the adapter follows a user pause to
+  the speaker (UPnP AVTransport `Pause` on the zone renderer) instead of
+  letting it play its 5-6 s buffer out. On resume it sends `Play` and holds
+  MPD at the resume point until the speaker plays again (like at a cast
+  start), so nothing is lost while the speaker reconnects. A speaker switched
+  to another source during the pause is not taken back; a speaker that left
+  the pause (standby, stopped) is taken over as before.
+
 ## 0.4.0
 
 Premium audio, installed from the repository.
