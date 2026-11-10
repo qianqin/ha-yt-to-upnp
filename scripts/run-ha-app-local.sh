@@ -21,7 +21,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'USAGE'
 usage: scripts/run-ha-app-local.sh --name NAME --room-udn UDN
-           (--speaker-udn UDN | --raumfeld-host HOST) [--speaker-udn UDN]
+           (--speaker-udn UDN | --raumfeld-host HOST [--speaker-udn UDN])
            [--stream-format flac|mp3] [--stream-host HOST] [--log-level LEVEL]
            [--start-gate-seconds N] [--stuck-seconds N] [--app-dir DIR]
        scripts/run-ha-app-local.sh --stop
@@ -85,7 +85,7 @@ done
 
 [ -f "$app/artefacts/BUILD-INFO" ] || die "$app is not an assembled app folder; run scripts/build-ha-app.sh first"
 for tool in mpd deno cargo python3 jq; do
-  command -v "$tool" >/dev/null || die "'$tool' not found (brew install mpd deno jq; rustup for cargo)"
+  command -v "$tool" >/dev/null || die "'$tool' not found (mpd, deno, jq: Homebrew; cargo: put $(brew --prefix rustup)/bin on PATH)"
 done
 [ ! -e "$run" ] || die "$run exists: already running? stop it first with --stop"
 
@@ -95,8 +95,6 @@ head_commit="$(git -C "$root" rev-parse HEAD)"
 if [ "$receiver_commit" != "$head_commit" ] || [ -n "$(git -C "$root" status --porcelain -- src Cargo.toml Cargo.lock build.rs proto)" ]; then
   echo "warning: the receiver is built from this checkout ($head_commit, plus any local changes), the app's from $receiver_commit" >&2
 fi
-echo "==> building the receiver for macOS (cargo build --release --locked)"
-(cd "$root" && cargo build --release --locked --quiet)
 
 mkdir -m 0700 "$run"
 mkdir -m 0700 "$run/data" "$run/data/ytcast" "$run/data/mpd" "$run/data/mpd/music" \
@@ -125,6 +123,9 @@ rootfs="$app/rootfs"
 python3 -I "$rootfs/usr/lib/ytcast/check_options.py" "$run/data/options.json" \
   || die "invalid options (see above)"
 
+echo "==> building the receiver for macOS (cargo build --release --locked)"
+(cd "$root" && cargo build --release --locked --quiet)
+
 option() { jq -r --arg k "$1" '.[$k] // empty' "$run/data/options.json"; }
 
 # The app's own encoder choice and MPD configuration, with /data moved here.
@@ -137,16 +138,16 @@ encoder="$(ytcast_stream_encoder "$stream_format")"
 template="$(< "$rootfs/etc/ytcast/mpd.conf.template")"
 printf '%s\n' "${template/@STREAM_ENCODER@/${encoder}}" | sed "s|\"/data/|\"$run/data/|" > "$run/mpd.conf"
 
-# Starts a process in the background with only the given environment; its
-# output goes to $run/<name>.log.
+# Starts a process in the background in the given directory with only the
+# given environment; its output goes to $run/<name>.log.
 start() {
-  local name="$1"; shift
-  env -i PATH=/usr/bin:/bin "$@" > "$run/$name.log" 2>&1 &
+  local name="$1" dir="$2"; shift 2
+  (cd "$dir" && exec env -i PATH=/usr/bin:/bin "$@") > "$run/$name.log" 2>&1 &
   echo "$name $!" >> "$run/pids"
   echo "started $name ($!), log $run/$name.log"
 }
 
-start mpd HOME="$run" "$(command -v mpd)" --no-daemon --stderr "$run/mpd.conf"
+start mpd "$run" HOME="$run" "$(command -v mpd)" --no-daemon --stderr "$run/mpd.conf"
 tries=40
 until (exec 3<>/dev/tcp/127.0.0.1/6600) 2>/dev/null; do
   tries=$((tries - 1))
@@ -154,16 +155,17 @@ until (exec 3<>/dev/tcp/127.0.0.1/6600) 2>/dev/null; do
   sleep 0.25
 done
 
-# The helper's Deno cache was filled at build time for the app folder's copy.
+# As in the app: from the helper's directory (Deno reads deno.json and the lock
+# file there), with the Deno cache filled at build time.
 bgutil="$app/artefacts/bgutil"
-start potoken DENO_DIR="$bgutil/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 HOME=/nonexistent \
+start potoken "$bgutil" DENO_DIR="$bgutil/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 HOME=/nonexistent \
   "$(command -v deno)" run --no-prompt --frozen --cached-only \
   --allow-net=127.0.0.1:4416,www.youtube.com:443,www.google.com:443,jnn-pa.googleapis.com:443 \
-  --allow-read="$bgutil" --allow-env \
+  --allow-read="$bgutil/node_modules" --allow-env \
   --deny-write --deny-run --deny-ffi --deny-sys --deny-import \
-  "$bgutil/src/main.ts" --host 127.0.0.1 --port 4416
+  src/main.ts --host 127.0.0.1 --port 4416
 
-start receiver HOME="$run/data/ytcast" DEVICE_NAME="$(option cast_name)" \
+start receiver "$run" HOME="$run/data/ytcast" DEVICE_NAME="$(option cast_name)" \
   RUST_LOG="$(case "$(option log_level)" in debug) echo "info,ytcast_lite=debug" ;; warning) echo warn ;; *) option log_level ;; esac)" \
   MPD_HOST=127.0.0.1 MPD_PORT=6600 YTCAST_DATA_DIR="$run/data/ytcast" \
   "$root/target/release/ytcast-lite"
@@ -188,7 +190,7 @@ for pair in raumfeld_speaker_udn:RAUMFELD_SPEAKER_UDN raumfeld_host:RAUMFELD_HOS
   value="$(option "${pair%%:*}")"
   [ -z "$value" ] || adapter_env+=("${pair#*:}=$value")
 done
-start adapter "${adapter_env[@]}" "$(command -v python3)" -I "$app/artefacts/adapter/raumfeld_adapter.py"
+start adapter "$run" "${adapter_env[@]}" "$(command -v python3)" -I "$app/artefacts/adapter/raumfeld_adapter.py"
 
 echo
 echo "running: '$(option cast_name)', $stream_format stream at http://$stream_host:8000/stream.$stream_format"
