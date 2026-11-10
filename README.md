@@ -47,9 +47,9 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 5. Extracts and streams audio segments as chunked HTTP to MPD
 6. Reports buffered ranges so the server sends the next segments
 
-If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL, ustreamer config and format ids, clears the SABR contexts and continues. Unlike googlevideo it also drops the playback cookie, which records the old session's format choice. StreamerContext `clientInfo` carries the page session's client version (the one `/player` used) and leaves out empty device fields. At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
+If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL, ustreamer config and format ids, clears the SABR contexts and continues; progress, PoToken and playback cookie carry over (only a cookie naming a different audio format than the one streaming is dropped). StreamerContext `clientInfo` carries the page session's client version (the one `/player` used) and leaves out empty device fields. At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
 
-The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions (19 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
+The SABR code and the Premium URL transport add roughly 3000 lines of Rust (without tests) across 4 files in `src/sabr/`. Proto definitions (19 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
 
 ## Audio quality
 
@@ -62,20 +62,26 @@ Casting from a YouTube Music **Premium** account gives Premium audio; any other 
 | itag 251 | Opus ~160 kbit/s, 48 kHz (WebM), via SABR | everything else, and the fallback |
 
 How it works: the phone sends a per-video credential transfer token (ctt) with each cast. The `/player` call made with it lists 774 and 141 when the casting account has Premium. SABR does not serve these formats to this receiver. Instead the receiver fetches them through their own googlevideo URL, as the music.youtube.com web player does:
-- the format's `signatureCipher` signature is deciphered into `sp`, and `n` is solved, both with the embedded yt-dlp/ejs solver and its per-player-version cache;
+- the format's `signatureCipher` signature is deciphered into `sp` and `n` is solved, both in one run of the embedded yt-dlp/ejs solver with its per-player-version cache (one solver run at a time);
 - the PoToken (`pot`), a client playback nonce (`cpn`) and the client version (`cver`) are added;
 - the audio is fetched in sequential 1 MiB byte ranges with plain GET. If the first range gives no bytes, the web player's POST form (`ump=1`) is tried.
 
 Nothing is stored: the ctt lives in memory only while its song streams. No cookie or OAuth token is read or sent, and logs show URL hosts and parameter names, never values.
 
-**Fallback chain, per song:** 774 via URL, then 141 via URL, then 251 via SABR. A format counts as failed if no audio byte arrives (HTTP error or 403, no media, or a deciphering failure); a warning names what is tried next. Without a ctt (no cast token, IOS client), or when `/player` lists no Premium format, the song goes straight to 251 via SABR, as before.
+**Fallback chain, per song:** 774 via URL, then 141 via URL, then 251 via SABR. Only Premium formats with a known length are tried. A format counts as failed if no audio byte arrives (HTTP error or 403, no media); a warning names what is tried next. A deciphering failure goes straight to 251 via SABR, since 141 would use the same base.js. Without a ctt (no cast token, IOS client), or when `/player` lists no Premium format, the song goes straight to 251 via SABR, as before.
 
 **During a Premium song:**
 - **Streaming and memory:** ranges stream straight through to MPD. A small bounded buffer means a slow consumer slows the download instead of filling memory.
+- **Timeouts:** a range that gets no response, or no data for 20 s, counts as broken.
 - **Song end:** the song ends exactly at the format's content length.
-- **Stopping:** when MPD drops the stream (skip, stop, next song), the download stops at once.
-- **Expiry:** if a range is refused (HTTP 401/403/410, e.g. an expired URL), the receiver makes one fresh `/player` call with the same ctt, deciphers again and resumes at the same byte. A broken range is resumed up to 2 times.
-- **Seeking:** `/stream/<id>` answers with `Content-Length` and `Accept-Ranges: bytes`, so MPD can seek within the song. A seek from the phone (`seekcur`) makes MPD request `Range: bytes=N-`; the receiver then starts the ranges at byte N and answers `206`. SABR songs stay chunked and unseekable, as before. A range request that ends up on SABR gets the song from the start.
+- **Stopping:** when MPD drops the stream (skip, stop, next song), the download stops at once, even in the middle of a slow range.
+- **Expiry:** if a range is refused (HTTP 401/403/410, e.g. an expired URL), the receiver makes one fresh `/player` call per song with the same ctt, deciphers again and resumes at the same byte. This happens only if the refreshed `/player` lists the same file (same itag, length and last-modified); otherwise the song ends.
+- **Broken ranges:** a range that breaks off or ends short is resumed at the exact byte, up to 2 times per range. The budget starts again for each range that completes.
+- **Seeking:** `/stream/<id>` answers with `Content-Length` and `Accept-Ranges: bytes`, so MPD can seek within the song. A seek from the phone (`seekcur`) makes MPD request `Range: bytes=N-`.
+  - The format chosen at byte 0 is pinned in memory for that song: same itag and resolved URL, no new `/player` call, no new solver run. The pin expires 5 minutes after last use, and the download touches it at every range.
+  - The ranges then start at byte N and the answer is `206`. A start at or past the end gets `416` with `Content-Range: bytes */<length>`.
+  - A seek never switches format: if the pinned format fails, or no pin exists, the request fails, and MPD reports the seek as failed.
+  - SABR songs stay chunked and unseekable (no `Accept-Ranges`), as before; MPD does not send them range requests.
 
 Setting:
 

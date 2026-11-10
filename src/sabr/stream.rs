@@ -23,6 +23,7 @@ use super::ump::{self, UmpParser};
 // ---------------------------------------------------------------------------
 
 /// Metadata about the audio stream being served.
+#[derive(Debug)]
 pub struct SabrStreamInfo {
     pub title: String,
     pub duration_secs: u64,
@@ -722,10 +723,6 @@ enum AudioQuality {
 const AUDIO_QUALITY_ENV: &str = "YTCAST_AUDIO_QUALITY";
 
 impl AudioQuality {
-    fn from_env() -> Self {
-        Self::parse(std::env::var(AUDIO_QUALITY_ENV).ok().as_deref())
-    }
-
     fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             None | Some("") | Some("max") => Self::Max,
@@ -1047,33 +1044,26 @@ fn format_id(format: &AdaptiveFormat) -> misc::FormatId {
     }
 }
 
-/// Make `format` the audio format and forget all audio progress. Tests use
-/// it to set up states for other formats.
-#[cfg(test)]
-fn switch_audio(state: &mut SabrState, format: &AdaptiveFormat) {
-    state.audio_itag = format.itag;
-    state.audio_format_id = format_id(format);
-    state.audio_max_segment = -1;
-    state.audio_downloaded_ms = 0;
-    state.audio_init_sent = false;
-    state.audio_initialized = false;
-    state.audio_total_end_ms = 0;
-    state.audio_end_segment = 0;
-    state.header_map.clear();
-}
-
 /// Point the stream at a reloaded /player response, as googlevideo does:
 /// new streaming URL and ustreamer config, SABR contexts cleared, format ids
-/// refreshed when the new response still lists the itag. Progress carries
-/// over. Unlike googlevideo, the playback cookie is dropped: it records the
-/// old session's format choice (`audio_fmt`), and resending it with the new
-/// ustreamer config got `sabr.no_audio_selected` for every request in a live
-/// Premium test.
+/// refreshed when the new response still lists the itag; progress, PoToken
+/// and playback cookie carry over. Only a cookie that names another audio
+/// format (`audio_fmt`) than the one streaming is dropped, so the new
+/// session is not told a different format was selected.
 fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), SabrError> {
     check_streaming_url(&player.server_url)?;
     state.server_url = player.server_url.clone();
     state.ustreamer_config = player.ustreamer_config.clone();
-    state.playback_cookie = None;
+    let cookie_audio = state
+        .playback_cookie
+        .as_deref()
+        .and_then(|bytes| vs::PlaybackCookie::decode(bytes).ok())
+        .and_then(|cookie| cookie.audio_fmt)
+        .and_then(|fmt| fmt.itag);
+    if cookie_audio.is_some_and(|itag| itag != state.audio_itag) {
+        tracing::info!("[sabr] reload: dropping a playback cookie for itag {:?}", cookie_audio);
+        state.playback_cookie = None;
+    }
     state.sabr_contexts.clear();
     state.sabr_contexts_send.clear();
     state.sabr_contexts_discard.clear();
@@ -1568,14 +1558,18 @@ async fn sabr_request_cycle(
 /// Stream audio for a YouTube video.
 ///
 /// With a cast ctt and `YTCAST_AUDIO_QUALITY=max` (default), Premium formats
-/// listed by /player are tried first via their own URL (774, then 141; see
-/// `url_transport`); otherwise, or if none delivers a first byte, the regular
-/// format streams via SABR. Returns metadata and a channel receiver of audio
-/// bytes, fed by a background task; the channel closes when the song ends or
-/// fails, and dropping the receiver stops the download.
+/// listed by /player (with a known length) are tried first via their own URL
+/// (774, then 141; see `url_transport`); otherwise, or if none delivers a
+/// first byte, the regular format streams via SABR. Returns metadata and a
+/// channel receiver of audio bytes, fed by a background task; the channel
+/// closes when the song ends or fails, and dropping the receiver stops the
+/// download.
 ///
-/// `start_offset` (a byte range request from MPD seeking) is honoured by the
-/// url transport only; a SABR stream always starts at the beginning.
+/// `start_offset > 0` is a byte range request (MPD seeking). It is served
+/// only from the format pinned when the song started at byte 0 (same itag,
+/// same file, no new /player call); without a pin it fails, and it never
+/// switches format mid-song. An offset at or past the end is
+/// `RangeNotSatisfiable`.
 ///
 /// Requests go through `credential_client()` so that redirects cannot carry
 /// the ctt or tokens off Google hosts.
@@ -1586,6 +1580,9 @@ pub async fn stream_audio(
     start_offset: u64,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     let started = std::time::Instant::now();
+    if start_offset > 0 {
+        return stream_pinned(video_id, start_offset, started).await;
+    }
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
@@ -1599,21 +1596,15 @@ pub async fn stream_audio(
 
     // 2. Premium formats via their URL, best first.
     let with_ctt = client_config.client_name == "WEB_REMIX";
-    let candidates = premium_candidates(&player.formats, AudioQuality::from_env(), with_ctt);
-    if let (Some(ctt), Some(session)) = (ctt, yt_session.as_ref()) {
-        let url_source = PremiumUrlSource {
-            http: client.clone(),
-            video_id: video_id.to_owned(),
-            ctt: ctt.to_owned(),
-            session: session.clone(),
-            po_token: gvs_po_token.clone(),
-        };
-        let premium = first_working(&candidates, |format| {
+    let candidates = premium_plan(&player.formats, with_ctt, env_var);
+    if let (Some(ctt), Some(session), false) = (ctt, yt_session.as_ref(), candidates.is_empty()) {
+        let url_source = PremiumUrlSource::new(client.clone(), video_id, ctt, session.clone(), gvs_po_token.clone());
+        let source = pick_source(&candidates, |format| {
             tracing::debug!("[audio] {}", describe_variants(&player.formats, format.itag));
-            url_source.clone().stream(format, start_offset)
+            url_source.clone().stream(format, 0)
         })
         .await;
-        if let Some((format, rx)) = premium {
+        if let AudioSource::Premium(format, (rx, url)) = source {
             tracing::info!(
                 "audio: itag {} (premium) via url, first bytes after {} ms",
                 format.itag, started.elapsed().as_millis(),
@@ -1623,14 +1614,23 @@ pub async fn stream_audio(
                 duration_secs: player.duration_secs,
                 mime_type: format.mime_type.clone(),
                 content_length: format.content_length,
-                start_offset,
+                start_offset: 0,
             };
+            pins::pin(pins::PinnedFormat {
+                video_id: video_id.to_owned(),
+                itag: format.itag,
+                url,
+                content_length: format.content_length.unwrap_or_default(),
+                last_modified: format.last_modified,
+                mime_type: format.mime_type.clone(),
+                title: player.title.clone(),
+                duration_secs: player.duration_secs,
+                source: url_source,
+            });
             return Ok((info, rx));
         }
     }
-    if start_offset > 0 {
-        tracing::warn!("[audio] {}: SABR cannot start at byte {}; streaming from the start", video_id, start_offset);
-    }
+    pins::unpin(video_id);
 
     // 3. SABR: the regular audio format + a video format for the discard trick.
     let audio_fmt = choose_audio_format(&player.formats)?.clone();
@@ -1670,10 +1670,7 @@ pub async fn stream_audio(
     // 6. Spawn the SABR streaming loop.
     let http = client.clone();
     let ustreamer_config = player.ustreamer_config;
-    let session_version = match client_config.client_name {
-        "WEB_REMIX" => yt_session.as_deref().and_then(|s| s.client_version()).map(str::to_owned),
-        _ => None,
-    };
+    let session_version = sabr_client_version(client_config, yt_session.as_deref());
     let reload_auth = match (ctt, yt_session) {
         (Some(ctt), Some(session)) if client_config.client_name == "WEB_REMIX" => {
             Some((ctt.to_owned(), session))
@@ -1699,35 +1696,203 @@ pub async fn stream_audio(
     Ok((info, rx))
 }
 
-/// Try each format in order; the first that delivers is used. Failures are
-/// logged as warnings, naming what is tried next.
-async fn first_working<'f, T, F, Fut>(
-    formats: &[&'f AdaptiveFormat],
-    mut attempt: F,
-) -> Option<(&'f AdaptiveFormat, T)>
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The Premium formats to try for this song, from the `YTCAST_AUDIO_QUALITY`
+/// setting read through `env`. Only formats with a known content length: a
+/// seek (byte range) must be answerable.
+fn premium_plan(
+    formats: &[AdaptiveFormat],
+    with_ctt: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<&AdaptiveFormat> {
+    let quality = AudioQuality::parse(env(AUDIO_QUALITY_ENV).as_deref());
+    premium_candidates(formats, quality, with_ctt)
+        .into_iter()
+        .filter(|f| f.content_length.is_some_and(|len| len > 0))
+        .collect()
+}
+
+/// The page session's client version for SABR clientInfo, when the song
+/// streams via WEB_REMIX (it must match the /player call).
+fn sabr_client_version(
+    client_config: &InnerTubeClient,
+    session: Option<&crate::music_session::YtMusicSession>,
+) -> Option<String> {
+    match client_config.client_name {
+        "WEB_REMIX" => session.and_then(|s| s.client_version()).map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The outcome of trying the Premium formats.
+enum AudioSource<'f, T> {
+    Premium(&'f AdaptiveFormat, T),
+    Sabr,
+}
+
+/// Try each Premium format in order; the first that delivers is used, else
+/// SABR. Failures are warnings naming what comes next. A decipher failure
+/// goes straight to SABR: every format uses the same base.js.
+async fn pick_source<'f, T, F, Fut>(formats: &[&'f AdaptiveFormat], mut attempt: F) -> AudioSource<'f, T>
 where
     F: FnMut(&'f AdaptiveFormat) -> Fut,
     Fut: std::future::Future<Output = Result<T, SabrError>>,
 {
+    const SABR: &str = "the regular format via sabr";
     for (i, format) in formats.iter().enumerate() {
         match attempt(format).await {
-            Ok(value) => return Some((format, value)),
+            Ok(value) => return AudioSource::Premium(format, value),
+            Err(e) if e.is::<super::url_transport::DecipherError>() => {
+                tracing::warn!("audio: itag {} (premium) via url failed: {}; trying {}", format.itag, e, SABR);
+                return AudioSource::Sabr;
+            }
             Err(e) => {
-                let next = formats
-                    .get(i + 1)
-                    .map_or("the regular format via sabr".to_owned(), |f| format!("itag {} via url", f.itag));
+                let next = formats.get(i + 1).map_or(SABR.to_owned(), |f| format!("itag {} via url", f.itag));
                 tracing::warn!("audio: itag {} (premium) via url failed: {}; trying {}", format.itag, e, next);
             }
         }
     }
-    None
+    AudioSource::Sabr
+}
+
+/// A seek: continue the pinned format from `start_offset`, nothing else.
+async fn stream_pinned(
+    video_id: &str,
+    start_offset: u64,
+    started: std::time::Instant,
+) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
+    let pin = pins::pinned(video_id)
+        .ok_or_else(|| format!("seek to byte {start_offset}: no pinned format for this song"))?;
+    if start_offset >= pin.content_length {
+        return Err(RangeNotSatisfiable { content_length: pin.content_length }.into());
+    }
+    let rx = super::url_transport::RangeFetch {
+        http: pin.source.http.clone(),
+        url: pin.url.clone(),
+        content_length: Some(pin.content_length),
+        chunk_size: URL_CHUNK_SIZE,
+        itag: pin.itag,
+        start_offset,
+        refresher: Box::new(PremiumUrlRefresher::for_pin(&pin)),
+        read_timeout: super::url_transport::READ_TIMEOUT,
+    }
+    .start()
+    .await?;
+    tracing::info!(
+        "audio: itag {} (premium) via url from byte {}, first bytes after {} ms",
+        pin.itag, start_offset, started.elapsed().as_millis(),
+    );
+    let info = SabrStreamInfo {
+        title: pin.title.clone(),
+        duration_secs: pin.duration_secs,
+        mime_type: pin.mime_type.clone(),
+        content_length: Some(pin.content_length),
+        start_offset,
+    };
+    Ok((info, rx))
+}
+
+/// A byte range starting at or past the end of the pinned format.
+#[derive(Debug)]
+pub struct RangeNotSatisfiable {
+    pub content_length: u64,
+}
+
+impl std::fmt::Display for RangeNotSatisfiable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "range starts past the end ({} bytes)", self.content_length)
+    }
+}
+
+impl std::error::Error for RangeNotSatisfiable {}
+
+/// Which format a song streams with, so a seek (byte range request) gets
+/// the same file. In memory only, a few entries, expiring 5 minutes after
+/// last use (the download touches it at every range). Holds the cast's ctt
+/// for the URL refresh, like the stream itself; the URL is never logged.
+mod pins {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const TTL: Duration = Duration::from_secs(5 * 60);
+    const MAX_PINS: usize = 4;
+
+    #[derive(Clone)]
+    pub(super) struct PinnedFormat {
+        pub video_id: String,
+        pub itag: i32,
+        pub url: String,
+        pub content_length: u64,
+        pub last_modified: u64,
+        pub mime_type: String,
+        pub title: String,
+        pub duration_secs: u64,
+        pub source: super::PremiumUrlSource,
+    }
+
+    static PINS: Mutex<Vec<(PinnedFormat, Instant)>> = Mutex::new(Vec::new());
+
+    fn prune(pins: &mut Vec<(PinnedFormat, Instant)>) {
+        pins.retain(|(_, touched)| touched.elapsed() < TTL);
+    }
+
+    pub(super) fn pin(format: PinnedFormat) {
+        let mut pins = PINS.lock().unwrap();
+        prune(&mut pins);
+        pins.retain(|(p, _)| p.video_id != format.video_id);
+        if pins.len() >= MAX_PINS {
+            pins.remove(0);
+        }
+        pins.push((format, Instant::now()));
+    }
+
+    pub(super) fn unpin(video_id: &str) {
+        PINS.lock().unwrap().retain(|(p, _)| p.video_id != video_id);
+    }
+
+    /// The pin for `video_id`, refreshing its expiry.
+    pub(super) fn pinned(video_id: &str) -> Option<PinnedFormat> {
+        let mut pins = PINS.lock().unwrap();
+        prune(&mut pins);
+        let (pin, touched) = pins.iter_mut().find(|(p, _)| p.video_id == video_id)?;
+        *touched = Instant::now();
+        Some(pin.clone())
+    }
+
+    /// Keep the pin alive while its song downloads.
+    pub(super) fn touch(video_id: &str) {
+        if let Some((_, touched)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
+            *touched = Instant::now();
+        }
+    }
+
+    /// A refreshed URL for the pinned song.
+    pub(super) fn update_url(video_id: &str, url: &str) {
+        if let Some((pin, _)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
+            pin.url = url.to_owned();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn age(video_id: &str, by: Duration) {
+        if let Some((_, touched)) = PINS.lock().unwrap().iter_mut().find(|(p, _)| p.video_id == video_id) {
+            *touched -= by;
+        }
+    }
 }
 
 /// Byte-range size for the url transport (the web player uses ~0.5-1 MiB).
 const URL_CHUNK_SIZE: u64 = 1024 * 1024;
 
+/// One solver run at a time for /stream requests: each runs QuickJS with
+/// up to 128-256 MiB, and parallel requests (seeks, probes) must not stack.
+static SOLVER_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Everything needed to (re)resolve a Premium format URL for one song: the
-/// cast's ctt stays here, in memory, only while the song streams.
+/// cast's ctt stays here, in memory, only while the song (or its pin) lives.
 #[derive(Clone)]
 struct PremiumUrlSource {
     http: reqwest::Client,
@@ -1735,26 +1900,41 @@ struct PremiumUrlSource {
     ctt: String,
     session: std::sync::Arc<crate::music_session::YtMusicSession>,
     po_token: Option<String>,
+    /// Client version for `cver`: the page session's, as /player used.
+    cver: String,
+    decipher: std::sync::Arc<dyn super::url_transport::Decipher>,
 }
 
 impl PremiumUrlSource {
+    fn new(
+        http: reqwest::Client,
+        video_id: &str,
+        ctt: &str,
+        session: std::sync::Arc<crate::music_session::YtMusicSession>,
+        po_token: Option<String>,
+    ) -> Self {
+        let cver = session.client_version().unwrap_or(WEB_REMIX_CLIENT.client_version).to_owned();
+        let decipher = std::sync::Arc::new(super::url_transport::PlayerJsDecipher::new(session.clone()));
+        Self { http, video_id: video_id.to_owned(), ctt: ctt.to_owned(), session, po_token, cver, decipher }
+    }
+
     /// Decipher the format's URL (signature into `sp`, `n`, plus pot, cpn,
-    /// cver) on a blocking thread.
+    /// cver) on a blocking thread, one solver run at a time.
     async fn resolve(&self, format: &AdaptiveFormat) -> Result<String, SabrError> {
-        use super::url_transport::{self as ut, PlayerJsDecipher};
+        use super::url_transport as ut;
         tracing::debug!(
             "[url] itag {} source {}",
             format.itag,
             ut::describe_source(format.url.as_deref(), format.signature_cipher.as_deref()),
         );
         let source = ut::format_source(format.url.as_deref(), format.signature_cipher.as_deref())?;
-        let session = self.session.clone();
-        let cver = session.client_version().unwrap_or(WEB_REMIX_CLIENT.client_version).to_owned();
+        let decipher = self.decipher.clone();
+        let cver = self.cver.clone();
         let pot = self.po_token.clone();
+        let _permit = SOLVER_PERMITS.acquire().await.map_err(|_| "solver closed")?;
         let started = std::time::Instant::now();
         let url = tokio::task::spawn_blocking(move || {
-            let decipher = PlayerJsDecipher { session };
-            ut::resolve_url(&source, &decipher, pot.as_deref(), &cver, &ut::generate_cpn())
+            ut::resolve_url(&source, decipher.as_ref(), pot.as_deref(), &cver, &ut::generate_cpn())
         })
         .await
         .map_err(|e| format!("decipher task: {e}"))??;
@@ -1767,27 +1947,63 @@ impl PremiumUrlSource {
     }
 
     /// Start streaming `format` from `start_offset`; `Err` before any byte.
-    async fn stream(self, format: &AdaptiveFormat, start_offset: u64) -> Result<mpsc::Receiver<Bytes>, SabrError> {
+    /// Also returns the resolved URL, for the pin.
+    async fn stream(
+        self,
+        format: &AdaptiveFormat,
+        start_offset: u64,
+    ) -> Result<(mpsc::Receiver<Bytes>, String), SabrError> {
         let url = self.resolve(format).await?;
-        super::url_transport::RangeFetch {
+        let rx = super::url_transport::RangeFetch {
             http: self.http.clone(),
-            url,
+            url: url.clone(),
             content_length: format.content_length,
             chunk_size: URL_CHUNK_SIZE,
             itag: format.itag,
             start_offset,
-            refresher: Box::new(PremiumUrlRefresher { source: self, itag: format.itag }),
+            refresher: Box::new(PremiumUrlRefresher {
+                itag: format.itag,
+                content_length: format.content_length.unwrap_or_default(),
+                last_modified: format.last_modified,
+                source: self,
+            }),
+            read_timeout: super::url_transport::READ_TIMEOUT,
         }
         .start()
-        .await
+        .await?;
+        Ok((rx, url))
     }
 }
 
 /// Fresh URL for a song whose format URL stopped working (expired): a new
-/// WEB_REMIX /player call with the same ctt, deciphered again.
+/// WEB_REMIX /player call with the same ctt, deciphered again. The refreshed
+/// format must be the same file (length and last-modified), else the song
+/// would continue with different bytes.
 struct PremiumUrlRefresher {
     source: PremiumUrlSource,
     itag: i32,
+    content_length: u64,
+    last_modified: u64,
+}
+
+impl PremiumUrlRefresher {
+    fn for_pin(pin: &pins::PinnedFormat) -> Self {
+        Self {
+            source: pin.source.clone(),
+            itag: pin.itag,
+            content_length: pin.content_length,
+            last_modified: pin.last_modified,
+        }
+    }
+
+    /// The listed format that is the same file as the one streaming.
+    fn same_file<'f>(&self, formats: &'f [AdaptiveFormat]) -> Result<&'f AdaptiveFormat, SabrError> {
+        formats
+            .iter()
+            .filter(|f| f.itag == self.itag)
+            .find(|f| f.content_length == Some(self.content_length) && f.last_modified == self.last_modified)
+            .ok_or_else(|| format!("refreshed /player has no itag {} with the same length and last-modified", self.itag).into())
+    }
 }
 
 impl super::url_transport::UrlRefresher for PremiumUrlRefresher {
@@ -1796,13 +2012,15 @@ impl super::url_transport::UrlRefresher for PremiumUrlRefresher {
             let src = &self.source;
             let auth = crate::music_session::web_remix_auth(Some(&src.ctt), Some(&src.session))?;
             let player = innertube_player(&src.http, &src.video_id, PlayerTarget::WebRemix(auth), None, None, None).await?;
-            let candidates = premium_candidates(&player.formats, AudioQuality::Max, true);
-            let format = candidates
-                .into_iter()
-                .find(|f| f.itag == self.itag)
-                .ok_or_else(|| format!("refreshed /player no longer lists itag {}", self.itag))?;
-            src.resolve(format).await
+            let format = self.same_file(&player.formats)?;
+            let url = src.resolve(format).await?;
+            pins::update_url(&src.video_id, &url);
+            Ok(url)
         })
+    }
+
+    fn keep_alive(&self) {
+        pins::touch(&self.source.video_id);
     }
 }
 
@@ -2069,6 +2287,21 @@ mod tests {
     }
 
     // -- helpers --------------------------------------------------------------
+
+    /// Make `format` the audio format and forget all audio progress. Tests use
+    /// it to set up states for other formats.
+    fn switch_audio(state: &mut SabrState, format: &AdaptiveFormat) {
+        state.audio_itag = format.itag;
+        state.audio_format_id = format_id(format);
+        state.audio_max_segment = -1;
+        state.audio_downloaded_ms = 0;
+        state.audio_init_sent = false;
+        state.audio_initialized = false;
+        state.audio_total_end_ms = 0;
+        state.audio_end_segment = 0;
+        state.header_map.clear();
+    }
+
 
     fn test_state(server_url: &str) -> SabrState {
         let fmt = AdaptiveFormat {
@@ -2484,37 +2717,249 @@ mod tests {
         assert_eq!(choose_audio_format(&premium_listing()).unwrap().itag, 251);
     }
 
-    /// Runs `first_working` over 774, 141 with the given per-itag outcomes.
-    async fn chain(ok_itags: &[i32]) -> (Option<i32>, Vec<i32>) {
+    fn listed(itag: i32, mime: &str, bitrate: u64, len: Option<u64>) -> AdaptiveFormat {
+        AdaptiveFormat { content_length: len, ..audio(itag, mime, bitrate) }
+    }
+
+    /// Runs `pick_source` over 774, 141: itags in `ok` deliver, 774 fails with
+    /// `fail_774` (HTTP-like unless it is a decipher failure).
+    async fn chain(ok: &[i32], decipher_fails: bool) -> (Option<i32>, Vec<i32>) {
         let formats = premium_listing();
         let candidates = premium_candidates(&formats, AudioQuality::Max, true);
         let mut tried = Vec::new();
-        let won = first_working(&candidates, |f| {
+        let source = pick_source(&candidates, |f| {
             tried.push(f.itag);
-            let ok = ok_itags.contains(&f.itag);
-            async move { if ok { Ok(()) } else { Err::<(), SabrError>("HTTP 403".into()) } }
+            let ok = ok.contains(&f.itag);
+            let decipher = decipher_fails && f.itag == 774;
+            async move {
+                if ok {
+                    Ok(())
+                } else if decipher {
+                    let err = super::super::url_transport::tests_support::decipher_error("jsc sig error: no solutions");
+                    Err::<(), SabrError>(err)
+                } else {
+                    Err("no media via url (Get: HTTP 403, UmpPost: HTTP 403)".into())
+                }
+            }
         })
         .await;
-        (won.map(|(f, ())| f.itag), tried)
+        let chosen = match source {
+            AudioSource::Premium(f, ()) => Some(f.itag),
+            AudioSource::Sabr => None,
+        };
+        (chosen, tried)
     }
 
     #[tokio::test]
     async fn chain_uses_774_when_it_works() {
-        assert_eq!(chain(&[774, 141]).await, (Some(774), vec![774]));
+        assert_eq!(chain(&[774, 141], false).await, (Some(774), vec![774]));
     }
 
     #[tokio::test]
     async fn chain_falls_back_from_774_to_141() {
         let logs = crate::storage::test_util::LogCapture::start();
-        assert_eq!(chain(&[141]).await, (Some(141), vec![774, 141]));
-        assert!(logs.text().contains("audio: itag 774 (premium) via url failed: HTTP 403; trying itag 141 via url"), "{}", logs.text());
+        assert_eq!(chain(&[141], false).await, (Some(141), vec![774, 141]));
+        assert!(logs.text().contains("audio: itag 774 (premium) via url failed: no media via url"), "{}", logs.text());
+        assert!(logs.text().contains("trying itag 141 via url"), "{}", logs.text());
     }
 
     #[tokio::test]
     async fn chain_ends_with_sabr_when_both_fail() {
         let logs = crate::storage::test_util::LogCapture::start();
-        assert_eq!(chain(&[]).await, (None, vec![774, 141]));
-        assert!(logs.text().contains("itag 141 (premium) via url failed: HTTP 403; trying the regular format via sabr"), "{}", logs.text());
+        assert_eq!(chain(&[], false).await, (None, vec![774, 141]));
+        assert!(logs.text().contains("itag 141 (premium) via url failed: no media via url"), "{}", logs.text());
+        assert!(logs.text().contains("trying the regular format via sabr"), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_decipher_failure_goes_straight_to_sabr() {
+        assert_eq!(chain(&[141], true).await, (None, vec![774]));
+    }
+
+    #[test]
+    fn premium_plan_follows_the_quality_setting() {
+        let formats = [
+            listed(774, OPUS, 272_644, Some(9_000_000)),
+            listed(141, AAC, 262_000, Some(7_000_000)),
+            listed(251, OPUS, 146_272, Some(4_000_000)),
+        ];
+        let env = |value: &'static str| move |name: &str| (name == "YTCAST_AUDIO_QUALITY").then(|| value.to_owned());
+        assert_eq!(itags(&premium_plan(&formats, true, |_| None)), [774, 141]);
+        assert_eq!(itags(&premium_plan(&formats, true, env("max"))), [774, 141]);
+        assert!(premium_plan(&formats, true, env("standard")).is_empty());
+        assert!(premium_plan(&formats, false, |_| None).is_empty());
+    }
+
+    #[test]
+    fn premium_plan_skips_formats_without_a_known_length() {
+        let formats = [listed(774, OPUS, 272_644, None), listed(141, AAC, 262_000, Some(7_000_000))];
+        assert_eq!(itags(&premium_plan(&formats, true, |_| None)), [141]);
+    }
+
+    #[test]
+    fn sabr_client_info_version_comes_from_the_session_for_web_remix() {
+        let session = crate::music_session::test_fixtures::session();
+        assert_eq!(sabr_client_version(&WEB_REMIX_CLIENT, Some(&session)).as_deref(), Some("1.20261102.01.00"));
+        assert_eq!(sabr_client_version(&IOS_CLIENT, Some(&session)), None);
+        assert_eq!(sabr_client_version(&WEB_REMIX_CLIENT, None), None);
+    }
+
+    // -- premium url source, refresh and pins -------------------------------------
+
+    /// A fixed answer for `n` and the signature.
+    struct FixedDecipher;
+
+    impl super::super::url_transport::Decipher for FixedDecipher {
+        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+            Ok((n.map(|_| "solved-n".to_owned()), sig.map(|_| "solved-sig".to_owned())))
+        }
+    }
+
+    fn url_source(video_id: &str) -> PremiumUrlSource {
+        let session = Arc::new(crate::music_session::test_fixtures::session());
+        let mut source = PremiumUrlSource::new(credential_client().clone(), video_id, "CTT-SECRET", session, Some("POT-SECRET".to_owned()));
+        source.decipher = Arc::new(FixedDecipher);
+        source
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_the_session_client_version_and_logs_no_values() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let format = AdaptiveFormat {
+            url: Some("https://rr1---sn-abc.googlevideo.com/videoplayback?itag=774&n=N-SECRET".to_owned()),
+            ..listed(774, OPUS, 272_644, Some(1000))
+        };
+
+        let url = url_source("vid00000001").resolve(&format).await.unwrap();
+
+        let pairs: Vec<(String, String)> = reqwest::Url::parse(&url).unwrap().query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("cver").as_deref(), Some("1.20261102.01.00"));
+        assert_eq!(get("n").as_deref(), Some("solved-n"));
+        assert_eq!(get("pot").as_deref(), Some("POT-SECRET"));
+        let logs = logs.text();
+        assert!(logs.contains("deciphered in"), "{logs}");
+        for secret in ["N-SECRET", "solved-n", "POT-SECRET", "CTT-SECRET", &get("cpn").unwrap()] {
+            assert!(!logs.contains(secret), "{secret} leaked: {logs}");
+        }
+    }
+
+    #[test]
+    fn refresh_accepts_only_the_same_file() {
+        let refresher = PremiumUrlRefresher { source: url_source("vid00000002"), itag: 774, content_length: 1000, last_modified: 1 };
+        let same = listed(774, OPUS, 272_644, Some(1000));
+        let longer = listed(774, OPUS, 272_644, Some(2000));
+        let mut newer = listed(774, OPUS, 272_644, Some(1000));
+        newer.last_modified = 9;
+
+        assert!(refresher.same_file(std::slice::from_ref(&same)).is_ok());
+        assert!(refresher.same_file(&[longer.clone()]).is_err());
+        assert!(refresher.same_file(&[newer.clone()]).is_err());
+        assert!(refresher.same_file(&[listed(141, AAC, 1, Some(1000))]).is_err());
+        assert_eq!(refresher.same_file(&[longer, newer, same]).unwrap().content_length, Some(1000));
+    }
+
+    /// Serves `content` by `range=a-b`; or answers every request with `status`.
+    fn spawn_ranges(listener: tokio::net::TcpListener, content: Vec<u8>, status: u16) -> Arc<Mutex<Vec<String>>> {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let req = read_request(&mut sock).await;
+                let line = req.lines().next().unwrap_or("").to_owned();
+                record.lock().unwrap().push(line.clone());
+                let range = line.split("range=").nth(1).unwrap_or("0-0").split(['&', ' ']).next().unwrap_or("0-0").to_owned();
+                let (a, b) = range.split_once('-').unwrap();
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                let body = if status == 200 { content[a..=b.min(content.len() - 1)].to_vec() } else { Vec::new() };
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+        seen
+    }
+
+    async fn pin_local(video_id: &str, status: u16, content: Vec<u8>) -> Arc<Mutex<Vec<String>>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let len = content.len() as u64;
+        let seen = spawn_ranges(listener, content, status);
+        let mut source = url_source(video_id);
+        source.http = reqwest::Client::new();
+        pins::pin(pins::PinnedFormat {
+            video_id: video_id.to_owned(),
+            itag: 141,
+            url: format!("http://{addr}/videoplayback?itag=141&sig=PINNED-URL-SECRET"),
+            content_length: len,
+            last_modified: 1,
+            mime_type: AAC.to_owned(),
+            title: "Song".to_owned(),
+            duration_secs: 200,
+            source,
+        });
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_seek_continues_the_pinned_format_from_the_offset() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let content: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let seen = pin_local("seekvideo01", 200, content.clone()).await;
+
+        let (info, mut rx) = stream_audio("seekvideo01", None, None, 1500).await.unwrap();
+
+        assert_eq!((info.start_offset, info.content_length), (1500, Some(3000)));
+        assert_eq!(info.mime_type, AAC);
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, content[1500..]);
+        assert!(seen.lock().unwrap().iter().all(|l| l.contains("itag=141")));
+        let logs = logs.text();
+        assert!(logs.contains("audio: itag 141 (premium) via url from byte 1500"), "{logs}");
+        assert!(!logs.contains("PINNED-URL-SECRET"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_pinned_seek_is_an_error_not_another_format() {
+        let seen = pin_local("seekvideo02", 403, vec![0; 3000]).await;
+
+        let err = stream_audio("seekvideo02", Some("ctt"), None, 1500).await.unwrap_err();
+
+        assert!(err.to_string().contains("HTTP 403"), "{err}");
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}"); // GET then the UMP POST form, same URL
+        assert!(lines.iter().all(|l| l.contains("itag=141")), "{lines:?}");
+        assert!(!err.to_string().contains("PINNED-URL-SECRET"));
+    }
+
+    #[tokio::test]
+    async fn a_seek_past_the_end_is_not_satisfiable() {
+        let seen = pin_local("seekvideo03", 200, vec![0; 3000]).await;
+
+        let err = stream_audio("seekvideo03", None, None, 3000).await.unwrap_err();
+
+        assert_eq!(err.downcast_ref::<RangeNotSatisfiable>().map(|e| e.content_length), Some(3000));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_seek_without_a_pin_fails_without_a_player_call() {
+        let err = stream_audio("nopinvideo1", Some("ctt"), None, 1500).await.unwrap_err();
+        assert!(err.to_string().contains("no pinned format"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pins_expire_after_five_idle_minutes() {
+        pin_local("seekvideo04", 200, vec![0; 10]).await;
+        assert!(pins::pinned("seekvideo04").is_some());
+        pins::age("seekvideo04", std::time::Duration::from_secs(4 * 60));
+        assert!(pins::pinned("seekvideo04").is_some(), "use refreshes the expiry");
+        pins::age("seekvideo04", std::time::Duration::from_secs(5 * 60 + 1));
+        assert!(pins::pinned("seekvideo04").is_none());
     }
 
     // -- format variants and client info ---------------------------------------------
@@ -2531,10 +2976,10 @@ mod tests {
     #[test]
     fn reload_keeps_the_same_variant_of_the_itag() {
         let mut state = test_state(GOOD_URL);
-        switch_audio(&mut state, &variant(774, None, false, None));
-        let mut drc = variant(774, Some("drc"), true, None);
+        switch_audio(&mut state, &variant(140, None, false, None));
+        let mut drc = variant(140, Some("drc"), true, None);
         drc.last_modified = 7;
-        let mut plain = variant(774, None, false, None);
+        let mut plain = variant(140, None, false, None);
         plain.last_modified = 8;
         let player = ReloadedPlayer { server_url: RELOADED_URL.to_owned(), ustreamer_config: vec![], formats: vec![drc, plain] };
 
@@ -2797,11 +3242,19 @@ mod tests {
         true
     }
 
-    /// A state streaming itag 774 (only the SABR mechanics matter here).
-    fn premium_state() -> SabrState {
+    /// A SABR state streaming 251 whose format id has last-modified 1.
+    fn sabr_251_state() -> SabrState {
         let mut state = test_state(GOOD_URL);
-        switch_audio(&mut state, &audio(774, OPUS, 272_644));
+        switch_audio(&mut state, &audio(251, OPUS, 146_272));
         state
+    }
+
+    fn cookie_for(itag: i32) -> Vec<u8> {
+        vs::PlaybackCookie {
+            audio_fmt: Some(misc::FormatId { itag: Some(itag), last_modified: Some(5), xtags: None }),
+            ..Default::default()
+        }
+        .encode_to_vec()
     }
 
     fn reload_formats() -> Vec<AdaptiveFormat> {
@@ -2818,7 +3271,8 @@ mod tests {
         let mut state = test_state(GOOD_URL);
         state.sabr_contexts.insert(2, vec![1]);
         state.sabr_contexts_send.insert(2);
-        state.playback_cookie = Some(vec![7]);
+        state.playback_cookie = Some(cookie_for(251));
+        state.po_token = Some(SECRET_POTOKEN.to_vec());
         let (tx, _rx) = mpsc::channel(1);
         let mut cycle = ReloadingCycle { requests: 0, reload_while: |s| s.server_url == GOOD_URL };
         let mut reloader = FakeReloader::new(reload_formats());
@@ -2831,7 +3285,9 @@ mod tests {
         assert_eq!(state.ustreamer_config, vec![9, 9]);
         assert!(state.sabr_contexts.is_empty());
         assert!(state.sabr_contexts_send.is_empty());
-        assert_eq!(state.playback_cookie, None);
+        // Reference behaviour: cookie and PoToken carry over.
+        assert_eq!(state.playback_cookie, Some(cookie_for(251)));
+        assert_eq!(state.po_token.as_deref(), Some(SECRET_POTOKEN));
         assert_eq!(state.stats.reloads, 1);
         assert_eq!(state.audio_itag, 251);
     }
@@ -2851,32 +3307,46 @@ mod tests {
 
     #[tokio::test]
     async fn first_request_after_reload_selects_the_reloaded_format_id() {
-        let mut state = premium_state();
-        state.playback_cookie = Some(vec![7]);
+        let mut state = sabr_251_state();
+        state.playback_cookie = Some(cookie_for(251));
         let (tx, _rx) = mpsc::channel(1);
         let mut cycle = RecordingCycle {
             sent: Vec::new(),
             inner: ReloadingCycle { requests: 0, reload_while: |s| s.server_url == GOOD_URL },
         };
-        let mut reloaded_774 = audio(774, OPUS, 272_644);
-        reloaded_774.last_modified = 2;
-        reloaded_774.xtags = Some("CgcKAnhoEgEx".to_owned());
-        let mut reloader = FakeReloader::new(vec![reloaded_774, audio(251, OPUS, 146_272)]);
+        let mut reloaded_251 = audio(251, OPUS, 146_272);
+        reloaded_251.last_modified = 2;
+        reloaded_251.xtags = Some("CgcKAnhoEgEx".to_owned());
+        let mut reloader = FakeReloader::new(vec![reloaded_251, audio(140, AAC, 134_111)]);
 
         drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
 
         assert_eq!(cycle.sent.len(), 2);
         let after = &cycle.sent[1];
         let expected = misc::FormatId {
-            itag: Some(774),
+            itag: Some(251),
             last_modified: Some(2),
             xtags: Some("CgcKAnhoEgEx".to_owned()),
         };
         // Field 16: googlevideo's selected_audio_format_ids.
         assert_eq!(after.preferred_audio_format_ids, vec![expected]);
-        // The old session's cookie (its audio_fmt) is not sent to the new one.
-        assert_eq!(after.streamer_context.as_ref().unwrap().playback_cookie, None);
+        // A cookie for the streaming format carries over.
+        assert_eq!(after.streamer_context.as_ref().unwrap().playback_cookie, Some(cookie_for(251)));
         assert_eq!(cycle.sent[0].preferred_audio_format_ids[0].last_modified, Some(1));
+    }
+
+    #[test]
+    fn reload_drops_only_a_cookie_for_another_audio_format() {
+        let player = ReloadedPlayer { server_url: RELOADED_URL.to_owned(), ustreamer_config: vec![], formats: vec![] };
+        let mut state = sabr_251_state();
+        state.playback_cookie = Some(cookie_for(774));
+        apply_reload(&mut state, &player).unwrap();
+        assert_eq!(state.playback_cookie, None);
+
+        let mut state = sabr_251_state();
+        state.playback_cookie = Some(vec![7]); // undecodable: kept as is
+        apply_reload(&mut state, &player).unwrap();
+        assert_eq!(state.playback_cookie, Some(vec![7]));
     }
 
     /// Answers with a SABR_ERROR while `error_while(state, request count)`
@@ -2917,7 +3387,8 @@ mod tests {
 
     #[test]
     fn request_format_summary_shows_format_ids_and_cookie_formats_only() {
-        let mut state = premium_state();
+        let mut state = sabr_251_state();
+        switch_audio(&mut state, &audio(140, AAC, 134_111));
         state.po_token = Some(SECRET_POTOKEN.to_vec());
         let cookie = vs::PlaybackCookie {
             audio_fmt: Some(misc::FormatId { itag: Some(251), last_modified: Some(5), xtags: None }),
@@ -2927,7 +3398,7 @@ mod tests {
 
         let line = describe_request_formats(&state.build_request());
 
-        assert!(line.contains("selected audio [774 lm=1 xtags=-]"), "{line}");
+        assert!(line.contains("selected audio [140 lm=1 xtags=-]"), "{line}");
         assert!(line.contains("selected video [251 lm=1 xtags=-]"), "{line}");
         assert!(line.contains("init [251 lm=1 xtags=-]"), "{line}");
         assert!(line.contains("cookie audio=251 video=-"), "{line}");

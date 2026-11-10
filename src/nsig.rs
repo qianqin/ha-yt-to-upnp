@@ -26,7 +26,7 @@ static PREPROCESSED_CACHE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// Disk cache file path: `$YTCAST_DATA_DIR/nsig-cache/` or `~/.cache/ytcast/`,
 /// file `nsig-preprocessed-ejs{EJS_VERSION}-{hash}.js`.
-fn cache_path(player_hash: &str) -> Option<PathBuf> {
+pub(crate) fn cache_path(player_hash: &str) -> Option<PathBuf> {
     cache_path_in(crate::storage::data_dir_env().as_deref(), player_hash)
 }
 
@@ -83,11 +83,6 @@ impl Challenge {
     }
 }
 
-/// Decipher a `signatureCipher` `s` value (same solver and cache as nsig).
-pub fn decode_sig(player_js: &str, s_value: &str, player_hash: &str) -> Result<String, String> {
-    decode_challenge_cached_at(player_js, Challenge::Sig, s_value, player_hash, cache_path(player_hash))
-}
-
 /// [`decode_nsig`] with an explicit disk cache file.
 pub fn decode_nsig_cached_at(
     player_js: &str,
@@ -95,18 +90,21 @@ pub fn decode_nsig_cached_at(
     player_hash: &str,
     disk_cache: Option<PathBuf>,
 ) -> Result<String, String> {
-    decode_challenge_cached_at(player_js, Challenge::N, n_value, player_hash, disk_cache)
+    let mut out = solve_cached_at(player_js, &[(Challenge::N, n_value)], player_hash, disk_cache)?;
+    Ok(out.remove(0))
 }
 
-/// Any [`Challenge`] with an explicit disk cache file.
-pub fn decode_challenge_cached_at(
+/// Solve several challenges in ONE solver run (e.g. a format URL's `n` and
+/// `sig`), with the per-player-version cache in `disk_cache` (memory cache
+/// keyed by `player_hash`). Answers come back in request order. Errors and
+/// logs carry lengths and generic reasons, never values.
+pub fn solve_cached_at(
     player_js: &str,
-    challenge: Challenge,
-    value: &str,
+    requests: &[(Challenge, &str)],
     player_hash: &str,
     disk_cache: Option<PathBuf>,
-) -> Result<String, String> {
-    decode_with_limits(player_js, challenge, value, player_hash, disk_cache, MEM_LIMITS)
+) -> Result<Vec<String>, String> {
+    decode_with_limits(player_js, requests, player_hash, disk_cache, MEM_LIMITS)
 }
 
 /// QuickJS heap limits per decode; each decode gets a fresh runtime.
@@ -133,14 +131,13 @@ const NULL_EXCEPTION: &str = "null exception (OOM?)";
 
 fn decode_with_limits(
     player_js: &str,
-    challenge: Challenge,
-    n_value: &str,
+    requests: &[(Challenge, &str)],
     player_hash: &str,
     disk_cache: Option<PathBuf>,
     limits: MemLimits,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let player_js = player_js.to_owned();
-    let n_value = n_value.to_owned();
+    let requests: Vec<(Challenge, String)> = requests.iter().map(|(c, v)| (*c, (*v).to_owned())).collect();
     let player_hash = player_hash.to_owned();
 
     // Check memory cache first, then disk cache
@@ -162,11 +159,10 @@ fn decode_with_limits(
         .name("nsig-solver".into())
         .stack_size(SOLVER_STACK_SIZE)
         .spawn(move || {
-            let result = run_solver(&player_js, challenge, &n_value, cached.as_deref(), limits)?;
+            let result = run_solver(&player_js, &requests, cached.as_deref(), limits)?;
             // An unusable answer from a player that ran is not a cache fault.
-            match challenge {
-                Challenge::N => check_decoded(&n_value, &result.decoded)?,
-                Challenge::Sig => check_sig_decoded(&n_value, &result.decoded)?,
+            for ((challenge, value), decoded) in requests.iter().zip(&result.decoded) {
+                check_decoded(*challenge, value, decoded)?;
             }
 
             // A preprocessed player comes back only from a fresh parse; it
@@ -185,27 +181,14 @@ fn decode_with_limits(
         .map_err(|_| "solver thread panicked".to_string())?
 }
 
-/// Signatures are request credentials: only lengths are logged.
-fn check_sig_decoded(s_value: &str, decoded: &str) -> Result<(), String> {
-    if decoded.is_empty() || decoded == s_value {
-        return Err(format!("sig decode returned an invalid result (len {})", decoded.len()));
+/// Challenge values and answers are request credentials (a signature) or
+/// close to it: only lengths are logged or reported.
+fn check_decoded(challenge: Challenge, value: &str, decoded: &str) -> Result<(), String> {
+    let kind = challenge.request_type();
+    if decoded.is_empty() || decoded == value {
+        return Err(format!("{kind} decode returned an invalid result (len {})", decoded.len()));
     }
-    tracing::info!("[nsig] sig deciphered: len {} -> {}", s_value.len(), decoded.len());
-    Ok(())
-}
-
-fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
-    if decoded.is_empty() || decoded == n_value {
-        return Err(format!(
-            "nsig decode returned invalid result: '{}'",
-            &decoded[..decoded.floor_char_boundary(64)]
-        ));
-    }
-    tracing::info!(
-        "[nsig] decoded: {} -> {}",
-        n_value,
-        &decoded[..decoded.floor_char_boundary(16)]
-    );
+    tracing::info!("[nsig] {} solved: len {} -> {}", kind, value.len(), decoded.len());
     Ok(())
 }
 
@@ -216,21 +199,20 @@ fn check_decoded(n_value: &str, decoded: &str) -> Result<(), String> {
 /// cache; if it fails too, the cache is left alone.
 fn run_solver(
     player_js: &str,
-    challenge: Challenge,
-    n_value: &str,
+    requests: &[(Challenge, String)],
     cached: Option<&str>,
     limits: MemLimits,
 ) -> Result<DecodeResult, String> {
     if let Some(preprocessed) = cached {
         for limit in [limits.cached, limits.fresh] {
-            match decode_nsig_inner(player_js, challenge, n_value, Some(preprocessed), limit) {
+            match decode_nsig_inner(player_js, requests, Some(preprocessed), limit) {
                 Ok(result) => return Ok(result),
                 Err(e) => tracing::warn!("[nsig] cached player failed at {} MiB: {}", limit >> 20, e),
             }
         }
         tracing::warn!("[nsig] re-parsing base.js; the cache is replaced only if that succeeds");
     }
-    decode_nsig_inner(player_js, challenge, n_value, None, limits.fresh)
+    decode_nsig_inner(player_js, requests, None, limits.fresh)
 }
 
 /// Runs a cached player with 3/4 of the cached-path limit, so a live test
@@ -239,18 +221,35 @@ fn run_solver(
 #[cfg(test)]
 #[allow(dead_code)] // used by the binary crate's network test
 pub(crate) fn decode_cached_below_limit(preprocessed: &str, n_value: &str) -> Result<String, String> {
-    decode_nsig_inner("", Challenge::N, n_value, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|r| r.decoded)
+    let requests = [(Challenge::N, n_value.to_owned())];
+    decode_nsig_inner("", &requests, Some(preprocessed), MEM_LIMITS.cached / 4 * 3).map(|mut r| r.decoded.remove(0))
 }
 
 struct DecodeResult {
-    decoded: String,
+    /// One answer per request, in request order.
+    decoded: Vec<String>,
     preprocessed: Option<String>,
+}
+
+/// The solver's per-request error, reduced to a generic reason: its text can
+/// quote the challenge value.
+fn generic_solver_error(err: &str) -> &'static str {
+    if err.starts_with("Failed to extract") {
+        "no function found"
+    } else if err.starts_with("no solutions") {
+        "no solutions"
+    } else if err.starts_with("invalid solutions") {
+        "invalid solutions"
+    } else if err.starts_with("Unknown request type") {
+        "unknown request type"
+    } else {
+        "solver failed"
+    }
 }
 
 fn decode_nsig_inner(
     player_js: &str,
-    challenge: Challenge,
-    n_value: &str,
+    requests: &[(Challenge, String)],
     cached_preprocessed: Option<&str>,
     mem_limit: usize,
 ) -> Result<DecodeResult, String> {
@@ -276,10 +275,15 @@ fn decode_nsig_inner(
 
         // 4. Set variables
         let global = ctx.globals();
-        global.set("_n_value", n_value)
-            .map_err(|e| fmt_js_error(&ctx, e, "set _n_value"))?;
-        global.set("_challenge_type", challenge.request_type())
-            .map_err(|e| fmt_js_error(&ctx, e, "set _challenge_type"))?;
+        let requests_json = serde_json::to_string(
+            &requests
+                .iter()
+                .map(|(c, v)| serde_json::json!({ "type": c.request_type(), "challenges": [v] }))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| format!("encode solver requests: {e}"))?;
+        global.set("_requests_json", requests_json)
+            .map_err(|e| fmt_js_error(&ctx, e, "set _requests_json"))?;
 
         let result_json: String = if let Some(preprocessed) = cached_preprocessed {
             // Fast path: use cached preprocessed player (~0.6s, ~65MB)
@@ -292,7 +296,7 @@ fn decode_nsig_inner(
                     var _r = jsc({
                         type: "preprocessed",
                         preprocessed_player: _preprocessed,
-                        requests: [{type: _challenge_type, challenges: [_n_value]}],
+                        requests: JSON.parse(_requests_json),
                         output_preprocessed: false
                     });
                     JSON.stringify(_r);
@@ -314,7 +318,7 @@ fn decode_nsig_inner(
                     var _r = jsc({
                         type: "player",
                         player: _player_js,
-                        requests: [{type: _challenge_type, challenges: [_n_value]}],
+                        requests: JSON.parse(_requests_json),
                         output_preprocessed: true
                     });
                     JSON.stringify(_r);
@@ -333,7 +337,7 @@ fn decode_nsig_inner(
 
         if result.get("type").and_then(|t| t.as_str()) == Some("error") {
             let msg = result.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-            return Err(format!("jsc error: {}", msg));
+            return Err(format!("jsc error: {}", generic_solver_error(msg)));
         }
 
         // Extract preprocessed player for caching
@@ -342,36 +346,28 @@ fn decode_nsig_inner(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let response = result
-            .get("responses")
-            .and_then(|r| r.as_array())
-            .and_then(|arr| arr.first());
-        if let Some(err) = response
-            .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("error"))
-            .and_then(|r| r.get("error"))
-            .and_then(|e| e.as_str())
-        {
-            return Err(format!(
-                "jsc {} error: {}",
-                challenge.request_type(),
-                &err[..err.floor_char_boundary(300)]
-            ));
+        let responses = result.get("responses").and_then(|r| r.as_array());
+        let mut decoded = Vec::with_capacity(requests.len());
+        for (i, (challenge, value)) in requests.iter().enumerate() {
+            let kind = challenge.request_type();
+            let response = responses.and_then(|arr| arr.get(i));
+            if let Some(err) = response
+                .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("error"))
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.as_str())
+            {
+                return Err(format!("jsc {kind} error: {}", generic_solver_error(err)));
+            }
+            let answer = response
+                .and_then(|resp| resp.get("data"))
+                .and_then(|data| data.get(value))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("unexpected jsc response for {kind} ({} bytes)", result_json.len()))?;
+            decoded.push(answer.to_string());
         }
 
-        // Extract decoded n from responses[0].data[n_value]
-        let decoded = response
-            .and_then(|resp| resp.get("data"))
-            .and_then(|data| data.get(n_value))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "unexpected jsc response: {}",
-                    &result_json[..result_json.floor_char_boundary(300)]
-                )
-            })?;
-
         Ok(DecodeResult {
-            decoded: decoded.to_string(),
+            decoded,
             preprocessed,
         })
     })
@@ -409,6 +405,18 @@ fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, stage: &str) -> Str
         format!("{} failed: {:?}", stage, caught)
     }
 }
+
+/// Minimal player in base.js's shape: one IIFE whose URL builder calls
+/// `x.set("alr", "yes")`; its first non-accessor URL method reverses n.
+#[cfg(test)]
+pub(crate) const SYNTHETIC_PLAYER: &str = r#"(function(g){
+var Q = function(u){ this.p = {}; };
+Q.prototype.set = function(k, v){ this.p[k] = v; };
+Q.prototype.get = function(k){ return this.p[k]; };
+Q.prototype.clone = function(){ return this; };
+Q.prototype.mutate = function(){ var n = this.p.n; if (n) this.p.n = n.split("").reverse().join(""); var s = this.p.s; if (s) this.p.s = s.toUpperCase(); };
+g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val) u.set(key, val); return u; };
+}).call(this, {});"#;
 
 #[cfg(test)]
 mod tests {
@@ -463,17 +471,33 @@ mod tests {
 
     #[test]
     fn decoded_value_must_differ_from_input() {
-        assert!(check_decoded("abc", "").is_err());
-        assert!(check_decoded("abc", "abc").is_err());
-        // Multi-byte char across the 16-byte log cut.
-        check_decoded("abc", &format!("{}\u{20ac}tail", "x".repeat(15))).unwrap();
+        assert!(check_decoded(Challenge::N, "abc", "").is_err());
+        assert!(check_decoded(Challenge::N, "abc", "abc").is_err());
+        check_decoded(Challenge::N, "abc", &format!("{}\u{20ac}tail", "x".repeat(15))).unwrap();
     }
 
     #[test]
-    fn invalid_result_error_is_truncated() {
-        let decoded = format!("{}\u{20ac}{}", "x".repeat(63), "TAIL".repeat(50));
-        let err = check_decoded(&decoded, &decoded).unwrap_err();
-        assert!(!err.contains("TAIL"), "{err}");
+    fn checks_report_and_log_lengths_only() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let n = "N-CHALLENGE-VALUE";
+        check_decoded(Challenge::N, n, "N-ANSWER-VALUE").unwrap();
+        check_decoded(Challenge::Sig, "S-CHALLENGE-VALUE", "S-ANSWER-VALUE").unwrap();
+        let err = check_decoded(Challenge::Sig, "S-CHALLENGE-VALUE", "S-CHALLENGE-VALUE").unwrap_err();
+        let logs = logs.text();
+        assert!(logs.contains("n solved: len 17 -> 14"), "{logs}");
+        assert!(logs.contains("sig solved: len 17 -> 14"), "{logs}");
+        for text in [logs, err] {
+            for secret in ["N-CHALLENGE", "N-ANSWER", "S-CHALLENGE", "S-ANSWER"] {
+                assert!(!text.contains(secret), "{secret}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn solver_errors_are_generic() {
+        assert_eq!(generic_solver_error("no solutions: TypeError at SECRET-N"), "no solutions");
+        assert_eq!(generic_solver_error("Failed to extract sig function"), "no function found");
+        assert_eq!(generic_solver_error("boom SECRET-N"), "solver failed");
     }
 
     #[test]
@@ -489,16 +513,6 @@ mod tests {
         assert!(path.exists(), "cache was discarded for a player that ran");
     }
 
-    /// Minimal player in base.js's shape: one IIFE whose URL builder calls
-    /// `x.set("alr", "yes")`; its first non-accessor URL method reverses n.
-    const SYNTHETIC_PLAYER: &str = r#"(function(g){
-var Q = function(u){ this.p = {}; };
-Q.prototype.set = function(k, v){ this.p[k] = v; };
-Q.prototype.get = function(k){ return this.p[k]; };
-Q.prototype.clone = function(){ return this; };
-Q.prototype.mutate = function(){ var n = this.p.n; if (n) this.p.n = n.split("").reverse().join(""); var s = this.p.s; if (s) this.p.s = s.toUpperCase(); };
-g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val) u.set(key, val); return u; };
-}).call(this, {});"#;
 
     #[test]
     fn solver_extracts_n_from_player_and_reuses_preprocessed() {
@@ -542,7 +556,8 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         let limits = MemLimits { cached: STARVED.cached, fresh: MEM_LIMITS.fresh };
 
         // No player JS: only the retry of the cached player can succeed.
-        let decoded = decode_with_limits("", Challenge::N, "xyz", "test-retry-disk", Some(path.clone()), limits);
+        let decoded = decode_with_limits("", &[(Challenge::N, "xyz")], "test-retry-disk", Some(path.clone()), limits)
+            .map(|mut d| d.remove(0));
 
         assert_eq!(decoded.unwrap(), "zyx");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -575,7 +590,7 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
         let (_tmp, path) = cache_synthetic_player("nsig-starved");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let decoded = decode_with_limits(SYNTHETIC_PLAYER, Challenge::N, "xyz", "test-starved-disk", Some(path.clone()), STARVED);
+        let decoded = decode_with_limits(SYNTHETIC_PLAYER, &[(Challenge::N, "xyz")], "test-starved-disk", Some(path.clone()), STARVED);
 
         assert!(decoded.is_err(), "{decoded:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -599,36 +614,44 @@ g.mk = function(url, key, val){ var u = new Q(url); u.set("alr", "yes"); if (val
     }
 
     #[test]
-    fn solver_deciphers_sig() {
+    fn solver_answers_n_and_sig_in_one_run_in_request_order() {
         let tmp = TempDir::new("sig-synthetic");
         let path = tmp.path().join("nsig-preprocessed-sig.js");
 
-        let sig = decode_challenge_cached_at(SYNTHETIC_PLAYER, Challenge::Sig, "secretsig", "test-sig", Some(path));
+        let answers = solve_cached_at(
+            SYNTHETIC_PLAYER,
+            &[(Challenge::N, "abc123"), (Challenge::Sig, "secretsig")],
+            "test-sig",
+            Some(path),
+        );
 
-        assert_eq!(sig.unwrap(), "SECRETSIG");
+        assert_eq!(answers.unwrap(), ["321cba", "SECRETSIG"]);
     }
 
     #[test]
-    fn sig_check_logs_lengths_only() {
-        let logs = crate::storage::test_util::LogCapture::start();
-        check_sig_decoded("secretsig", "SECRETSIG").unwrap();
-        let err = check_sig_decoded("secretsig", "secretsig").unwrap_err();
-        let logs = logs.text();
-        assert!(logs.contains("sig deciphered: len 9 -> 9"), "{logs}");
-        for text in [logs, err] {
-            assert!(!text.contains("secretsig") && !text.contains("SECRETSIG"), "{text}");
-        }
+    fn preprocessed_player_is_keyed_by_player_hash() {
+        let tmp = TempDir::new("sig-hash-key");
+        let path = tmp.path().join("nsig-preprocessed-keyed.js");
+        solve_cached_at(SYNTHETIC_PLAYER, &[(Challenge::Sig, "abc")], "test-hash-a", Some(path.clone())).unwrap();
+
+        // Same hash: served from cache without base.js.
+        let cached = solve_cached_at("", &[(Challenge::Sig, "xyz")], "test-hash-a", Some(path));
+        assert_eq!(cached.unwrap(), ["XYZ"]);
+        // Another player version must not reuse it.
+        let other = solve_cached_at("", &[(Challenge::Sig, "xyz")], "test-hash-b-unrelated", None);
+        assert!(other.is_err(), "{other:?}");
     }
 
     #[test]
-    fn player_without_sig_function_reports_sig_error() {
-        let err = decode_challenge_cached_at(PLAYER_WITHOUT_N, Challenge::Sig, "abc", "test-no-sig", None).unwrap_err();
+    fn player_without_sig_function_reports_a_generic_sig_error() {
+        let err = solve_cached_at(PLAYER_WITHOUT_N, &[(Challenge::Sig, "SECRET-S")], "test-no-sig", None).unwrap_err();
         assert!(err.starts_with("jsc sig error"), "{err}");
+        assert!(!err.contains("SECRET-S"), "{err}");
     }
 
     #[test]
     fn player_without_n_function_reports_solver_error() {
         let err = decode_nsig_cached_at(PLAYER_WITHOUT_N, "abc", "test-no-solution", None).unwrap_err();
-        assert!(err.starts_with("jsc n error: no solutions"), "{err}");
+        assert_eq!(err, "jsc n error: no solutions");
     }
 }

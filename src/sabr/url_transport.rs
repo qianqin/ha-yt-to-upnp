@@ -18,31 +18,61 @@ use super::ump::{self, UmpParser};
 
 /// Solves base.js challenges for a format URL.
 pub(crate) trait Decipher: Send + Sync {
-    fn n(&self, value: &str) -> Result<String, String>;
-    fn sig(&self, value: &str) -> Result<String, String>;
+    /// The URL's `n` and signature `s` (either may be absent), solved in one
+    /// solver run; answers in the same positions.
+    fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String>;
 }
 
-/// The real solver, on the anonymous page session's base.js.
+/// The real solver, on the anonymous page session's base.js, with the
+/// per-player-version cache (keyed by the player hash).
 pub(crate) struct PlayerJsDecipher {
     pub session: std::sync::Arc<crate::music_session::YtMusicSession>,
+    pub disk_cache: Option<std::path::PathBuf>,
 }
 
 impl PlayerJsDecipher {
-    fn player(&self) -> Result<(&str, String), String> {
-        let js = self.session.player_js.as_deref().ok_or("no base.js in the YouTube Music session")?;
-        Ok((js, self.session.player_hash.clone().unwrap_or_default()))
+    pub(crate) fn new(session: std::sync::Arc<crate::music_session::YtMusicSession>) -> Self {
+        let disk_cache = crate::nsig::cache_path(session.player_hash.as_deref().unwrap_or_default());
+        Self { session, disk_cache }
     }
 }
 
 impl Decipher for PlayerJsDecipher {
-    fn n(&self, value: &str) -> Result<String, String> {
-        let (js, hash) = self.player()?;
-        crate::nsig::decode_nsig(js, value, &hash)
+    fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+        use crate::nsig::Challenge;
+        let js = self.session.player_js.as_deref().ok_or("no base.js in the YouTube Music session")?;
+        let hash = self.session.player_hash.as_deref().unwrap_or_default();
+        let requests: Vec<(Challenge, &str)> = [(Challenge::N, n), (Challenge::Sig, sig)]
+            .into_iter()
+            .filter_map(|(c, v)| v.map(|v| (c, v)))
+            .collect();
+        if requests.is_empty() {
+            return Ok((None, None));
+        }
+        let mut answers = crate::nsig::solve_cached_at(js, &requests, hash, self.disk_cache.clone())?.into_iter();
+        let n = n.map(|_| answers.next().unwrap_or_default());
+        let sig = sig.map(|_| answers.next().unwrap_or_default());
+        Ok((n, sig))
     }
+}
 
-    fn sig(&self, value: &str) -> Result<String, String> {
-        let (js, hash) = self.player()?;
-        crate::nsig::decode_sig(js, value, &hash)
+/// The format URL could not be deciphered. Another format would use the same
+/// base.js, so the caller stops trying formats.
+#[derive(Debug)]
+pub(crate) struct DecipherError(String);
+
+impl std::fmt::Display for DecipherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decipher failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DecipherError {}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) fn decipher_error(reason: &str) -> super::SabrError {
+        Box::new(super::DecipherError(reason.to_owned()))
     }
 }
 
@@ -112,13 +142,16 @@ pub(crate) fn resolve_url(
     }
     let mut url = reqwest::Url::parse(&source.url).map_err(|_| "unparseable format url")?;
     let mut pairs: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
-    for (key, value) in pairs.iter_mut() {
-        if key == "n" {
-            *value = decipher.n(value).map_err(|e| format!("n decipher: {e}"))?;
+    let n = pairs.iter().find(|(k, _)| k == "n").map(|(_, v)| v.clone());
+    let s = source.signature.as_ref().map(|(_, s)| s.as_str());
+    // The solver's own errors are generic; nothing here quotes a value.
+    let (n_solved, sig) = decipher.solve(n.as_deref(), s).map_err(DecipherError)?;
+    if let Some(n_solved) = n_solved {
+        for (_, value) in pairs.iter_mut().filter(|(k, _)| k == "n") {
+            *value = n_solved.clone();
         }
     }
-    if let Some((sp, s)) = &source.signature {
-        let sig = decipher.sig(s).map_err(|e| format!("sig decipher: {e}"))?;
+    if let (Some((sp, _)), Some(sig)) = (&source.signature, sig) {
         pairs.push((sp.clone(), sig));
     }
     if let Some(pot) = po_token {
@@ -149,8 +182,13 @@ pub(crate) enum RangeMode {
 /// The web player's 2-byte request body (protobuf field 15 = 0).
 const UMP_POST_BODY: [u8; 2] = [0x78, 0x00];
 
-/// Extra attempts per range after the first bytes have arrived.
+/// Extra attempts per range after the first bytes have arrived; also the
+/// number of times one range may break off and be resumed.
 const RANGE_RETRIES: u32 = 2;
+
+/// How long a range request may wait for its response, or for the next
+/// body chunk. Waiting for the consumer (backpressure) is not limited.
+pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Channel slots between the download and the consumer. Each slot holds one
 /// body chunk as it arrives (typically 8-64 KiB), so memory stays bounded and
@@ -164,6 +202,8 @@ pub(crate) type RefreshFuture<'a> =
 /// mid-song (e.g. expired).
 pub(crate) trait UrlRefresher: Send {
     fn refresh(&mut self) -> RefreshFuture<'_>;
+    /// Called at every new range while the song downloads.
+    fn keep_alive(&self) {}
 }
 
 /// One format, fetched as sequential byte ranges from `start_offset`.
@@ -175,6 +215,7 @@ pub(crate) struct RangeFetch {
     pub itag: i32,
     pub start_offset: u64,
     pub refresher: Box<dyn UrlRefresher>,
+    pub read_timeout: std::time::Duration,
 }
 
 fn range_url(url: &str, start: u64, end: u64, rn: u32, mode: RangeMode) -> String {
@@ -211,11 +252,13 @@ struct RangeBody {
 
 impl RangeBody {
     /// The next non-empty piece of media, `None` at the end of the range.
-    async fn next_media(&mut self) -> Option<Result<Bytes, RangeError>> {
+    async fn next_media(&mut self, read_timeout: std::time::Duration) -> Option<Result<Bytes, RangeError>> {
         loop {
-            let chunk = match self.stream.next().await? {
-                Ok(chunk) => chunk,
-                Err(e) => return Some(Err(RangeError::Other(e.without_url().to_string()))),
+            let chunk = match tokio::time::timeout(read_timeout, self.stream.next()).await {
+                Err(_) => return Some(Err(RangeError::Other("read timed out".to_owned()))),
+                Ok(None) => return None,
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(e))) => return Some(Err(RangeError::Other(e.without_url().to_string()))),
             };
             let media = match &mut self.ump {
                 None => chunk,
@@ -245,6 +288,7 @@ async fn open_range(
     end: u64,
     rn: u32,
     mode: RangeMode,
+    read_timeout: std::time::Duration,
 ) -> Result<RangeBody, RangeError> {
     let target = range_url(url, start, end, rn, mode);
     let req = match mode {
@@ -254,7 +298,10 @@ async fn open_range(
             .header("Content-Type", "application/x-protobuf")
             .body(UMP_POST_BODY.to_vec()),
     };
-    let resp = req.send().await.map_err(|e| RangeError::Other(e.without_url().to_string()))?;
+    let resp = tokio::time::timeout(read_timeout, req.send())
+        .await
+        .map_err(|_| RangeError::Other("no response (timed out)".to_owned()))?
+        .map_err(|e| RangeError::Other(e.without_url().to_string()))?;
     let status = resp.status();
     if matches!(status.as_u16(), 401 | 403 | 410) {
         return Err(RangeError::Refused(status.as_u16()));
@@ -284,7 +331,7 @@ enum Ending {
 
 impl RangeFetch {
     fn range_end(&self, start: u64) -> u64 {
-        let end = start + self.chunk_size - 1;
+        let end = start.saturating_add(self.chunk_size - 1);
         match self.content_length {
             Some(len) => end.min(len.saturating_sub(1)),
             None => end,
@@ -307,8 +354,8 @@ impl RangeFetch {
         let mut failures = Vec::new();
         let mut opened = None;
         for mode in [RangeMode::Get, RangeMode::UmpPost] {
-            let first = match open_range(&self.http, &self.url, self.start_offset, end, 1, mode).await {
-                Ok(mut body) => match body.next_media().await {
+            let first = match open_range(&self.http, &self.url, self.start_offset, end, 1, mode, self.read_timeout).await {
+                Ok(mut body) => match body.next_media(self.read_timeout).await {
                     Some(Ok(bytes)) => Ok((body, bytes)),
                     Some(Err(e)) => Err(e.to_string()),
                     None => Err("no media".to_owned()),
@@ -373,7 +420,13 @@ impl RangeFetch {
             loop {
                 let next = match pending.take() {
                     Some(bytes) => Some(Ok(bytes)),
-                    None => body.next_media().await,
+                    // A consumer that goes away stops the download at once,
+                    // even while the server is slow to send.
+                    None => tokio::select! {
+                        biased;
+                        _ = tx.closed() => return (Ending::Cancelled, offset - self.start_offset),
+                        next = body.next_media(self.read_timeout) => next,
+                    },
                 };
                 match next {
                     Some(Ok(bytes)) => {
@@ -400,6 +453,9 @@ impl RangeFetch {
                 }
                 failure = Some(RangeError::Other(format!("range ended at {offset}")));
             }
+            if failure.is_none() {
+                broken_ranges = 0;
+            }
             if let Some(e) = failure {
                 broken_ranges += 1;
                 if broken_ranges > RANGE_RETRIES {
@@ -409,6 +465,7 @@ impl RangeFetch {
             }
 
             // Open the next range (or the rest of a broken one).
+            self.refresher.keep_alive();
             range_start = offset;
             range_end = self.range_end(offset);
             let mut attempts = 0;
@@ -417,7 +474,7 @@ impl RangeFetch {
                     return (Ending::Cancelled, sent);
                 }
                 rn += 1;
-                match open_range(&self.http, &self.url, range_start, range_end, rn, mode).await {
+                match open_range(&self.http, &self.url, range_start, range_end, rn, mode, self.read_timeout).await {
                     Ok(body) => break body,
                     Err(RangeError::Refused(status)) if !refreshed => {
                         refreshed = true;
@@ -445,19 +502,36 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Recognisable secret values: none may appear in any log or error.
+    const S_SECRET: &str = "S-SECRET-SIGNATURE";
+    const N_SECRET: &str = "N-SECRET-NVALUE";
+    const POT_SECRET: &str = "POT-SECRET-TOKEN";
+    const CPN_SECRET: &str = "CPN-SECRET";
+    const SECRETS: [&str; 6] = [S_SECRET, N_SECRET, POT_SECRET, CPN_SECRET, "SECRET-SIG", "SECRET-NVALUE"];
+
+    fn assert_no_secrets(text: &str) {
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert!(!text.to_uppercase().contains("EULAVN-TERCES"), "reversed n leaked: {text}");
+    }
+
     /// Reverses `n` and upper-cases the signature, like a (fake) base.js.
     struct FakeDecipher;
 
     impl Decipher for FakeDecipher {
-        fn n(&self, value: &str) -> Result<String, String> {
-            Ok(value.chars().rev().collect())
-        }
-        fn sig(&self, value: &str) -> Result<String, String> {
-            Ok(value.to_uppercase())
+        fn solve(&self, n: Option<&str>, sig: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+            Ok((n.map(|n| n.chars().rev().collect()), sig.map(str::to_lowercase)))
         }
     }
 
-    const FORMAT_URL: &str = "https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&itag=141&n=abcd&sparams=expire";
+    fn format_url() -> String {
+        format!("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1&itag=141&n={N_SECRET}&sparams=expire")
+    }
+
+    fn cipher() -> String {
+        serde_urlencoded::to_string([("s", S_SECRET), ("sp", "sig"), ("url", &format_url())]).unwrap()
+    }
 
     fn query(url: &str) -> Vec<(String, String)> {
         reqwest::Url::parse(url).unwrap().query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
@@ -469,92 +543,125 @@ mod tests {
 
     #[test]
     fn signature_cipher_is_split_into_url_s_and_sp() {
-        let cipher = serde_urlencoded::to_string([("s", "secret-s"), ("sp", "sig"), ("url", FORMAT_URL)]).unwrap();
+        let source = format_source(None, Some(&cipher())).unwrap();
 
-        let source = format_source(None, Some(&cipher)).unwrap();
-
-        assert_eq!(source.url, FORMAT_URL);
-        assert_eq!(source.signature, Some(("sig".to_owned(), "secret-s".to_owned())));
-        assert_eq!(format_source(Some(FORMAT_URL), None).unwrap().signature, None);
+        assert_eq!(source.url, format_url());
+        assert_eq!(source.signature, Some(("sig".to_owned(), S_SECRET.to_owned())));
+        assert_eq!(format_source(Some(&format_url()), None).unwrap().signature, None);
         assert!(format_source(None, None).is_err());
     }
 
     #[test]
     fn source_description_has_names_but_no_values() {
-        let cipher = serde_urlencoded::to_string([("s", "secret-s"), ("sp", "sig"), ("url", FORMAT_URL)]).unwrap();
-
-        let text = describe_source(None, Some(&cipher));
-
+        let text = describe_source(None, Some(&cipher()));
         assert_eq!(text, "signatureCipher (fields s, sp, url; url params expire, itag, n, sparams)");
-        let plain = describe_source(Some(FORMAT_URL), None);
+        let plain = describe_source(Some(&format_url()), None);
         assert_eq!(plain, "url (host rr1---sn-abc.googlevideo.com; params expire, itag, n, sparams)");
         assert_eq!(describe_source(None, None), "neither url nor signatureCipher");
     }
 
     #[test]
     fn resolved_url_has_signature_in_sp_solved_n_pot_cpn_and_cver() {
-        let cipher = serde_urlencoded::to_string([("s", "secret-s"), ("sp", "sig"), ("url", FORMAT_URL)]).unwrap();
-        let source = format_source(None, Some(&cipher)).unwrap();
+        let logs = crate::storage::test_util::LogCapture::start();
+        let source = format_source(None, Some(&cipher())).unwrap();
 
-        let url = resolve_url(&source, &FakeDecipher, Some("pot-token"), "1.2026", "CPN").unwrap();
+        let url = resolve_url(&source, &FakeDecipher, Some(POT_SECRET), "1.2026", CPN_SECRET).unwrap();
 
         let pairs = query(&url);
-        assert_eq!(param(&pairs, "sig"), Some("SECRET-S"));
-        assert_eq!(param(&pairs, "n"), Some("dcba"));
-        assert_eq!(param(&pairs, "pot"), Some("pot-token"));
-        assert_eq!(param(&pairs, "cpn"), Some("CPN"));
+        assert_eq!(param(&pairs, "sig"), Some(S_SECRET.to_lowercase().as_str()));
+        assert_eq!(param(&pairs, "n"), Some(N_SECRET.chars().rev().collect::<String>().as_str()));
+        assert_eq!(param(&pairs, "pot"), Some(POT_SECRET));
+        assert_eq!(param(&pairs, "cpn"), Some(CPN_SECRET));
         assert_eq!(param(&pairs, "cver"), Some("1.2026"));
         assert_eq!(param(&pairs, "itag"), Some("141"));
-        assert!(!url.contains("secret-s"), "{url}");
+        assert!(!url.contains(S_SECRET), "the raw s must not be sent");
+        assert_no_secrets(&logs.text());
     }
 
     #[test]
     fn plain_url_without_pot_gets_n_solved_only() {
-        let source = format_source(Some(FORMAT_URL), None).unwrap();
+        let source = format_source(Some(&format_url()), None).unwrap();
         let url = resolve_url(&source, &FakeDecipher, None, "v", "c").unwrap();
         let pairs = query(&url);
-        assert_eq!(param(&pairs, "n"), Some("dcba"));
+        assert_eq!(param(&pairs, "n"), Some(N_SECRET.chars().rev().collect::<String>().as_str()));
         assert_eq!(param(&pairs, "pot"), None);
         assert_eq!(param(&pairs, "sig"), None);
     }
 
     #[test]
     fn untrusted_format_host_is_refused() {
-        let source = format_source(Some("https://evil.example/videoplayback?sig=secret-q"), None).unwrap();
-        let err = resolve_url(&source, &FakeDecipher, Some("pot"), "v", "c").unwrap_err();
+        let source = format_source(Some(&format!("https://evil.example/videoplayback?sig={S_SECRET}")), None).unwrap();
+        let err = resolve_url(&source, &FakeDecipher, Some(POT_SECRET), "v", "c").unwrap_err();
         assert!(err.to_string().contains("evil.example"), "{err}");
-        assert!(!err.to_string().contains("secret-q"), "{err}");
+        assert_no_secrets(&err.to_string());
     }
 
     #[test]
-    fn decipher_failure_is_an_error() {
+    fn decipher_failure_is_a_typed_error_without_values() {
         struct Broken;
         impl Decipher for Broken {
-            fn n(&self, _: &str) -> Result<String, String> {
-                Err("no n function".to_owned())
-            }
-            fn sig(&self, _: &str) -> Result<String, String> {
-                Err("no sig function".to_owned())
+            fn solve(&self, _: Option<&str>, _: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+                Err("jsc n error: no solutions".to_owned())
             }
         }
-        let source = format_source(Some(FORMAT_URL), None).unwrap();
-        let err = resolve_url(&source, &Broken, None, "v", "c").unwrap_err();
-        assert!(err.to_string().contains("n decipher"), "{err}");
+        let source = format_source(None, Some(&cipher())).unwrap();
+
+        let err = resolve_url(&source, &Broken, Some(POT_SECRET), "v", CPN_SECRET).unwrap_err();
+
+        assert!(err.is::<DecipherError>(), "{err}");
+        assert_eq!(err.to_string(), "decipher failed: jsc n error: no solutions");
+        assert_no_secrets(&format!("{err} {err:?}"));
+    }
+
+    #[test]
+    fn player_js_decipher_solves_n_and_sig_with_the_session_player() {
+        let tmp = std::env::temp_dir().join(format!("ytcast-decipher-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut session = crate::music_session::test_fixtures::session();
+        session.player_js = Some(crate::nsig::SYNTHETIC_PLAYER.to_owned());
+        session.player_hash = Some("test-decipher-hash".to_owned());
+        let decipher = PlayerJsDecipher {
+            session: Arc::new(session),
+            disk_cache: Some(tmp.join("pp.js")),
+        };
+
+        let (n, sig) = decipher.solve(Some("abc"), Some("sig")).unwrap();
+
+        assert_eq!((n.as_deref(), sig.as_deref()), (Some("cba"), Some("SIG")));
+        assert!(tmp.join("pp.js").exists());
+        // Keyed by this session's player hash: another hash with no base.js fails.
+        let mut other = crate::music_session::test_fixtures::session();
+        other.player_js = Some(String::new());
+        other.player_hash = Some("test-decipher-other-hash".to_owned());
+        let other = PlayerJsDecipher { session: Arc::new(other), disk_cache: None };
+        assert!(other.solve(Some("abc"), None).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -- fake googlevideo ---------------------------------------------------------
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct Behaviour {
+        /// Status for GET / POST (0 = 200).
         get_status: u16,
         post_status: u16,
-        /// From this request on (0-based), URLs without `fresh=1` get 403:
-        /// the original URL "expires".
+        /// From this request on (0-based), URLs without `fresh=1` get 403.
         expire_from: Option<usize>,
+        /// (request index, bytes): announce the whole range, send only these
+        /// bytes, then close the connection mid-body.
+        truncate: Option<(usize, usize)>,
+        /// (request index, bytes): a well-formed but short response.
+        short: Option<(usize, usize)>,
+        /// Send this many body bytes, then stall without closing.
+        stall_after: Option<usize>,
     }
 
-    /// Serves `content` by `range=a-b` query param: GET as raw bytes, POST
-    /// (`ump=1`) as UMP MEDIA parts. Records each request line.
+    fn status_or_ok(status: u16) -> u16 {
+        if status == 0 { 200 } else { status }
+    }
+
+    /// Serves `content` by `range=a-b`: GET as raw bytes, POST (`ump=1`) as
+    /// UMP MEDIA parts. Records each request line.
     fn spawn_videoplayback(
         listener: tokio::net::TcpListener,
         content: Vec<u8>,
@@ -587,16 +694,19 @@ mod tests {
                 }
                 let text = String::from_utf8_lossy(&req).into_owned();
                 let line = text.lines().next().unwrap_or("").to_owned();
-                record.lock().unwrap().push(line.clone());
+                let index = {
+                    let mut seen = record.lock().unwrap();
+                    seen.push(line.clone());
+                    seen.len() - 1
+                };
                 let is_post = line.starts_with("POST");
-                let index = record.lock().unwrap().len() - 1;
                 let expired = behaviour.expire_from.is_some_and(|from| index >= from) && !line.contains("fresh=1");
                 let status = if expired {
                     403
                 } else if is_post {
-                    behaviour.post_status
+                    status_or_ok(behaviour.post_status)
                 } else {
-                    behaviour.get_status
+                    status_or_ok(behaviour.get_status)
                 };
                 let path = line.split(' ').nth(1).unwrap_or("");
                 let pairs: Vec<(String, String)> =
@@ -604,7 +714,12 @@ mod tests {
                 let range = pairs.iter().find(|(k, _)| k == "range").map(|(_, v)| v.clone()).unwrap_or_default();
                 let (a, b) = range.split_once('-').unwrap_or(("0", "0"));
                 let (a, b): (usize, usize) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
-                let slice = content.get(a..=b.min(content.len().saturating_sub(1))).unwrap_or(&[]).to_vec();
+                let mut slice = content.get(a..=b.min(content.len().saturating_sub(1))).unwrap_or(&[]).to_vec();
+                if let Some((at, keep)) = behaviour.short {
+                    if at == index {
+                        slice.truncate(keep);
+                    }
+                }
                 let (ctype, body) = if is_post {
                     let mut out = Vec::new();
                     ump::write_varint(&mut out, ump::MEDIA_HEADER);
@@ -623,7 +738,15 @@ mod tests {
                     body.len()
                 );
                 let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(&body).await;
+                let send = match (behaviour.truncate, behaviour.stall_after) {
+                    (Some((at, keep)), _) if at == index => keep.min(body.len()),
+                    (_, Some(keep)) => keep.min(body.len()),
+                    _ => body.len(),
+                };
+                let _ = sock.write_all(&body[..send]).await;
+                if behaviour.stall_after.is_some() && send < body.len() {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
             }
         });
         seen
@@ -647,11 +770,25 @@ mod tests {
         }
     }
 
+    /// Refreshes to the same URL, so a refusal persists.
+    struct SameUrl {
+        url: String,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl UrlRefresher for SameUrl {
+        fn refresh(&mut self) -> RefreshFuture<'_> {
+            *self.calls.lock().unwrap() += 1;
+            let url = self.url.clone();
+            Box::pin(async move { Ok(url) })
+        }
+    }
+
     async fn fetcher(behaviour: Behaviour, data: &[u8], clen: Option<u64>) -> (RangeFetch, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = spawn_videoplayback(listener, data.to_vec(), behaviour);
-        let url = format!("http://{addr}/videoplayback?itag=141&sig=SECRET-SIG");
+        let url = format!("http://{addr}/videoplayback?itag=141&sig=SECRET-SIG&pot={POT_SECRET}&cpn={CPN_SECRET}");
         let fetch = RangeFetch {
             http: reqwest::Client::new(),
             url: url.clone(),
@@ -660,6 +797,7 @@ mod tests {
             itag: 141,
             start_offset: 0,
             refresher: Box::new(FreshUrl { url, calls: Arc::default() }),
+            read_timeout: std::time::Duration::from_millis(500),
         };
         (fetch, seen)
     }
@@ -684,7 +822,14 @@ mod tests {
             .collect()
     }
 
-    const OK: Behaviour = Behaviour { get_status: 200, post_status: 200, expire_from: None };
+    const OK: Behaviour = Behaviour {
+        get_status: 0,
+        post_status: 0,
+        expire_from: None,
+        truncate: None,
+        short: None,
+        stall_after: None,
+    };
 
     #[tokio::test]
     async fn get_ranges_stream_the_whole_format_in_order() {
@@ -698,15 +843,125 @@ mod tests {
         assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999", "GET 2000-2499"]);
         let logs = logs.text();
         assert!(logs.contains("first bytes via Get"), "{logs}");
-        assert!(!logs.contains("SECRET-SIG"), "{logs}");
+        assert!(logs.contains("complete: 2500 bytes"), "{logs}");
+        assert_no_secrets(&logs);
+    }
+
+    #[tokio::test]
+    async fn without_content_length_a_short_range_ends_the_stream() {
+        let data = content(1500);
+        let (fetch, seen) = fetcher(OK, &data, None).await;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999"]);
+    }
+
+    #[tokio::test]
+    async fn with_content_length_a_short_range_is_resumed_at_its_end() {
+        let data = content(2500);
+        let (fetch, seen) = fetcher(Behaviour { short: Some((1, 300)), ..OK }, &data, Some(2500)).await;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999", "GET 1300-2299", "GET 2300-2499"]);
+    }
+
+    #[tokio::test]
+    async fn a_range_broken_off_mid_body_resumes_at_the_exact_byte() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(2500);
+        let (fetch, seen) = fetcher(Behaviour { truncate: Some((1, 400)), ..OK }, &data, Some(2500)).await;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999", "GET 1400-2399", "GET 2400-2499"]);
+        assert_no_secrets(&logs.text());
+    }
+
+    #[tokio::test]
+    async fn the_break_budget_is_per_range_not_per_song() {
+        // Three separate ranges each break once; each is resumed.
+        let data = content(4000);
+        let (mut fetch, seen) = fetcher(OK, &data, Some(4000)).await;
+        fetch.chunk_size = 1000;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Requests 1, 3 and 5 break off after 100 bytes.
+        let seen2 = spawn_multi_truncate(listener, data.clone(), vec![1, 3, 5]);
+        fetch.url = format!("http://{addr}/videoplayback?itag=141");
+        let _ = seen;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(seen2.lock().unwrap().len(), 7);
+    }
+
+    /// Like `spawn_videoplayback` with OK behaviour, but the listed requests
+    /// break off after 100 body bytes.
+    fn spawn_multi_truncate(listener: tokio::net::TcpListener, content: Vec<u8>, broken: Vec<usize>) -> Arc<Mutex<Vec<String>>> {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = text.lines().next().unwrap_or("").to_owned();
+                let index = {
+                    let mut seen = record.lock().unwrap();
+                    seen.push(line.clone());
+                    seen.len() - 1
+                };
+                let range = line.split("range=").nth(1).unwrap_or("0-0").split('&').next().unwrap_or("0-0").to_owned();
+                let (a, b) = range.split_once('-').unwrap();
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                let body = content[a..=b.min(content.len() - 1)].to_vec();
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let send = if broken.contains(&index) { 100 } else { body.len() };
+                let _ = sock.write_all(&body[..send]).await;
+            }
+        });
+        seen
+    }
+
+    #[tokio::test]
+    async fn refused_get_falls_back_to_the_ump_post_form() {
+        let data = content(1800);
+        let (fetch, seen) = fetcher(Behaviour { get_status: 403, ..OK }, &data, Some(1800)).await;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(ranges(&seen), ["GET 0-999", "POST 0-999", "POST 1000-1799"]);
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[1].contains("ump=1"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn no_bytes_from_either_form_is_an_error_for_the_caller() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(1000);
+        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 403, ..OK }, &data, Some(1000)).await;
+
+        let err = fetch.start().await.unwrap_err();
+
+        assert!(err.to_string().contains("HTTP 403"), "{err}");
+        assert_eq!(ranges(&seen), ["GET 0-999", "POST 0-999"]);
+        assert_no_secrets(&format!("{err} {}", logs.text()));
     }
 
     #[tokio::test]
     async fn expired_url_mid_song_is_refreshed_once_and_resumes_at_the_offset() {
         let logs = crate::storage::test_util::LogCapture::start();
         let data = content(3500);
-        let (mut fetch, seen) =
-            fetcher(Behaviour { expire_from: Some(2), ..OK }, &data, Some(3500)).await;
+        let (mut fetch, seen) = fetcher(Behaviour { expire_from: Some(2), ..OK }, &data, Some(3500)).await;
         let calls: Arc<Mutex<u32>> = Arc::default();
         fetch.refresher = Box::new(FreshUrl { url: fetch.url.clone(), calls: calls.clone() });
 
@@ -717,22 +972,7 @@ mod tests {
         assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999", "GET 2000-2999", "GET 2000-2999", "GET 3000-3499"]);
         let lines = seen.lock().unwrap().clone();
         assert!(lines[3].contains("fresh=1") && lines[4].contains("fresh=1"), "{lines:?}");
-        let logs = logs.text();
-        assert!(!logs.contains("SECRET-SIG"), "{logs}");
-    }
-
-    /// Refreshes to the same URL, so the refusal persists.
-    struct SameUrl {
-        url: String,
-        calls: Arc<Mutex<u32>>,
-    }
-
-    impl UrlRefresher for SameUrl {
-        fn refresh(&mut self) -> RefreshFuture<'_> {
-            *self.calls.lock().unwrap() += 1;
-            let url = self.url.clone();
-            Box::pin(async move { Ok(url) })
-        }
+        assert_no_secrets(&logs.text());
     }
 
     #[tokio::test]
@@ -744,7 +984,6 @@ mod tests {
 
         let rx = fetch.start().await.unwrap();
 
-        // The first range arrived; everything after it stays refused.
         assert_eq!(collect(rx).await, data[..1000]);
         assert_eq!(*calls.lock().unwrap(), 1);
     }
@@ -761,6 +1000,51 @@ mod tests {
 
         let requests = seen.lock().unwrap().len();
         assert!(requests < 20, "kept downloading after the player went away: {requests} of 200 ranges");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_during_a_slow_range_stops_at_once() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(100_000);
+        // One big range; the server sends 2000 bytes and then stalls.
+        let (mut fetch, _seen) = fetcher(Behaviour { stall_after: Some(2000), ..OK }, &data, Some(100_000)).await;
+        fetch.chunk_size = 100_000;
+        fetch.read_timeout = std::time::Duration::from_secs(10);
+
+        let mut rx = fetch.start().await.unwrap();
+        rx.recv().await.unwrap();
+        while rx.try_recv().is_ok() {}
+        drop(rx);
+
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if logs.text().contains("stopped by the player") {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(stopped.is_ok(), "download kept waiting on the stalled server: {}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_server_times_out() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(3000);
+        let (fetch, _seen) = fetcher(Behaviour { stall_after: Some(200), ..OK }, &data, Some(3000)).await;
+
+        let started = std::time::Instant::now();
+        let rx = fetch.start().await.unwrap();
+        let got = collect(rx).await;
+
+        // Each range stalls after 200 bytes: 1 + RANGE_RETRIES resumes, then give up.
+        assert!(got.len() < 3000);
+        assert_eq!(got, data[..got.len()]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+        let logs = logs.text();
+        assert!(logs.contains("read timed out"), "{logs}");
+        assert!(logs.contains("failed after"), "{logs}");
     }
 
     #[tokio::test]
@@ -785,42 +1069,33 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn without_content_length_a_short_range_ends_the_stream() {
-        let data = content(1500);
-        let (fetch, seen) = fetcher(OK, &data, None).await;
-
-        let rx = fetch.start().await.unwrap();
-
-        assert_eq!(collect(rx).await, data);
-        assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999"]);
+    #[test]
+    fn range_end_does_not_overflow() {
+        let fetch = RangeFetch {
+            http: reqwest::Client::new(),
+            url: String::new(),
+            content_length: None,
+            chunk_size: 1000,
+            itag: 141,
+            start_offset: 0,
+            refresher: Box::new(SameUrl { url: String::new(), calls: Arc::default() }),
+            read_timeout: READ_TIMEOUT,
+        };
+        assert_eq!(fetch.range_end(u64::MAX - 5), u64::MAX);
     }
 
     #[tokio::test]
-    async fn refused_get_falls_back_to_the_ump_post_form() {
-        let data = content(1800);
-        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 200, expire_from: None }, &data, Some(1800)).await;
+    async fn transport_errors_do_not_carry_the_url() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let url = format!("http://{addr}/videoplayback?sig=SECRET-SIG&pot={POT_SECRET}");
 
-        let rx = fetch.start().await.unwrap();
+        let err = match open_range(&reqwest::Client::new(), &url, 0, 999, 1, RangeMode::Get, READ_TIMEOUT).await {
+            Ok(_) => panic!("closed port answered"),
+            Err(e) => e,
+        };
 
-        assert_eq!(collect(rx).await, data);
-        assert_eq!(ranges(&seen), ["GET 0-999", "POST 0-999", "POST 1000-1799"]);
-        let lines = seen.lock().unwrap().clone();
-        assert!(lines[1].contains("ump=1"), "{lines:?}");
-    }
-
-    #[tokio::test]
-    async fn no_bytes_from_either_form_is_an_error_for_the_caller() {
-        let logs = crate::storage::test_util::LogCapture::start();
-        let data = content(1000);
-        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 403, expire_from: None }, &data, Some(1000)).await;
-
-        let err = fetch.start().await.unwrap_err();
-
-        assert!(err.to_string().contains("HTTP 403"), "{err}");
-        assert_eq!(ranges(&seen), ["GET 0-999", "POST 0-999"]);
-        for text in [err.to_string(), logs.text()] {
-            assert!(!text.contains("SECRET-SIG"), "{text}");
-        }
+        assert_no_secrets(&format!("{err} {err:?}"));
     }
 }

@@ -429,16 +429,44 @@ async fn stream_audio(
         return (StatusCode::BAD_REQUEST, "invalid video id").into_response();
     }
 
+    serve_stream(&state, &video_id, &request_headers, |video_id, ctt, yt_session, start| async move {
+        crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session, start).await
+    })
+    .await
+}
+
+type StreamResult = std::result::Result<
+    (crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>),
+    crate::sabr::stream::SabrError,
+>;
+
+/// The `/stream` response for a validated request: the Range offset goes to
+/// `open` (the real one is `sabr::stream::stream_audio`), and its result is
+/// framed (200, 206, or 416 past the end).
+async fn serve_stream<F, Fut>(
+    state: &DialState,
+    video_id: &str,
+    request_headers: &HeaderMap,
+    open: F,
+) -> Response
+where
+    F: FnOnce(String, Option<String>, Option<Arc<crate::music_session::YtMusicSession>>, u64) -> Fut,
+    Fut: std::future::Future<Output = StreamResult>,
+{
     let ctt = state.ctt.read().unwrap().clone();
     let yt_session = state.yt_session.clone();
-    let start = range_start(&request_headers);
-    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session, start).await {
+    let start = range_start(request_headers);
+    match open(video_id.to_owned(), ctt, yt_session, start).await {
         Ok((info, rx)) => {
-            state.note_stream_result(&video_id, Ok(()));
+            if start == 0 {
+                state.note_stream_result(video_id, Ok(()));
+            }
             // Build streaming response from the mpsc receiver.
-            // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
-            // so we can inspect with ffprobe if MPD crashes.
-            let dump_file = if std::env::var("YTCAST_DUMP_STREAM").is_ok() {
+            // When YTCAST_DUMP_STREAM=1, also write every byte of a stream
+            // from its start to /tmp/sabr-dump-{id}.webm, so it can be
+            // inspected with ffprobe if MPD crashes (a range request would
+            // overwrite it with a tail).
+            let dump_file = if start == 0 && std::env::var("YTCAST_DUMP_STREAM").is_ok() {
                 let path = format!("/tmp/sabr-dump-{}.webm", video_id);
                 tracing::info!("[stream] dumping raw stream to {}", path);
                 std::fs::File::create(&path).ok()
@@ -485,9 +513,21 @@ async fn stream_audio(
             (status, headers, body).into_response()
         }
         Err(e) => {
-            tracing::error!("[stream] {} failed: {}", video_id, e);
-            // Recorded before responding, so it is visible once MPD stops.
-            state.note_stream_result(&video_id, Err(e.to_string()));
+            if let Some(past_end) = e.downcast_ref::<crate::sabr::stream::RangeNotSatisfiable>() {
+                tracing::info!("[stream] {} range from byte {}: past the end", video_id, start);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_RANGE,
+                    format!("bytes */{}", past_end.content_length).parse().unwrap(),
+                );
+                return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
+            }
+            tracing::error!("[stream] {} failed (from byte {}): {}", video_id, start, e);
+            // A song that never started is recorded before responding, so it
+            // is visible once MPD stops; a failed seek is not a song failure.
+            if start == 0 {
+                state.note_stream_result(video_id, Err(e.to_string()));
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error: {}", e),
@@ -755,6 +795,67 @@ mod tests {
         assert_eq!(header_text(&headers, header::TRANSFER_ENCODING), Some("chunked"));
         assert!(headers.get(header::CONTENT_LENGTH).is_none());
         assert!(headers.get(header::ACCEPT_RANGES).is_none());
+    }
+
+    fn fake_info(content_length: Option<u64>, start_offset: u64) -> crate::sabr::stream::SabrStreamInfo {
+        crate::sabr::stream::SabrStreamInfo {
+            title: "Song".to_owned(),
+            duration_secs: 200,
+            mime_type: "audio/mp4".to_owned(),
+            content_length,
+            start_offset,
+        }
+    }
+
+    #[tokio::test]
+    async fn range_request_reaches_the_stream_and_is_answered_206() {
+        let state = test_state();
+        let seen = std::sync::Mutex::new(None);
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |video_id, _, _, start| {
+            *seen.lock().unwrap() = Some((video_id, start));
+            async move {
+                let (tx, rx) = mpsc::channel(1);
+                tx.send(bytes::Bytes::from(vec![7u8; 600])).await.unwrap();
+                Ok((fake_info(Some(1000), start), rx))
+            }
+        })
+        .await;
+
+        assert_eq!(seen.lock().unwrap().clone(), Some(("dQw4w9WgXcQ".to_owned(), 400)));
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header_text(resp.headers(), header::CONTENT_RANGE), Some("bytes 400-999/1000"));
+        assert_eq!(header_text(resp.headers(), header::CONTENT_LENGTH), Some("600"));
+        assert_eq!(header_text(resp.headers(), header::CONTENT_TYPE), Some("audio/mp4"));
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        assert_eq!(body.len(), 600);
+    }
+
+    #[tokio::test]
+    async fn range_past_the_end_is_416_and_no_song_failure() {
+        let state = test_state();
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=1000-"), |_, _, _, _| async {
+            let err: crate::sabr::stream::SabrError =
+                Box::new(crate::sabr::stream::RangeNotSatisfiable { content_length: 1000 });
+            Err(err)
+        })
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header_text(resp.headers(), header::CONTENT_RANGE), Some("bytes */1000"));
+        assert!(state.stream_failure.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn whole_song_request_starts_at_zero_and_is_200() {
+        let state = test_state();
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, start| async move {
+            assert_eq!(start, 0);
+            let (_tx, rx) = mpsc::channel(1);
+            Ok((fake_info(Some(1000), 0), rx))
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_text(resp.headers(), header::CONTENT_LENGTH), Some("1000"));
     }
 
     #[tokio::test]
