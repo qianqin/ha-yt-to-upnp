@@ -15,7 +15,10 @@ audio_output {
     port        "8000"
     bitrate     "320"           # use either bitrate or quality, not both
 #   quality     "5.0"
-    format      "44100:16:2"
+    # Fixed 48 kHz (Opus's own rate; 44.1 kHz AAC is resampled): with the
+    # source's own rate ("*:16:2"), MPD's httpd output closes its clients
+    # whenever the rate changes between songs, and the speaker drops the stream.
+    format      "48000:16:2"
     always_on   "yes"           # keep the stream open between tracks and while paused (silence),
                                 # so the speaker neither drops it nor stalls during the start gate
     tags        "yes"
@@ -24,14 +27,16 @@ audio_output {
     mixer_type  "software"
 }
 
-# Lossless variant (use instead of the block above; set STREAM_MIME=audio/flac).
+# Lossless variant (use instead of the block above; STREAM_URL=http://<receiver-host>:8000/stream.flac,
+# STREAM_MIME=audio/flac).
 # Keep it 16-bit: a Raumfeld connects to a 24-bit FLAC stream but never plays it.
 # audio_output {
 #     type        "httpd"
 #     name        "Raumfeld stream (FLAC)"
 #     encoder     "flac"
+#     compression "5"
 #     port        "8000"
-#     format      "44100:16:2"
+#     format      "48000:16:2"   # fixed 48 kHz as above
 #     always_on   "yes"
 #     mixer_type  "software"   # phone volume = MPD software volume; Raumfeld volume untouched
 # }
