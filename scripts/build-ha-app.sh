@@ -2,7 +2,12 @@
 # Assembles the Home Assistant app folder, ready to copy into the HA host's
 # /local_apps folder: ha-yt-to-upnp/ as committed at HEAD plus prebuilt artefacts for
 # linux/amd64, so the Supervisor's build only installs Debian packages and
-# copies files. The build images are pinned by digest, Deno by checksum,
+# copies files.
+# --release also packs the artefacts into the release tarball
+# dist/release/ha-yt-to-upnp-artefacts-<version>-amd64.tar.gz (reproducible, see
+# scripts/pack_artefacts.py) and writes ha-yt-to-upnp/artefacts.lock with the
+# version, the asset's GitHub release URL (owner and repository from the origin
+# remote) and its sha256, for Home Assistant's build from the repository. The build images are pinned by digest, Deno by checksum,
 # bgutil by commit and lock files; any mismatch aborts. Not pinned: protoc
 # (Debian bookworm's protobuf-compiler, installed in the Rust container); its
 # version is recorded in BUILD-INFO.
@@ -30,10 +35,14 @@ readonly BGUTIL_DIR=/opt/bgutil
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/build-ha-app.sh [--receiver-ref REF] [--adapter-ref REF] [--out DIR]
+       scripts/build-ha-app.sh --release [--out DIR]
   --receiver-ref REF  commit of the receiver (Rust) to build (default HEAD)
   --adapter-ref REF   commit to take adapter/raumfeld_adapter.py from (default HEAD)
   --out DIR           output folder (default dist/ha-yt-to-upnp); replaced only if it
                       holds a previous build (artefacts/BUILD-INFO) or is empty
+  --release           build everything from HEAD, then also write the release tarball
+                      (dist/release/) and ha-yt-to-upnp/artefacts.lock for the version
+                      in ha-yt-to-upnp/config.yaml (see docs/DEVOPS.md, Release)
 EOF
 }
 
@@ -41,11 +50,14 @@ EOF
 # the app folder's run scripts and the programs they start are in step.
 receiver_ref=HEAD
 adapter_ref=HEAD
+refs_given=0
+release=0
 out=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --receiver-ref) [ $# -ge 2 ] || { usage; exit 2; }; receiver_ref="$2"; shift 2 ;;
-    --adapter-ref) [ $# -ge 2 ] || { usage; exit 2; }; adapter_ref="$2"; shift 2 ;;
+    --receiver-ref) [ $# -ge 2 ] || { usage; exit 2; }; receiver_ref="$2"; refs_given=1; shift 2 ;;
+    --adapter-ref) [ $# -ge 2 ] || { usage; exit 2; }; adapter_ref="$2"; refs_given=1; shift 2 ;;
+    --release) release=1; shift ;;
     --out) [ $# -ge 2 ] || { usage; exit 2; }; out="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
@@ -59,7 +71,9 @@ out="${out:-$root/dist/ha-yt-to-upnp}"
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
-for tool in docker git curl unzip shasum tar file; do
+[ "$release" = 0 ] || [ "$refs_given" = 0 ] || die "--release builds receiver and adapter from HEAD; no --receiver-ref/--adapter-ref"
+
+for tool in docker git curl unzip shasum tar file python3; do
   command -v "$tool" >/dev/null || die "'$tool' not found"
 done
 docker info >/dev/null 2>&1 || die "Docker daemon not running"
@@ -71,6 +85,16 @@ if [ -n "$(git status --porcelain --untracked-files=all -- ha-yt-to-upnp)" ]; th
   die "uncommitted or untracked changes in ha-yt-to-upnp/; commit them first"
 fi
 head_commit="$(git rev-parse --verify HEAD)"
+
+if [ "$release" = 1 ]; then
+  version="$(git show "$head_commit:ha-yt-to-upnp/config.yaml" | sed -n 's/^version: "\(.*\)"$/\1/p')"
+  remote="$(git remote get-url origin)" || die "no origin remote"
+  # Fails now, not after the build, on a version or remote the lock cannot name.
+  python3 -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import pack_artefacts as p
+p.asset_name(sys.argv[3]); p.github_repo(sys.argv[2])' "$root/scripts" "$remote" "$version" \
+    || die "cannot name the release asset for version '$version' and origin '$remote'"
+  release_dir="$root/dist/release"
+fi
 
 if [ -e "$out" ] && [ ! -f "$out/artefacts/BUILD-INFO" ] && [ -n "$(ls -A "$out")" ]; then
   die "$out exists and is not a previous build; refusing to replace it"
@@ -196,9 +220,23 @@ bgutil-ytdlp-pot-provider: $BGUTIL_COMMIT (npm ci --omit=dev --ignore-scripts in
 bgutil native build output: none (no *.node, no node_modules/canvas/build)
 EOF
 
+if [ "$release" = 1 ]; then
+  step "release tarball and ha-yt-to-upnp/artefacts.lock (version $version)"
+  # One fixed mtime for every entry: the commit's time.
+  python3 -I -B "$root/scripts/pack_artefacts.py" --version "$version" \
+    --mtime "$(git log -1 --format=%ct "$head_commit")" --remote "$remote" \
+    "$art" "$release_dir" "$root/ha-yt-to-upnp/artefacts.lock"
+  # The assembled folder carries the lock that is about to be committed.
+  cp "$root/ha-yt-to-upnp/artefacts.lock" "$app/artefacts.lock"
+fi
+
 step "output $out"
 rm -rf "$out"
 mkdir -p "$(dirname "$out")"
 mv "$app" "$out"
 cat "$out/artefacts/BUILD-INFO"
-echo "==> done: copy $out to the HA host's /local_apps folder (see docs/DEVOPS.md)"
+if [ "$release" = 1 ]; then
+  echo "==> done: commit ha-yt-to-upnp/artefacts.lock, smoke-test, then scripts/publish-release.sh (see docs/DEVOPS.md, Release)"
+else
+  echo "==> done: copy $out to the HA host's /local_apps folder (see docs/DEVOPS.md)"
+fi
