@@ -1,4 +1,6 @@
-# Home Assistant app repository metadata. The app is installed as a local app
-# for now (built folder copied to /local_apps); this file only matters if the
-# repository is ever added to Home Assistant as an app repository.
-name: ha-yt-to-upnp
+# Home Assistant app repository. Add the url under Settings > Apps >
+# Repositories; Home Assistant finds the app in ha-yt-to-upnp/ and builds it
+# there (see ha-yt-to-upnp/DOCS.md).
+name: YouTube to UPnP
+url: https://github.com/qianqin/ha-yt-to-upnp
+maintainer: qianqin

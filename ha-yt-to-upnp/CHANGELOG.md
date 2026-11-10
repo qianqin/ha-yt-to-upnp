@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0
+
+Premium audio, installed from the repository.
+
+- Premium audio for casts from a YouTube Music Premium account: the receiver
+  asks with the phone's cast token for format 774 (Opus, about 257 kbit/s),
+  then 141 (AAC 256 kbit/s), both through the deciphered format URL, and
+  falls back to 251 (Opus, about 160 kbit/s, SABR). The cast token is used
+  only for the cast it came with and never stored.
+- Each song keeps the format it started with, so a seek never switches
+  format (byte ranges of the same file).
+- FLAC 48 kHz 16-bit stays the default stream (`stream_format: flac`),
+  MP3 320 kbit/s the fallback (`stream_format: mp3`), see 0.3.0; the stream
+  stays at a fixed 48 kHz because MPD's httpd output closes its clients when
+  the sample rate changes between songs.
+- Install from the repository: add the repository URL in Home Assistant
+  (Settings > Apps > Repositories), and Home Assistant builds the app itself
+  (base image and MPD via apt, nothing compiled) and offers updates. The
+  prebuilt programs (receiver, adapter, Deno, PoToken helper) come from the
+  GitHub release `v0.4.0` as one tarball, downloaded over https and checked
+  against the sha256 in `artefacts.lock`; a mismatch stops the build. A folder
+  assembled by `scripts/build-ha-app.sh` (with `artefacts/`) still builds
+  without a download, as a local app.
+- Dockerfile: two stages, the first only fetches and checks the artefacts.
+
 ## 0.3.0
 
 Lossless stream to the speaker.

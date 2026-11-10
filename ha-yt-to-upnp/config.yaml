@@ -1,10 +1,10 @@
 name: YouTube to UPnP
-version: "0.3.0"
+version: "0.4.0"
 slug: yt_to_upnp
 description: >-
   YouTube Music cast receiver (DIAL + Lounge API) that plays through MPD's
-  HTTP stream on a Teufel Raumfeld room via UPnP. Built locally, no image
-  registry.
+  HTTP stream on a Teufel Raumfeld room via UPnP. Home Assistant builds it
+  from this repository with prebuilt programs from the GitHub release.
 arch:
   - amd64
 startup: application
