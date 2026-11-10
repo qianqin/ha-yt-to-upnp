@@ -210,7 +210,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ip,
         port: dial_port,
         ctt: std::sync::RwLock::new(None),
-        player_params: std::sync::RwLock::new(None),
         yt_session: yt_session.clone(),
         screen_id: config.screen_id.clone(),
         stream_failure: Default::default(),
@@ -440,7 +439,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     has_remote = false;
                     let end_msgs = release_cast(&mut playlist, &mut play_started);
                     *dial_state.ctt.write().unwrap() = None;
-                    *dial_state.player_params.write().unwrap() = None;
                     dial_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
                     if let Err(e) = mpd_client.stop().await {
                         tracing::warn!("[player] release: mpd stop failed: {e}");
@@ -646,7 +644,6 @@ async fn handle_command(
                 tracing::info!("[player] ctt received from cast session");
             }
             *dial_state.ctt.write().unwrap() = ctt;
-            *dial_state.player_params.write().unwrap() = playlist.params.clone();
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;
@@ -671,7 +668,6 @@ async fn handle_command(
                 tracing::info!("[player] ctt received from cast session");
             }
             *dial_state.ctt.write().unwrap() = ctt;
-            *dial_state.player_params.write().unwrap() = None;
 
             *play_started = false;
             *play_started = play_video(mpd, state_tx, playlist, &video_id, current_time, yt_session).await?;

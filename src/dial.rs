@@ -39,9 +39,6 @@ pub struct DialState {
     /// Credential transfer token from the casting session: the receiver's
     /// only authentication, sent per video with WEB_REMIX /player.
     pub ctt: std::sync::RwLock<Option<String>>,
-    /// The cast's opaque `params` (Lounge setPlaylist), kept in memory with
-    /// the ctt; sent with /player only when YTCAST_PREMIUM_PLAYER_PARAMS=1.
-    pub player_params: std::sync::RwLock<Option<String>>,
     /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
@@ -145,7 +142,6 @@ impl DialState {
             local_ip: std::net::Ipv4Addr::new(192, 0, 2, 1),
             port: 8008,
             ctt: std::sync::RwLock::new(None),
-            player_params: std::sync::RwLock::new(None),
             yt_session: None,
             screen_id: "test-screen".to_string(),
             stream_failure: Default::default(),
@@ -379,10 +375,45 @@ async fn silence_audio(
 // GET /stream/:video_id -- SABR audio stream
 // ---------------------------------------------------------------------------
 
+/// Start offset of a `Range: bytes=N-` (or `bytes=N-M`) request, as MPD
+/// sends when it seeks in a stream of known length; 0 for anything else.
+fn range_start(headers: &HeaderMap) -> u64 {
+    headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("bytes="))
+        .filter(|spec| !spec.contains(','))
+        .and_then(|spec| spec.split_once('-'))
+        .and_then(|(start, _)| start.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Status and framing headers. A stream of known length (url transport) gets
+/// Content-Length and Accept-Ranges, so MPD can seek with a range request (206
+/// from `start`); SABR streams stay chunked and unseekable, as before.
+fn stream_framing(content_length: Option<u64>, start: u64) -> (StatusCode, HeaderMap) {
+    let mut headers = HeaderMap::new();
+    let Some(len) = content_length else {
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        return (StatusCode::OK, headers);
+    };
+    headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    headers.insert(header::CONTENT_LENGTH, (len - start.min(len)).to_string().parse().unwrap());
+    if start == 0 {
+        return (StatusCode::OK, headers);
+    }
+    headers.insert(
+        header::CONTENT_RANGE,
+        format!("bytes {}-{}/{}", start, len.saturating_sub(1), len).parse().unwrap(),
+    );
+    (StatusCode::PARTIAL_CONTENT, headers)
+}
+
 async fn stream_audio(
     axum::extract::Path(video_id): axum::extract::Path<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<DialState>>,
+    request_headers: HeaderMap,
 ) -> Response {
     if !is_loopback_peer(peer) {
         tracing::debug!("[stream] rejected non-loopback peer {}", peer);
@@ -399,9 +430,9 @@ async fn stream_audio(
     }
 
     let ctt = state.ctt.read().unwrap().clone();
-    let player_params = state.player_params.read().unwrap().clone();
     let yt_session = state.yt_session.clone();
-    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), player_params.as_deref(), yt_session).await {
+    let start = range_start(&request_headers);
+    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session, start).await {
         Ok((info, rx)) => {
             state.note_stream_result(&video_id, Ok(()));
             // Build streaming response from the mpsc receiver.
@@ -427,16 +458,12 @@ async fn stream_audio(
             });
             let body = axum::body::Body::from_stream(stream);
 
-            let mut headers = HeaderMap::new();
+            let (status, mut headers) = stream_framing(info.content_length, info.start_offset);
             headers.insert(
                 header::CONTENT_TYPE,
                 info.mime_type
                     .parse()
                     .unwrap_or_else(|_| "audio/webm".parse().unwrap()),
-            );
-            headers.insert(
-                header::TRANSFER_ENCODING,
-                "chunked".parse().unwrap(),
             );
             // Replace non-ASCII characters with '?' for a header-safe title
             let safe_title: String = info
@@ -455,7 +482,7 @@ async fn stream_audio(
                 info.duration_secs.to_string().parse().unwrap(),
             );
 
-            (StatusCode::OK, headers, body).into_response()
+            (status, headers, body).into_response()
         }
         Err(e) => {
             tracing::error!("[stream] {} failed: {}", video_id, e);
@@ -685,6 +712,51 @@ mod tests {
         }
     }
 
+    fn range(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn range_start_reads_mpd_seek_requests() {
+        assert_eq!(range_start(&HeaderMap::new()), 0);
+        assert_eq!(range_start(&range("bytes=0-")), 0);
+        assert_eq!(range_start(&range("bytes=123456-")), 123_456);
+        assert_eq!(range_start(&range("bytes=10-20")), 10);
+        // Forms MPD does not send are served whole.
+        assert_eq!(range_start(&range("bytes=-500")), 0);
+        assert_eq!(range_start(&range("items=5-")), 0);
+        assert_eq!(range_start(&range("bytes=5-,9-")), 0);
+    }
+
+    fn header_text(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+        headers.get(name).map(|v| v.to_str().unwrap())
+    }
+
+    #[test]
+    fn known_length_streams_are_served_with_byte_ranges() {
+        let (status, headers) = stream_framing(Some(1000), 0);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header_text(&headers, header::CONTENT_LENGTH), Some("1000"));
+        assert_eq!(header_text(&headers, header::ACCEPT_RANGES), Some("bytes"));
+        assert!(headers.get(header::TRANSFER_ENCODING).is_none());
+
+        let (status, headers) = stream_framing(Some(1000), 400);
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header_text(&headers, header::CONTENT_LENGTH), Some("600"));
+        assert_eq!(header_text(&headers, header::CONTENT_RANGE), Some("bytes 400-999/1000"));
+    }
+
+    #[test]
+    fn sabr_streams_stay_chunked() {
+        let (status, headers) = stream_framing(None, 0);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header_text(&headers, header::TRANSFER_ENCODING), Some("chunked"));
+        assert!(headers.get(header::CONTENT_LENGTH).is_none());
+        assert!(headers.get(header::ACCEPT_RANGES).is_none());
+    }
+
     #[tokio::test]
     async fn rejected_lan_peers_are_not_logged_as_warnings() {
         // A LAN peer probing /silence or /stream must not flood the log.
@@ -695,6 +767,7 @@ mod tests {
             axum::extract::Path("dQw4w9WgXcQ".to_string()),
             ConnectInfo(lan),
             State(test_state()),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(silence.status(), StatusCode::FORBIDDEN);

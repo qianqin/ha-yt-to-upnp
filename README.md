@@ -41,50 +41,55 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 
 **Under the hood:**
 1. InnerTube `/player` call using WEB_REMIX client + credential transfer token (ctt) from the cast session for authenticated access. When casting from YouTube Music, the phone sends a per-video ctt automatically — no setup needed. Without a ctt (or if the anonymous YouTube Music session failed to load) it uses the IOS client, with ANDROID as a further fallback (some tracks may be restricted without authentication)
-2. Picks the highest-bitrate Opus audio format, skipping YouTube Music Premium-only formats (774, 141): a ctt can list them, but requesting one only got reload requests, never media (see [Premium audio experiment](#premium-audio-experiment))
+2. Picks the highest-bitrate Opus audio format, skipping YouTube Music Premium-only formats (774, 141): SABR does not serve them to this receiver; they are fetched via their own URL instead (see [Audio quality](#audio-quality))
 3. Opens a SABR session with YouTube's CDN using protobuf requests
 4. Parses UMP (Universal Media Protocol) binary response frames
 5. Extracts and streams audio segments as chunked HTTP to MPD
 6. Reports buffered ranges so the server sends the next segments
 
-If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL, ustreamer config and format ids, clears the SABR contexts and continues. Unlike googlevideo it also drops the playback cookie, which records the old session's format choice (resending it got `sabr.no_audio_selected` in a live Premium test). At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
+If the server asks for a fresh `/player` response (`RELOAD_PLAYER_RESPONSE`, UMP part 46), the receiver does what googlevideo does: it calls WEB_REMIX `/player` again with the same ctt and page session plus the server's reload token (`playbackContext.reloadPlaybackContext`), solves nsig for the new streaming URL, takes the new streaming URL, ustreamer config and format ids, clears the SABR contexts and continues. Unlike googlevideo it also drops the playback cookie, which records the old session's format choice. StreamerContext `clientInfo` carries the page session's client version (the one `/player` used) and leaves out empty device fields. At most 2 reloads per song; a third request ends the stream with a clear error instead of looping. Without a ctt (IOS client) there is no reload and the stream ends as before.
 
 The SABR code adds roughly 2400 lines of Rust across 3 files. Proto definitions (19 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
 
-## Premium audio experiment
+## Audio quality
 
-Opt-in and off by default: without these variables format selection, PoToken use and log volume stay as described above.
+Casting from a YouTube Music **Premium** account gives Premium audio; any other cast gets the regular format.
+
+| Format | Codec | Used when |
+|---|---|---|
+| itag 774 | Opus ~256 kbit/s, 48 kHz (WebM) | Premium cast, first choice |
+| itag 141 | AAC 256 kbit/s, 44.1 kHz (MP4) | Premium cast, if 774 fails |
+| itag 251 | Opus ~160 kbit/s, 48 kHz (WebM), via SABR | everything else, and the fallback |
+
+How it works: the phone sends a per-video credential transfer token (ctt) with each cast. The `/player` call made with it lists 774 and 141 when the casting account has Premium. SABR does not serve these formats to this receiver. Instead the receiver fetches them through their own googlevideo URL, as the music.youtube.com web player does:
+- the format's `signatureCipher` signature is deciphered into `sp`, and `n` is solved, both with the embedded yt-dlp/ejs solver and its per-player-version cache;
+- the PoToken (`pot`), a client playback nonce (`cpn`) and the client version (`cver`) are added;
+- the audio is fetched in sequential 1 MiB byte ranges with plain GET. If the first range gives no bytes, the web player's POST form (`ump=1`) is tried.
+
+Nothing is stored: the ctt lives in memory only while its song streams. No cookie or OAuth token is read or sent, and logs show URL hosts and parameter names, never values.
+
+**Fallback chain, per song:** 774 via URL, then 141 via URL, then 251 via SABR. A format counts as failed if no audio byte arrives (HTTP error or 403, no media, or a deciphering failure); a warning names what is tried next. Without a ctt (no cast token, IOS client), or when `/player` lists no Premium format, the song goes straight to 251 via SABR, as before.
+
+**During a Premium song:**
+- **Streaming and memory:** ranges stream straight through to MPD. A small bounded buffer means a slow consumer slows the download instead of filling memory.
+- **Song end:** the song ends exactly at the format's content length.
+- **Stopping:** when MPD drops the stream (skip, stop, next song), the download stops at once.
+- **Expiry:** if a range is refused (HTTP 401/403/410, e.g. an expired URL), the receiver makes one fresh `/player` call with the same ctt, deciphers again and resumes at the same byte. A broken range is resumed up to 2 times.
+- **Seeking:** `/stream/<id>` answers with `Content-Length` and `Accept-Ranges: bytes`, so MPD can seek within the song. A seek from the phone (`seekcur`) makes MPD request `Range: bytes=N-`; the receiver then starts the ranges at byte N and answers `206`. SABR songs stay chunked and unseekable, as before. A range request that ends up on SABR gets the song from the start.
+
+Setting:
 
 | Variable | Values | Effect |
 |---|---|---|
-| `YTCAST_PREMIUM_AUDIO` | `774` (Opus ~256k), `141` (AAC 256k), `off` (default) | Prefer that Premium itag when the ctt `/player` response lists it. Any other value is ignored with a warning. |
-| `YTCAST_PREMIUM_NO_POT` | `1` | With the experiment on: send no PoToken (SABR requests, and no `pot` on the url transport) (yt-dlp: GVS PoToken not required for Premium). |
-| `YTCAST_PREMIUM_TRANSPORT` | `sabr` (default), `url` | `url`: fetch the Premium itag through its own googlevideo URL in 1 MiB byte ranges, as the music.youtube.com web player does for 141: the format's `url` or `signatureCipher` (signature deciphered into `sp`), `n` solved, plus `pot`, `cpn` and `cver`. Plain GET with `range=a-b` first; if that gives no bytes, the web player's POST form (`ump=1`, 2-byte body, UMP MEDIA parts). No bytes from either, or no session for deciphering, falls back to SABR with the regular format (251) for that song. |
-| `YTCAST_PREMIUM_AUDIO_ONLY` | `1` | With the experiment on: SABR requests in googlevideo's audio-only shape (no video format in fields 2, 3 and 17; field 2 only lists initialized formats). |
-| `YTCAST_PREMIUM_PLAYER_PARAMS` | `1` | Independent of the itag: send the cast's `params` (Lounge setPlaylist) as `params` in every `/player` body, initial and reload, as the phone's own player does. Kept in memory with the ctt, logged by length only. |
+| `YTCAST_AUDIO_QUALITY` | `max` (default), `standard` | `standard`: always 251 via SABR, Premium formats skipped (the old behaviour). Any other value is treated as `max`, with a warning. |
 
-With the experiment on, SABR requests also set `drcEnabled` and `audioTrackId` from the chosen format, and of several `/player` entries for the Premium itag the non-DRC one is chosen (after a reload the entry with the same xtags). StreamerContext `clientInfo` always carries the page session's client version (the one `/player` used) and leaves out empty device fields.
-
-Per song, the reloads described above apply. If the Premium itag still gets a reload request after 2 reloads, or gets any `SABR_ERROR`, and no audio of it has been forwarded yet, the song falls back to the regular format (251) via a fresh `/player` call; after audio has started, the stream ends instead. A fallback from 141 (AAC/MP4) to 251 (Opus/WebM) keeps the already sent `Content-Type`, so the player has to detect the format itself.
-
-What it logs at info (protocol detail that is otherwise at debug level):
-
-- `[sabr] premium experiment: want itag 774, PoToken sent|omitted|unavailable; /player lists itags [...]`
-- `[sabr] selected audio: itag=...` - the chosen itag
-- `[sabr] premium experiment: 774 variants: [xtags=... isDrc=... audioTrack=... lm=..., ...]` - every `/player` entry for the itag (again as `[sabr] reloaded 774 variants: ...` after each reload)
-- `[sabr] premium experiment: itag 141 transport Url, audio-only shape false, source signatureCipher (fields s, sp, url; url params ...)` or `source url (host ...; params ...)` - names only, never values
-- url transport: `[url] itag 141 decipher OK in N ms (host ..., params ...)`, `[url] itag 141 Get range 0-1048575: HTTP 403` per failed first attempt, `[url] itag 141 first bytes via Get|UmpPost from <host> after N ms (... bytes, clen ...)`, then at the end `[sabr] premium experiment: itag 141 via url → media OK|NO (bytes N)`; if no byte arrived: `[sabr] premium experiment: itag 141 via url → media NO (bytes 0): <reason>; falling back to SABR itag 251`
-- `[sabr] YTCAST_PREMIUM_PLAYER_PARAMS: cast params sent (len N)` and `+params` on the `/player` log line
-- `[sabr] request #N formats: selected audio [774 lm=… xtags=…] selected video [...] init [...] cookie audio=… video=…` - the format ids each SABR request sends (fields 16, 17, 2) and the itags named in the playback cookie; no tokens
-- `[sabr] response #N parts: 20,21x3,22,35` - the UMP part ids of each response (consecutive repeats as `idxN`; 46 = reload request, 47 = playback start policy, 35 = next request policy, 44 = SABR error, 58 = stream protection status)
-- `[sabr] RELOAD_PLAYER_RESPONSE (token len=N)`, `[sabr] reloading player response (1/2)`, `[sabr] reloaded /player lists itags [...]`
-- `[sabr] premium experiment: itag 774 got SABR error: type=..., code=..., falling back to itag 251` (or `still asks for a reload after 2 reloads, ...`)
-- `[sabr] playback start policy: ...`, `[sabr] SABR_ERROR type=... code=...`, `[sabr] stream_protection_status=...`
-- the verdict at the end of the song: `[sabr] premium experiment: itag 774 → media OK|NO (reloads N, sps [...], media headers {itag: count}, audio bytes {itag: bytes}[, fell back to itag 251])` - OK only if audio bytes of the Premium itag itself arrived; `→ media NO (not listed by /player)` if the response did not offer it
+Log lines (info):
+- `audio: itag 774 (premium) via url, first bytes after N ms`, or `audio: itag 251 (standard) via sabr, first bytes after N ms` - one per song
+- `audio: itag 774 (premium) via url failed: <reason>; trying itag 141 via url` (warning)
+- `[url] itag 774 deciphered in N ms (host ..., params ...)`, `[url] itag 774 first bytes via Get from <host> after N ms (offset ..., clen ...)`, `[url] itag 774 complete: N bytes` / `stopped by the player after N bytes` / `failed after N bytes: ...` (warning)
+- `[url] range a-b: HTTP 403, refreshing the URL` (warning)
 
 For every cast, `[lounge:...] setPlaylist|setVideo|updatePlaylist keys=[...]` lists the argument names the phone sent (never the values).
-
-No credentials are stored for the experiment either: the ctt stays in memory for the one song (it is reused only for that song's reload calls), reload tokens are logged by length only, and no cookie or OAuth token is read or sent.
 
 ## Features
 
@@ -95,7 +100,7 @@ No credentials are stored for the experiment either: the ctt stays in memory for
 - Playlist support with queue updates mid-session
 - Phone UI stays fully synced (seekbar, album art, controls)
 - Graceful disconnect (stops playback when phone disconnects)
-- Best-quality Opus audio (itag 251, up to ~160kbps, 48kHz stereo)
+- Best available audio: Premium Opus ~256kbps (itag 774) or AAC 256kbps (141) when casting from a Premium account, otherwise Opus (itag 251, up to ~160kbps, 48kHz stereo) - see [Audio quality](#audio-quality)
 - Authenticated streaming via cast session credential transfer tokens (WEB_REMIX + ctt)
 - Full YouTube Music session context (fetches live ytcfg anonymously from music.youtube.com for WEB_REMIX /player)
 - n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver (0.8.0) in QuickJS. When YouTube changes its player and streams start failing, an outdated solver is the usual cause - see [src/vendor/README.md](src/vendor/README.md) to update it

@@ -1,4 +1,4 @@
-//! Premium experiment transport: fetch one audio format through its own
+//! Premium audio transport: fetch one audio format through its own
 //! googlevideo URL in byte ranges, as the music.youtube.com web player does
 //! for Premium itag 141, instead of through a SABR session.
 //!
@@ -152,12 +152,29 @@ const UMP_POST_BODY: [u8; 2] = [0x78, 0x00];
 /// Extra attempts per range after the first bytes have arrived.
 const RANGE_RETRIES: u32 = 2;
 
+/// Channel slots between the download and the consumer. Each slot holds one
+/// body chunk as it arrives (typically 8-64 KiB), so memory stays bounded and
+/// a slow consumer slows the download (backpressure) instead of buffering it.
+const CHANNEL_CHUNKS: usize = 8;
+
+pub(crate) type RefreshFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, SabrError>> + Send + 'a>>;
+
+/// Provides a fresh, deciphered URL when the current one is refused
+/// mid-song (e.g. expired).
+pub(crate) trait UrlRefresher: Send {
+    fn refresh(&mut self) -> RefreshFuture<'_>;
+}
+
+/// One format, fetched as sequential byte ranges from `start_offset`.
 pub(crate) struct RangeFetch {
     pub http: reqwest::Client,
     pub url: String,
     pub content_length: Option<u64>,
     pub chunk_size: u64,
     pub itag: i32,
+    pub start_offset: u64,
+    pub refresher: Box<dyn UrlRefresher>,
 }
 
 fn range_url(url: &str, start: u64, end: u64, rn: u32, mode: RangeMode) -> String {
@@ -168,30 +185,67 @@ fn range_url(url: &str, start: u64, end: u64, rn: u32, mode: RangeMode) -> Strin
     out
 }
 
-/// Media payload of a UMP response: the MEDIA parts' bytes after their
-/// one-byte header id.
-fn ump_media(body: &[u8]) -> Vec<u8> {
-    let mut parser = UmpParser::new();
-    parser.push(body);
-    let mut media = Vec::new();
-    while let Some(part) = parser.next_part() {
-        if part.part_type == ump::MEDIA && part.data.len() > 1 {
-            media.extend_from_slice(&part.data[1..]);
-        }
-    }
-    media
+/// Why a range request failed. `Refused` (HTTP 401/403/410) may mean the URL
+/// expired; it never carries the URL.
+#[derive(Debug)]
+enum RangeError {
+    Refused(u16),
+    Other(String),
 }
 
-/// One range request. `Err` carries the HTTP status or transport error,
-/// never the URL.
-async fn fetch_range(
+impl std::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RangeError::Refused(status) => write!(f, "HTTP {status}"),
+            RangeError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// An open range response, read chunk by chunk as it arrives.
+struct RangeBody {
+    stream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+    /// `Some` for a UMP response: media is taken from its MEDIA parts.
+    ump: Option<UmpParser>,
+}
+
+impl RangeBody {
+    /// The next non-empty piece of media, `None` at the end of the range.
+    async fn next_media(&mut self) -> Option<Result<Bytes, RangeError>> {
+        loop {
+            let chunk = match self.stream.next().await? {
+                Ok(chunk) => chunk,
+                Err(e) => return Some(Err(RangeError::Other(e.without_url().to_string()))),
+            };
+            let media = match &mut self.ump {
+                None => chunk,
+                Some(parser) => {
+                    parser.push(&chunk);
+                    let mut media = Vec::new();
+                    while let Some(part) = parser.next_part() {
+                        // MEDIA: one-byte header id, then payload.
+                        if part.part_type == ump::MEDIA && part.data.len() > 1 {
+                            media.extend_from_slice(&part.data[1..]);
+                        }
+                    }
+                    Bytes::from(media)
+                }
+            };
+            if !media.is_empty() {
+                return Some(Ok(media));
+            }
+        }
+    }
+}
+
+async fn open_range(
     http: &reqwest::Client,
     url: &str,
     start: u64,
     end: u64,
     rn: u32,
     mode: RangeMode,
-) -> Result<Bytes, String> {
+) -> Result<RangeBody, RangeError> {
     let target = range_url(url, start, end, rn, mode);
     let req = match mode {
         RangeMode::Get => http.get(&target),
@@ -200,25 +254,32 @@ async fn fetch_range(
             .header("Content-Type", "application/x-protobuf")
             .body(UMP_POST_BODY.to_vec()),
     };
-    let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
+    let resp = req.send().await.map_err(|e| RangeError::Other(e.without_url().to_string()))?;
     let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403 | 410) {
+        return Err(RangeError::Refused(status.as_u16()));
+    }
     if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+        return Err(RangeError::Other(format!("HTTP {}", status.as_u16())));
     }
     let is_ump = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.yt-ump"));
-    let mut body = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.extend_from_slice(&chunk.map_err(|e| e.without_url().to_string())?);
-    }
-    let bytes = if is_ump { ump_media(&body) } else { body };
-    if bytes.is_empty() {
-        return Err(format!("HTTP {} with no media", status.as_u16()));
-    }
-    Ok(Bytes::from(bytes))
+    Ok(RangeBody {
+        stream: resp.bytes_stream().boxed(),
+        ump: is_ump.then(UmpParser::new),
+    })
+}
+
+/// How the download ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    /// Content length reached, or a short range without one.
+    Complete,
+    /// The consumer went away (song skipped or stopped).
+    Cancelled,
+    Failed(String),
 }
 
 impl RangeFetch {
@@ -230,85 +291,150 @@ impl RangeFetch {
         }
     }
 
-    /// Fetch the first range (GET, then the UMP POST form) and stream the
-    /// rest from a background task. `Err` means no byte arrived, so the
-    /// caller can still fall back to another transport.
+    fn complete_at(&self, offset: u64) -> bool {
+        self.content_length.is_some_and(|len| offset >= len)
+    }
+
+    /// Open the first range (GET, then the UMP POST form) and read its first
+    /// media bytes; the rest streams from a background task. `Err` means no
+    /// byte arrived, so the caller can still try another format.
     pub(crate) async fn start(self) -> Result<mpsc::Receiver<Bytes>, SabrError> {
+        if self.complete_at(self.start_offset) {
+            return Err(format!("start offset {} is past the end", self.start_offset).into());
+        }
         let started = Instant::now();
-        let end = self.range_end(0);
+        let end = self.range_end(self.start_offset);
         let mut failures = Vec::new();
-        let mut first = None;
+        let mut opened = None;
         for mode in [RangeMode::Get, RangeMode::UmpPost] {
-            match fetch_range(&self.http, &self.url, 0, end, 1, mode).await {
-                Ok(bytes) => {
-                    first = Some((mode, bytes));
+            let first = match open_range(&self.http, &self.url, self.start_offset, end, 1, mode).await {
+                Ok(mut body) => match body.next_media().await {
+                    Some(Ok(bytes)) => Ok((body, bytes)),
+                    Some(Err(e)) => Err(e.to_string()),
+                    None => Err("no media".to_owned()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            match first {
+                Ok((body, bytes)) => {
+                    opened = Some((mode, body, bytes));
                     break;
                 }
                 Err(e) => {
-                    tracing::info!("[url] itag {} {:?} range 0-{}: {}", self.itag, mode, end, e);
+                    tracing::info!("[url] itag {} {:?} range {}-{}: {}", self.itag, mode, self.start_offset, end, e);
                     failures.push(format!("{mode:?}: {e}"));
                 }
             }
         }
-        let Some((mode, bytes)) = first else {
+        let Some((mode, body, first)) = opened else {
             return Err(format!("no media via url ({})", failures.join(", ")).into());
         };
         tracing::info!(
-            "[url] itag {} first bytes via {:?} from {} after {} ms ({} bytes, clen {:?})",
+            "[url] itag {} first bytes via {:?} from {} after {} ms (offset {}, clen {:?})",
             self.itag, mode, host_for_log(&self.url), started.elapsed().as_millis(),
-            bytes.len(), self.content_length,
+            self.start_offset, self.content_length,
         );
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(CHANNEL_CHUNKS);
         tokio::spawn(async move {
-            let total = self.pump(mode, bytes, &tx).await;
-            let media = if total > 0 { "OK" } else { "NO" };
-            tracing::info!(
-                "[sabr] premium experiment: itag {} via url → media {} (bytes {})",
-                self.itag, media, total,
-            );
+            let mut fetch = self;
+            let (ending, sent) = fetch.pump(mode, body, first, &tx).await;
+            match ending {
+                Ending::Complete => tracing::info!("[url] itag {} complete: {} bytes", fetch.itag, sent),
+                Ending::Cancelled => tracing::info!("[url] itag {} stopped by the player after {} bytes", fetch.itag, sent),
+                Ending::Failed(e) => tracing::warn!("[url] itag {} failed after {} bytes: {}", fetch.itag, sent, e),
+            }
         });
         Ok(rx)
     }
 
-    /// Send `first`, then the following ranges until the content length is
-    /// reached (or, without one, a short range). Returns the bytes sent.
-    async fn pump(&self, mode: RangeMode, first: Bytes, tx: &mpsc::Sender<Bytes>) -> u64 {
-        let mut offset = first.len() as u64;
-        let mut requested_end = self.range_end(0);
-        let mut chunk = first;
+    /// Forward `first` and the rest of `body`, then the following ranges,
+    /// until the content length (or, without one, a short range). A refused
+    /// range gets one fresh URL per song; other failures resume from the
+    /// current offset up to `RANGE_RETRIES` times. Returns how it ended and
+    /// the bytes forwarded.
+    async fn pump(
+        &mut self,
+        mode: RangeMode,
+        mut body: RangeBody,
+        first: Bytes,
+        tx: &mpsc::Sender<Bytes>,
+    ) -> (Ending, u64) {
+        let mut offset = self.start_offset;
+        let mut range_start = offset;
+        let mut range_end = self.range_end(offset);
         let mut rn = 1u32;
+        let mut refreshed = false;
+        let mut broken_ranges = 0u32;
+        let mut pending = Some(first);
         loop {
-            let short = (chunk.len() as u64) < requested_end + 1 - (offset - chunk.len() as u64);
-            if tx.send(chunk).await.is_err() {
-                tracing::info!("[url] receiver dropped after {} bytes", offset);
-                return offset;
-            }
-            let done = match self.content_length {
-                Some(len) => offset >= len,
-                None => short,
-            };
-            if done {
-                return offset;
-            }
-            requested_end = self.range_end(offset);
-            rn += 1;
-            let mut attempt = 0;
-            chunk = loop {
-                match fetch_range(&self.http, &self.url, offset, requested_end, rn, mode).await {
-                    Ok(bytes) => break bytes,
-                    Err(e) if attempt < RANGE_RETRIES => {
-                        attempt += 1;
-                        tracing::warn!("[url] range {}-{}: {}, retry {}/{}", offset, requested_end, e, attempt, RANGE_RETRIES);
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt))).await;
+            // Drain the open range.
+            let mut failure = None;
+            loop {
+                let next = match pending.take() {
+                    Some(bytes) => Some(Ok(bytes)),
+                    None => body.next_media().await,
+                };
+                match next {
+                    Some(Ok(bytes)) => {
+                        offset += bytes.len() as u64;
+                        if tx.send(bytes).await.is_err() {
+                            return (Ending::Cancelled, offset - self.start_offset);
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("[url] range {}-{}: {}, giving up after {} bytes", offset, requested_end, e, offset);
-                        return offset;
+                    Some(Err(e)) => {
+                        failure = Some(e);
+                        break;
                     }
+                    None => break,
+                }
+            }
+            let sent = offset - self.start_offset;
+            if self.complete_at(offset) {
+                return (Ending::Complete, sent);
+            }
+            if failure.is_none() && offset <= range_end {
+                // A short range: the end of a format without a known length.
+                if self.content_length.is_none() && offset > range_start {
+                    return (Ending::Complete, sent);
+                }
+                failure = Some(RangeError::Other(format!("range ended at {offset}")));
+            }
+            if let Some(e) = failure {
+                broken_ranges += 1;
+                if broken_ranges > RANGE_RETRIES {
+                    return (Ending::Failed(format!("range {range_start}-{range_end} broke off at {offset}: {e}")), sent);
+                }
+                tracing::warn!("[url] range {}-{} broke off at {}: {}, resuming", range_start, range_end, offset, e);
+            }
+
+            // Open the next range (or the rest of a broken one).
+            range_start = offset;
+            range_end = self.range_end(offset);
+            let mut attempts = 0;
+            body = loop {
+                if tx.is_closed() {
+                    return (Ending::Cancelled, sent);
+                }
+                rn += 1;
+                match open_range(&self.http, &self.url, range_start, range_end, rn, mode).await {
+                    Ok(body) => break body,
+                    Err(RangeError::Refused(status)) if !refreshed => {
+                        refreshed = true;
+                        tracing::warn!("[url] range {}-{}: HTTP {}, refreshing the URL", range_start, range_end, status);
+                        match self.refresher.refresh().await {
+                            Ok(url) => self.url = url,
+                            Err(e) => return (Ending::Failed(format!("URL refresh failed: {e}")), sent),
+                        }
+                    }
+                    Err(e) if attempts < RANGE_RETRIES => {
+                        attempts += 1;
+                        tracing::warn!("[url] range {}-{}: {}, retry {}/{}", range_start, range_end, e, attempts, RANGE_RETRIES);
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempts))).await;
+                    }
+                    Err(e) => return (Ending::Failed(format!("range {range_start}-{range_end}: {e}")), sent),
                 }
             };
-            offset += chunk.len() as u64;
         }
     }
 }
@@ -422,6 +548,9 @@ mod tests {
     struct Behaviour {
         get_status: u16,
         post_status: u16,
+        /// From this request on (0-based), URLs without `fresh=1` get 403:
+        /// the original URL "expires".
+        expire_from: Option<usize>,
     }
 
     /// Serves `content` by `range=a-b` query param: GET as raw bytes, POST
@@ -460,7 +589,15 @@ mod tests {
                 let line = text.lines().next().unwrap_or("").to_owned();
                 record.lock().unwrap().push(line.clone());
                 let is_post = line.starts_with("POST");
-                let status = if is_post { behaviour.post_status } else { behaviour.get_status };
+                let index = record.lock().unwrap().len() - 1;
+                let expired = behaviour.expire_from.is_some_and(|from| index >= from) && !line.contains("fresh=1");
+                let status = if expired {
+                    403
+                } else if is_post {
+                    behaviour.post_status
+                } else {
+                    behaviour.get_status
+                };
                 let path = line.split(' ').nth(1).unwrap_or("");
                 let pairs: Vec<(String, String)> =
                     serde_urlencoded::from_str(path.split_once('?').map_or("", |(_, q)| q)).unwrap_or_default();
@@ -496,16 +633,33 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
+    /// Hands out the same URL with `fresh=1`, counting calls.
+    struct FreshUrl {
+        url: String,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl UrlRefresher for FreshUrl {
+        fn refresh(&mut self) -> RefreshFuture<'_> {
+            *self.calls.lock().unwrap() += 1;
+            let url = format!("{}&fresh=1", self.url);
+            Box::pin(async move { Ok(url) })
+        }
+    }
+
     async fn fetcher(behaviour: Behaviour, data: &[u8], clen: Option<u64>) -> (RangeFetch, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = spawn_videoplayback(listener, data.to_vec(), behaviour);
+        let url = format!("http://{addr}/videoplayback?itag=141&sig=SECRET-SIG");
         let fetch = RangeFetch {
             http: reqwest::Client::new(),
-            url: format!("http://{addr}/videoplayback?itag=141&sig=SECRET-SIG"),
+            url: url.clone(),
             content_length: clen,
             chunk_size: 1000,
             itag: 141,
+            start_offset: 0,
+            refresher: Box::new(FreshUrl { url, calls: Arc::default() }),
         };
         (fetch, seen)
     }
@@ -530,7 +684,7 @@ mod tests {
             .collect()
     }
 
-    const OK: Behaviour = Behaviour { get_status: 200, post_status: 200 };
+    const OK: Behaviour = Behaviour { get_status: 200, post_status: 200, expire_from: None };
 
     #[tokio::test]
     async fn get_ranges_stream_the_whole_format_in_order() {
@@ -548,6 +702,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_url_mid_song_is_refreshed_once_and_resumes_at_the_offset() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let data = content(3500);
+        let (mut fetch, seen) =
+            fetcher(Behaviour { expire_from: Some(2), ..OK }, &data, Some(3500)).await;
+        let calls: Arc<Mutex<u32>> = Arc::default();
+        fetch.refresher = Box::new(FreshUrl { url: fetch.url.clone(), calls: calls.clone() });
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(ranges(&seen), ["GET 0-999", "GET 1000-1999", "GET 2000-2999", "GET 2000-2999", "GET 3000-3499"]);
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[3].contains("fresh=1") && lines[4].contains("fresh=1"), "{lines:?}");
+        let logs = logs.text();
+        assert!(!logs.contains("SECRET-SIG"), "{logs}");
+    }
+
+    /// Refreshes to the same URL, so the refusal persists.
+    struct SameUrl {
+        url: String,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl UrlRefresher for SameUrl {
+        fn refresh(&mut self) -> RefreshFuture<'_> {
+            *self.calls.lock().unwrap() += 1;
+            let url = self.url.clone();
+            Box::pin(async move { Ok(url) })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_url_is_refreshed_only_once_per_song() {
+        let data = content(5000);
+        let (mut fetch, _seen) = fetcher(Behaviour { expire_from: Some(1), ..OK }, &data, Some(5000)).await;
+        let calls: Arc<Mutex<u32>> = Arc::default();
+        fetch.refresher = Box::new(SameUrl { url: fetch.url.clone(), calls: calls.clone() });
+
+        let rx = fetch.start().await.unwrap();
+
+        // The first range arrived; everything after it stays refused.
+        assert_eq!(collect(rx).await, data[..1000]);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_stops_the_download() {
+        let data = content(200_000);
+        let (fetch, seen) = fetcher(OK, &data, Some(200_000)).await;
+
+        let mut rx = fetch.start().await.unwrap();
+        rx.recv().await.unwrap();
+        drop(rx);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let requests = seen.lock().unwrap().len();
+        assert!(requests < 20, "kept downloading after the player went away: {requests} of 200 ranges");
+    }
+
+    #[tokio::test]
+    async fn a_start_offset_begins_ranges_there() {
+        let data = content(3000);
+        let (mut fetch, seen) = fetcher(OK, &data, Some(3000)).await;
+        fetch.start_offset = 1500;
+
+        let rx = fetch.start().await.unwrap();
+
+        assert_eq!(collect(rx).await, data[1500..]);
+        assert_eq!(ranges(&seen), ["GET 1500-2499", "GET 2500-2999"]);
+    }
+
+    #[tokio::test]
+    async fn a_start_offset_past_the_end_is_refused() {
+        let data = content(1000);
+        let (mut fetch, seen) = fetcher(OK, &data, Some(1000)).await;
+        fetch.start_offset = 1000;
+
+        assert!(fetch.start().await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn without_content_length_a_short_range_ends_the_stream() {
         let data = content(1500);
         let (fetch, seen) = fetcher(OK, &data, None).await;
@@ -561,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn refused_get_falls_back_to_the_ump_post_form() {
         let data = content(1800);
-        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 200 }, &data, Some(1800)).await;
+        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 200, expire_from: None }, &data, Some(1800)).await;
 
         let rx = fetch.start().await.unwrap();
 
@@ -575,7 +813,7 @@ mod tests {
     async fn no_bytes_from_either_form_is_an_error_for_the_caller() {
         let logs = crate::storage::test_util::LogCapture::start();
         let data = content(1000);
-        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 403 }, &data, Some(1000)).await;
+        let (fetch, seen) = fetcher(Behaviour { get_status: 403, post_status: 403, expire_from: None }, &data, Some(1000)).await;
 
         let err = fetch.start().await.unwrap_err();
 
