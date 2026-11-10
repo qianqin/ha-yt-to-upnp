@@ -25,6 +25,7 @@ VALID = {
     "cast_name": "Living Room",
     "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
     "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
+    "stream_format": "flac",
     "log_level": "info",
 }
 
@@ -89,6 +90,18 @@ class DefaultsInStep(unittest.TestCase):
             if schema[name].endswith("?"):
                 self.assertNotEqual(value, "null", name)
 
+    def test_stream_format_defaults_to_flac(self):
+        self.assertEqual(config_block("options").get("stream_format"), "flac")
+
+
+class TranslationsInStep(unittest.TestCase):
+    def test_every_option_has_a_name_and_description(self):
+        with open(os.path.join(APP, "translations", "en.yaml")) as f:
+            text = f.read()
+        for name in config_schema():
+            m = re.search(r"^  %s:\n    name: .+\n    description: .+" % name, text, re.M)
+            self.assertIsNotNone(m, name)
+
 
 class AdapterAgreesOnRaumfeldHost(unittest.TestCase):
     def test_option_accepts_exactly_what_the_adapter_accepts(self):
@@ -132,6 +145,10 @@ class Valid(unittest.TestCase):
         options = dict(VALID, raumfeld_host="192.0.2.20")
         del options["raumfeld_speaker_udn"]
         self.assertIsNone(problem(options))
+
+    def test_stream_formats(self):
+        for fmt in ("flac", "mp3"):
+            self.assertIsNone(problem(dict(VALID, stream_format=fmt)), fmt)
 
     def test_bounds(self):
         self.assertIsNone(problem(dict(VALID, start_gate_seconds=60, stuck_seconds=1)))
@@ -186,6 +203,10 @@ class Invalid(unittest.TestCase):
     def test_stream_host(self):
         for bad in ("host:8000", "http://host", "a b", "x" * 254, "host\n"):
             self.assertProblem(dict(VALID, stream_host=bad), "stream_host")
+
+    def test_stream_format(self):
+        for bad in ("FLAC", "ogg", "wav", "flac24", " flac", 1):
+            self.assertProblem(dict(VALID, stream_format=bad), "stream_format")
 
     def test_log_level(self):
         for bad in ("INFO", "trace", "warn", 1):
