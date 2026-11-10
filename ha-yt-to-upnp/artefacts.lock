@@ -1,0 +1,5 @@
+# Written by scripts/build-ha-app.sh --release; the Dockerfile downloads
+# the url and checks the sha256 unless artefacts/ is in the build context.
+version: 0.4.0
+url: https://github.com/qianqin/ha-yt-to-upnp/releases/download/v0.4.0/ha-yt-to-upnp-artefacts-0.4.0-amd64.tar.gz
+sha256: 266b601d6b7a77da8953738809b9a98038cb58e6ab6be862363e2c333d0c9355
