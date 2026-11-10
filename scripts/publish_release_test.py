@@ -269,12 +269,15 @@ class PublishReleaseTest(unittest.TestCase):
                              ("modified", lambda: self.write("src/main.rs", "edited\n"))):
             with self.subTest(change=name):
                 change()
-                for args in ((), ("--dry-run",)):
-                    result, calls = self.run_script(*args)
-                    self.assertRefused(result, calls, "working tree is not clean")
-                    self.assertEqual(self.remote_calls(calls), [])
-                self.git("checkout", "-q", "--", ".")
-                self.git("clean", "-qfd")
+                try:
+                    for args in ((), ("--dry-run",)):
+                        result, calls = self.run_script(*args)
+                        self.assertRefused(result, calls, "working tree is not clean")
+                        self.assertEqual(self.remote_calls(calls), [])
+                finally:
+                    # Clean again for the next change, also after a failure.
+                    self.git("checkout", "-q", "--", ".")
+                    self.git("clean", "-qfd")
 
     def test_missing_changelog_section_is_refused(self):
         for name, text in (("none", "# Changelog\n\n## 1.2.2\n\n- Old.\n"),
@@ -286,6 +289,7 @@ class PublishReleaseTest(unittest.TestCase):
                 for args in ((), ("--dry-run",)):
                     result, calls = self.run_script(*args)
                     self.assertRefused(result, calls, "no '## %s' section in ha-yt-to-upnp/CHANGELOG.md" % VERSION)
+                    self.assertEqual(self.remote_calls(calls), [])
 
     def test_release_notes_are_the_versions_changelog_section(self):
         notes = os.path.join(self.tmp, "notes-seen")
