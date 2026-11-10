@@ -14,13 +14,18 @@ RUN apt-get update \
     && useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin potoken \
     && id mpd
 
-COPY artefacts/ytcast-lite artefacts/deno /usr/local/bin/
-COPY artefacts/adapter/ /opt/ytcast-adapter/
+# Execute bits do not survive every way of copying the folder onto the HA host,
+# hence the chmods. The PoToken helper (Deno, bgutil) changes least, so it comes
+# first: scripts/smoke-ha-app.sh --quick keeps everything above the boundary
+# line below as a cached image.
+COPY artefacts/deno /usr/local/bin/
 COPY artefacts/bgutil/ /opt/bgutil/
+RUN chmod 0755 /usr/local/bin/deno && chmod -R a+rX,go-w /opt/bgutil
+# smoke-quick-cache-boundary
+COPY artefacts/ytcast-lite /usr/local/bin/
+COPY artefacts/adapter/ /opt/ytcast-adapter/
 COPY artefacts/BUILD-INFO /opt/BUILD-INFO
 COPY rootfs/ /
-
-# Execute bits do not survive every way of copying the folder onto the HA host.
-RUN chmod 0755 /usr/local/bin/ytcast-lite /usr/local/bin/deno /etc/s6-overlay/scripts/*.sh \
+RUN chmod 0755 /usr/local/bin/ytcast-lite /etc/s6-overlay/scripts/*.sh \
         /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish \
-    && chmod -R a+rX,go-w /opt/ytcast-adapter /opt/bgutil /usr/lib/ytcast /etc/ytcast
+    && chmod -R a+rX,go-w /opt/ytcast-adapter /usr/lib/ytcast /etc/ytcast
