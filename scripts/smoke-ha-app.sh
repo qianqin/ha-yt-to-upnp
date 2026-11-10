@@ -36,8 +36,11 @@
 # scripts/build-ha-app.sh --release) and checks it against artefacts.lock. The
 # tarball is served over http on 127.0.0.1 of this machine and reached as
 # host.docker.internal (Docker Desktop), through the test-only ARTEFACTS_URL
-# build argument. Before that, a tampered copy of the tarball and a
-# BUILD_VERSION other than the lock's must each fail the build. The image then
+# build argument. Before that, building the artefacts stage alone must fail
+# for a tampered copy of the tarball, a BUILD_VERSION other than config.yaml's,
+# a lock for another version (no BUILD_VERSION), a lock naming the tarball over
+# plain http (no override) and an ARTEFACTS_URL to any other host. The full
+# run checks that its build took artefacts/ from the build context. The image then
 # gets the quick run's checks, and its programs must be the tarball's
 # (BUILD-INFO and checksums).
 #
@@ -172,9 +175,13 @@ create_builder() {
 build_full() {
   create_builder
   image_built=1
-  docker buildx build --builder "$builder" --platform "$PLATFORM" --load \
+  docker buildx build --builder "$builder" --platform "$PLATFORM" --load --progress plain \
     --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
-    -t "$image" "$dir"
+    -t "$image" "$dir" > "$tmp/build.log" 2>&1 || { tail -40 "$tmp/build.log"; die "the image build failed"; }
+  # An assembled folder's own artefacts win over any download.
+  grep -F "fetch-artefacts: artefacts/ from the build context" "$tmp/build.log" \
+    || die "the artefacts stage did not take artefacts/ from the build context"
+  echo "PASS the artefacts stage takes artefacts/ from the build context"
 }
 
 # The quick run splits the Dockerfile at its boundary line: the part above
@@ -222,17 +229,25 @@ build_quick() {
     -t "$image" -f "$tmp/Dockerfile.quick" "$tmp/context" >/dev/null
 }
 
-# Builds only the artefacts stage with the given ARTEFACTS_URL and
-# BUILD_VERSION; the build must fail with a line containing the message.
+# Builds only the artefacts stage of the context with the given ARTEFACTS_URL
+# (empty: the lock's url) and BUILD_VERSION; the build must fail with a line
+# containing the message.
 expect_artefacts_failure() {
-  local what="$1" url="$2" build_version="$3" message="$4" log="$tmp/build-$1.log"
+  local what="$1" context="$2" url="$3" build_version="$4" message="$5" log="$tmp/build-$1.log"
   if docker buildx build --builder "$builder" --platform "$PLATFORM" --no-cache --progress plain \
       --target artefacts --build-arg BUILD_VERSION="$build_version" --build-arg BUILD_ARCH=amd64 \
-      --build-arg ARTEFACTS_URL="$url" "$dir" > "$log" 2>&1; then
+      --build-arg ARTEFACTS_URL="$url" "$context" > "$log" 2>&1; then
     tail -20 "$log"; die "the build with $what did not fail"
   fi
   grep -F "fetch-artefacts: error: $message" "$log" || { tail -20 "$log"; die "the build with $what failed, but not with: $message"; }
   echo "PASS the build with $what fails: $message"
+}
+
+# A copy of the app folder whose artefacts.lock has one line replaced.
+context_with_lock_line() {
+  local name="$1" key="$2" value="$3"
+  cp -R "$dir" "$tmp/$name"
+  sed "s|^$key: .*|$key: $value|" "$dir/artefacts.lock" > "$tmp/$name/artefacts.lock"
 }
 
 # The release path: the tarball is served over http on 127.0.0.1, which
@@ -257,9 +272,19 @@ build_release() {
   done
   url="http://host.docker.internal:$port"
   create_builder
-  expect_artefacts_failure "a tampered tarball" "$url/tampered/$asset" "$version" "sha256 mismatch"
-  expect_artefacts_failure "BUILD_VERSION 0.0.0" "$url/genuine/$asset" 0.0.0 \
-    "artefacts.lock is for version $version, the app is 0.0.0"
+  expect_artefacts_failure "a tampered tarball" "$dir" "$url/tampered/$asset" "$version" "sha256 mismatch"
+  expect_artefacts_failure "BUILD_VERSION 0.0.0" "$dir" "$url/genuine/$asset" 0.0.0 \
+    "BUILD_VERSION 0.0.0 is not config.yaml's version $version"
+  # A lock left from an older release; the Supervisor passes no BUILD_VERSION.
+  context_with_lock_line stale-lock version 0.0.1
+  expect_artefacts_failure "a stale lock" "$tmp/stale-lock" "$url/genuine/$asset" "" \
+    "artefacts.lock is for version 0.0.1, config.yaml says $version"
+  # The genuine tarball, but the lock names it over plain http: https only.
+  context_with_lock_line http-lock url "$url/genuine/$asset"
+  expect_artefacts_failure "an http url in the lock" "$tmp/http-lock" "" "$version" \
+    "download of $url/genuine/$asset failed"
+  expect_artefacts_failure "an ARTEFACTS_URL elsewhere" "$dir" "http://192.0.2.1:$port/genuine/$asset" "$version" \
+    "ARTEFACTS_URL must be https://"
   image_built=1
   docker buildx build --builder "$builder" --platform "$PLATFORM" --load --progress plain \
     --build-arg BUILD_VERSION="$version" --build-arg BUILD_ARCH=amd64 \
