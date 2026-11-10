@@ -45,8 +45,9 @@ solving with the vendored yt-dlp/ejs solver in QuickJS.
   respects standby, line-in and other sources, and releases the cast when the
   speaker is taken away. Never touches the speaker's volume.
 - **FLAC 16-bit/48 kHz stream** to the speaker (from 0.4.0, see below).
-- **Home Assistant app packaging**, built on the release machine (a Mac) with
-  pinned, checksummed inputs, published as release assets.
+- **Home Assistant app packaging:** the programs are built on the release
+  machine (a Mac) from pinned, checksummed inputs and published as a GitHub
+  Release asset; Home Assistant installs the app from this repository.
 
 ## How it works
 
@@ -80,8 +81,8 @@ volume; the speaker's own volume is never changed.
 MPD decodes the source and re-encodes it losslessly as FLAC, so there is no
 second lossy step; `stream_format: mp3` (320 kbit/s) is the fallback. The rate
 is fixed at 48 kHz because MPD's HTTP stream drops its clients when the rate
-changes between songs. **Up to 0.2.0** the stream is MP3 192 kbit/s instead
-(no `stream_format` option); FLAC arrives with **0.4.0**.
+changes between songs. FLAC and `stream_format` arrive with **0.4.0**;
+earlier versions (local apps) stream MP3 192 kbit/s.
 
 Setting `YTCAST_AUDIO_QUALITY=standard` on the receiver disables Premium
 formats (always 251 via SABR).
@@ -107,29 +108,38 @@ formats (always 251 via SABR).
 Home Assistant OS on amd64, with the phone and the speaker on the same LAN
 segment (multicast).
 
-**From 0.4.0 (release-based install):**
+From 0.4.0 the app is installed from this repository:
 
-1. Settings → Apps → App store → ⋮ → Repositories, add
+1. Settings → Apps → **Repositories**: add
    `https://github.com/qianqin/ha-yt-to-upnp`.
-2. Install **YouTube to UPnP**. The Supervisor builds the image on the host
-   from the app folder and the prebuilt release assets (nothing is compiled
-   on the host).
-3. Configure and start (options below).
+2. Open **YouTube to UPnP** in the app store and **Install**. Home Assistant
+   builds the image on the host: MPD and Python from Debian, plus the
+   prebuilt programs (receiver, adapter, Deno, PoToken helper) downloaded as
+   one tarball from the GitHub Release of the app's version and checked
+   against the SHA-256 in `ha-yt-to-upnp/artefacts.lock`. Nothing is
+   compiled; a mismatch stops the build.
+3. **Configuration** tab: set the options below, save, start.
 
-**0.2.0 and earlier** are installed as a local app: build the folder with
-`scripts/build-ha-app.sh` and copy it into `/local_apps` on the Home Assistant
-host, see [docs/DEVOPS.md](docs/DEVOPS.md#home-assistant-app).
+**Updates:** the app's page (or Settings → Updates) offers **Update** when a
+new version is in the repository; options and `/data` are kept.
+
+Versions before 0.4.0 were local apps only. A folder assembled with
+`scripts/build-ha-app.sh` can still be installed as a local app (copied to
+`/local_apps`), see [docs/DEVOPS.md](docs/DEVOPS.md#local-app-without-the-repository).
 
 Main options (full list, rules and troubleshooting in
 [ha-yt-to-upnp/DOCS.md](ha-yt-to-upnp/DOCS.md)):
 
 | Option | Meaning |
 | --- | --- |
-| `cast_name` | Name in the cast menu |
-| `raumfeld_room_udn` | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` |
-| `raumfeld_speaker_udn` | UDN of the speaker device that hosts the Raumfeld API; needed unless `raumfeld_host` is set |
-| `raumfeld_host` | Optional IPv4 address of that device, e.g. `192.0.2.20`, for a faster start |
-| `stream_format` | `flac` (default) or `mp3` (from 0.4.0) |
+| `cast_name` | Name in the cast menu (required) |
+| `raumfeld_room_udn` | UDN of the Raumfeld room, e.g. `uuid:00000000-0000-0000-0000-000000000001` (required) |
+| `raumfeld_speaker_udn` | UDN of the speaker device that hosts the Raumfeld API; required unless `raumfeld_host` is set |
+| `raumfeld_host` | Optional IPv4 address (recommended) or DNS name of that device, e.g. `192.0.2.20`, for a faster start |
+| `stream_host` | Optional address the speaker fetches the stream from; default: the host's detected LAN address |
+| `stream_format` | `flac` (default) or `mp3` |
+| `start_gate_seconds`, `stuck_seconds` | Optional start-gate and stuck-renderer timings |
+| `log_level` | `debug`, `info` (default), `warning` or `error` |
 
 To find the UDNs, ask the Raumfeld host API: `http://<raumfeld-host>:47365/getZones`
 lists the rooms and their UDNs. To find `<raumfeld-host>`, start the app once
@@ -175,10 +185,47 @@ Run only one receiver with the same cast name on the LAN.
   pinned, verified artefacts; `scripts/smoke-ha-app.sh` builds the image and
   checks it on an isolated Docker network.
 
-There is no CI by design: everything is built and tested locally on the Mac
-and in temporary Linux containers. Details in [docs/DEVOPS.md](docs/DEVOPS.md).
+- App release: `scripts/build-ha-app.sh --release` packs the release tarball
+  and `artefacts.lock`, `scripts/publish-release.sh` publishes it as the
+  GitHub Release asset of the version.
+
+There is no CI by design: releases are built and tested on the Mac (and in
+temporary Linux containers) and published as GitHub Release assets; nothing
+runs on a hosted pipeline. Details in [docs/DEVOPS.md](docs/DEVOPS.md)
+(*Release*, *App release*).
 To update the nsig solver when YouTube changes its player, see
 [src/vendor/README.md](src/vendor/README.md).
+
+## Running without Home Assistant
+
+The parts also run on any Linux host (or a Mac for testing,
+`scripts/run-ha-app-local.sh`), on the same LAN as the phone and the speaker:
+
+1. **MPD** on the same host with an `httpd` output and `mixer_type
+   "software"`, control on localhost: see
+   [adapter/mpd.conf.example](adapter/mpd.conf.example). For FLAC use
+   `format "48000:16:2"` (16-bit, fixed 48 kHz, as the app does).
+2. **PoToken helper:** [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+   on Deno, listening on `127.0.0.1:4416` (the receiver asks it there).
+   Without it, streams are throttled after about a minute. For the restricted
+   Deno permissions the app uses, see its
+   [run script](ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/potoken/run).
+3. **Receiver** (`cargo build --release --locked`, binary `ytcast-lite`):
+
+   | Variable | Default | Meaning |
+   | --- | --- | --- |
+   | `DEVICE_NAME` | `Living Room Pi` | Name in the cast menu |
+   | `MPD_HOST`, `MPD_PORT` | `localhost`, `6600` | MPD control connection |
+   | `YTCAST_DATA_DIR` | OS config/cache dirs | Absolute path for the device identity and nsig cache |
+   | `YTCAST_AUDIO_QUALITY` | `max` | `max`: Premium formats first; `standard`: always 251 via SABR |
+   | `RUST_LOG` | - | Currently ignored: the build has no `env-filter`, the receiver logs at info |
+
+4. **Raumfeld adapter:** `python3 -m adapter` with `RAUMFELD_ROOM_UDN`,
+   `RAUMFELD_SPEAKER_UDN` or `RAUMFELD_HOST`, `STREAM_URL`
+   (`http://<receiver-host>:8000/stream.flac`) and `STREAM_MIME`
+   (`audio/flac`); all settings in [adapter/README.md](adapter/README.md).
+
+Keep MPD's control port and the PoToken helper on loopback, as the app does.
 
 ## Limitations and known issues
 
