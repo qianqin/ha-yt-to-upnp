@@ -653,9 +653,11 @@ fn dispatch_messages(
 
             // -- Playback commands --
             "setPlaylist" => {
+                log_cast_keys(&session.theme, "setPlaylist", &msg.args);
                 dispatch_set_playlist(&msg.args, player_tx);
             }
             "setVideo" => {
+                log_cast_keys(&session.theme, "setVideo", &msg.args);
                 dispatch_set_video(&msg.args, player_tx);
             }
             "play" => {
@@ -684,6 +686,7 @@ fn dispatch_messages(
                 send_cmd(player_tx, PlayerCommand::GetPlaylist);
             }
             "updatePlaylist" => {
+                log_cast_keys(&session.theme, "updatePlaylist", &msg.args);
                 dispatch_update_playlist(&msg.args, player_tx);
             }
             "stopVideo" => {
@@ -708,6 +711,11 @@ fn dispatch_messages(
     }
 
     responses
+}
+
+/// Shows what the phone sends with each cast (keys only, see `arg_keys`).
+fn log_cast_keys(theme: &str, command: &str, args: &HashMap<String, String>) {
+    tracing::info!("[lounge:{}] {} keys={:?}", theme, command, arg_keys(args));
 }
 
 /// Command args can carry credentials (e.g. `ctt`), so logs get keys only.
@@ -1163,6 +1171,42 @@ mod tests {
         assert!(logs.contains("setVideo with no videoId"), "{logs}");
         assert!(logs.contains("\"ctt\""), "{logs}");
         assert!(!logs.contains("secret-ctt"), "{logs}");
+    }
+
+    #[test]
+    fn cast_commands_log_their_arg_keys_at_info() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut session = LoungeSession::new(
+            reqwest::Client::new(),
+            "Test Screen".to_owned(),
+            "uuid".to_owned(),
+            "screen".to_owned(),
+            "cl".to_owned(),
+        );
+        let (player_tx, _player_rx) = mpsc::channel(8);
+        let messages = [
+            incoming(
+                "setPlaylist",
+                &[("ctt", "secret-ctt"), ("videoId", "dQw4w9WgXcQ"), ("listId", "secret-list"), ("params", "secret-params")],
+            ),
+            incoming("setVideo", &[("ctt", "secret-ctt"), ("videoId", "dQw4w9WgXcQ")]),
+            incoming("updatePlaylist", &[("videoIds", "dQw4w9WgXcQ"), ("listId", "secret-list")]),
+        ];
+
+        dispatch_messages(&mut session, &messages, &player_tx);
+
+        let logs = logs.text();
+        for expected in [
+            r#"setPlaylist keys=["ctt", "listId", "params", "videoId"]"#,
+            r#"setVideo keys=["ctt", "videoId"]"#,
+            r#"updatePlaylist keys=["listId", "videoIds"]"#,
+        ] {
+            let line = logs.lines().find(|l| l.contains(expected)).unwrap_or_else(|| panic!("{expected}: {logs}"));
+            assert!(line.contains(" INFO "), "{line}");
+        }
+        for secret in ["secret-ctt", "secret-list", "secret-params"] {
+            assert!(!logs.contains(secret), "{secret} leaked: {logs}");
+        }
     }
 
     #[test]
