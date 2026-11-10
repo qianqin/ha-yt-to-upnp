@@ -119,6 +119,18 @@ class PackTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "points out of"):
                     pack_artefacts.pack(src, src + ".tar.gz", MTIME)
 
+    def test_a_link_through_another_link_out_of_the_tree_is_refused(self):
+        # "up" points to the tree's root (inside). "esc" -> "up/../x" stays
+        # inside when read as text (node_modules/x), but once "up" is followed
+        # it is the tree's parent's x.
+        src = os.path.join(self.tmp, "chain", "artefacts")
+        make_tree(src, 1)
+        modules = os.path.join(src, "bgutil", "node_modules")
+        os.symlink("../..", os.path.join(modules, "up"))
+        os.symlink("up/../x", os.path.join(modules, "esc"))
+        with self.assertRaisesRegex(ValueError, "points out of"):
+            pack_artefacts.pack(src, src + ".tar.gz", MTIME)
+
     def test_anything_but_files_dirs_and_links_is_refused(self):
         src = os.path.join(self.tmp, "fifo", "artefacts")
         make_tree(src, 1)
@@ -166,6 +178,11 @@ class LockTest(unittest.TestCase):
                 lines = [l for l in f.read().splitlines() if not l.startswith("#")]
         self.assertEqual(lines, ["version: 0.4.0", "url: https://example.invalid/a.tar.gz",
                                  "sha256: " + "ab" * 32])
+
+    def test_bad_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                pack_artefacts.write_lock(os.path.join(tmp, "l"), "0.4", "https://x/a", "ab" * 32)
 
     def test_bad_digest_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

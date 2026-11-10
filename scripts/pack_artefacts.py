@@ -67,9 +67,12 @@ def _entries(root):
 
 
 def _check_link(root, path):
+    # realpath follows every link on the way (also one inside the target, as
+    # in "up/../x" with up -> ../..), so text that looks inside cannot leave.
     target = os.readlink(path)
-    resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
-    if os.path.isabs(target) or os.path.relpath(resolved, root).split(os.sep)[0] == "..":
+    real_root = os.path.realpath(root)
+    resolved = os.path.realpath(path)
+    if os.path.isabs(target) or os.path.commonpath([real_root, resolved]) != real_root:
         raise ValueError("link %s points out of the artefacts folder: %s" % (path, target))
     return target
 
