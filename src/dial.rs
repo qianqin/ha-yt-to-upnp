@@ -395,7 +395,7 @@ async fn stream_audio(
     }
 
     let ctt = state.ctt.read().unwrap().clone();
-    let yt_session = state.yt_session.as_ref().map(|s| s.as_ref());
+    let yt_session = state.yt_session.clone();
     match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session).await {
         Ok((info, rx)) => {
             state.note_stream_result(&video_id, Ok(()));

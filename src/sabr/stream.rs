@@ -345,20 +345,23 @@ async fn innertube_player(
     target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
+    reload_token: Option<&str>,
 ) -> Result<PlayerData, SabrError> {
-    let req = player_request(http, video_id, target, visitor_data, po_token)?;
+    let req = player_request(http, video_id, target, visitor_data, po_token, reload_token)?;
     let resp = http.execute(req).await.map_err(|e| e.without_url())?;
     parse_player_data(video_id, resp).await
 }
 
 /// Build the InnerTube /player request. The cast's ctt (in `context.user`)
 /// is the only authentication; no stored credential is ever attached.
+/// `reload_token` answers a RELOAD_PLAYER_RESPONSE (as googlevideo does).
 fn player_request(
     http: &reqwest::Client,
     video_id: &str,
     target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
+    reload_token: Option<&str>,
 ) -> Result<reqwest::Request, SabrError> {
     // --- Build context ---
     // WEB_REMIX uses the page session's full 22+ field INNERTUBE_CONTEXT plus
@@ -385,6 +388,10 @@ fn player_request(
     });
     if let Some(sts) = sig_timestamp {
         playback_ctx["contentPlaybackContext"]["signatureTimestamp"] = serde_json::json!(sts);
+    }
+    if let Some(token) = reload_token {
+        playback_ctx["reloadPlaybackContext"] =
+            serde_json::json!({ "reloadPlaybackParams": { "token": token } });
     }
 
     // --- Build request body ---
@@ -416,12 +423,13 @@ fn player_request(
         .unwrap_or(itclient.client_version);
 
     tracing::info!(
-        "[sabr] innertube /player for {} using {} v{}{}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}{}",
         video_id,
         itclient.client_name,
         client_version,
         if is_web_remix { " +ctt +session" } else { "" },
         if po_token.is_some() { " +potoken" } else { "" },
+        if reload_token.is_some() { " +reload" } else { "" },
     );
 
     let mut req = http
@@ -578,7 +586,7 @@ async fn get_player_data(
     match crate::music_session::web_remix_auth(ctt, yt_session) {
         Ok(auth) => {
             tracing::info!("[sabr] WEB_REMIX /player (ctt=true, session=true)");
-            match innertube_player(http, video_id, PlayerTarget::WebRemix(auth), None, None).await {
+            match innertube_player(http, video_id, PlayerTarget::WebRemix(auth), None, None, None).await {
                 Ok(data) => {
                     tracing::info!("[sabr] WEB_REMIX /player OK");
                     return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
@@ -594,7 +602,7 @@ async fn get_player_data(
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, PlayerTarget::Anonymous(&IOS_CLIENT), None, None).await?;
+    let data = innertube_player(http, video_id, PlayerTarget::Anonymous(&IOS_CLIENT), None, None, None).await?;
     tracing::info!("[sabr] IOS /player OK");
     Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
 }
@@ -614,6 +622,51 @@ async fn get_player_data(
 fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<String, SabrError> {
     crate::nsig::decode_nsig(player_js, n_value, player_hash)
         .map_err(|e| -> SabrError { format!("nsig: {}", e).into() })
+}
+
+/// Solve the `n` parameter of a WEB_REMIX SABR URL with the session's
+/// base.js. A URL without `n` is returned unchanged.
+async fn solve_nsig(
+    server_url: String,
+    session: Option<&crate::music_session::YtMusicSession>,
+) -> Result<String, SabrError> {
+    let n_value = server_url.split_once('?').and_then(|(_, query)| {
+        query.split('&').find_map(|pair| pair.strip_prefix("n=")).map(str::to_owned)
+    });
+    let Some(n_val) = n_value else {
+        return Ok(server_url);
+    };
+    let Some(session) = session else {
+        tracing::warn!("[sabr] WEB_REMIX URL has n= but no session — CDN will 403");
+        return Ok(server_url);
+    };
+    let Some(js) = session.player_js.clone() else {
+        tracing::warn!("[sabr] WEB_REMIX URL has n= but no player_js cached — CDN will 403");
+        return Ok(server_url);
+    };
+
+    tracing::info!("[sabr] decoding nsig: n len={}", n_val.len());
+    let n_clone = n_val.clone();
+    let hash = session.player_hash.clone().unwrap_or_default();
+    match tokio::task::spawn_blocking(move || decode_nsig(&js, &n_clone, &hash)).await {
+        Ok(Ok(decoded)) => {
+            tracing::info!("[sabr] nsig decoded: len {} -> {}", n_val.len(), decoded.len());
+            Ok(replace_n_param(&server_url, &decoded))
+        }
+        Ok(Err(e)) => {
+            tracing::error!("[sabr] nsig decode failed: {}", e);
+            Err(e)
+        }
+        Err(e) => {
+            tracing::error!("[sabr] nsig task panicked: {}", e);
+            Err(format!("nsig task panicked: {}", e).into())
+        }
+    }
+}
+
+/// All itags a /player response lists, for the log.
+fn listed_itags(formats: &[AdaptiveFormat]) -> Vec<i32> {
+    formats.iter().map(|f| f.itag).collect()
 }
 
 /// Replace the `n` parameter in a SABR URL with the decoded value.
@@ -728,6 +781,10 @@ struct SabrState {
     /// A RELOAD_PLAYER_RESPONSE seen in the current response; acted on once
     /// the whole response has been read.
     pending_reload: Option<ReloadRequested>,
+    /// The premium experiment's itag while it is the audio format; cleared
+    /// when the song falls back to the regular format.
+    premium_itag: Option<i32>,
+    fell_back_from: Option<i32>,
     stats: StreamStats,
 }
 
@@ -739,6 +796,7 @@ struct StreamStats {
     audio_bytes_by_itag: BTreeMap<i32, u64>,
     /// STREAM_PROTECTION_STATUS values in arrival order, repeats collapsed.
     protection_statuses: Vec<i32>,
+    reloads: u32,
 }
 
 /// Info when the premium experiment is on, debug otherwise, so production
@@ -761,16 +819,8 @@ impl SabrState {
         ustreamer_config: Vec<u8>,
         client_config: &'static InnerTubeClient,
     ) -> Self {
-        let audio_format_id = misc::FormatId {
-            itag: Some(audio_format.itag),
-            last_modified: Some(audio_format.last_modified),
-            xtags: audio_format.xtags.clone(),
-        };
-        let video_format_id = misc::FormatId {
-            itag: Some(video_format.itag),
-            last_modified: Some(video_format.last_modified),
-            xtags: video_format.xtags.clone(),
-        };
+        let audio_format_id = format_id(audio_format);
+        let video_format_id = format_id(video_format);
 
         Self {
             server_url,
@@ -796,6 +846,8 @@ impl SabrState {
             done: false,
             verbose: false,
             pending_reload: None,
+            premium_itag: None,
+            fell_back_from: None,
             stats: StreamStats::default(),
         }
     }
@@ -913,6 +965,47 @@ impl SabrState {
             ..Default::default()
         }
     }
+}
+
+fn format_id(format: &AdaptiveFormat) -> misc::FormatId {
+    misc::FormatId {
+        itag: Some(format.itag),
+        last_modified: Some(format.last_modified),
+        xtags: format.xtags.clone(),
+    }
+}
+
+/// Make `format` the audio format and forget all audio progress (only used
+/// before any audio was forwarded).
+fn switch_audio(state: &mut SabrState, format: &AdaptiveFormat) {
+    state.audio_itag = format.itag;
+    state.audio_format_id = format_id(format);
+    state.audio_max_segment = -1;
+    state.audio_downloaded_ms = 0;
+    state.audio_init_sent = false;
+    state.audio_initialized = false;
+    state.audio_total_end_ms = 0;
+    state.audio_end_segment = 0;
+    state.header_map.clear();
+}
+
+/// Point the stream at a reloaded /player response, as googlevideo does:
+/// new streaming URL and ustreamer config, SABR contexts cleared. Progress
+/// and the playback cookie carry over; format ids are refreshed when the new
+/// response still lists the itag.
+fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), SabrError> {
+    check_streaming_url(&player.server_url)?;
+    state.server_url = player.server_url.clone();
+    state.ustreamer_config = player.ustreamer_config.clone();
+    state.sabr_contexts.clear();
+    state.sabr_contexts_send.clear();
+    state.sabr_contexts_discard.clear();
+    for id in [&mut state.audio_format_id, &mut state.video_format_id] {
+        if let Some(f) = player.formats.iter().find(|f| Some(f.itag) == id.itag) {
+            *id = format_id(f);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,7 +1438,7 @@ async fn sabr_request_cycle(
 pub async fn stream_audio(
     video_id: &str,
     ctt: Option<&str>,
-    yt_session: Option<&crate::music_session::YtMusicSession>,
+    yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
@@ -1353,7 +1446,7 @@ pub async fn stream_audio(
     let client = credential_client();
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
-    let result = get_player_data(client, video_id, ctt, yt_session).await?;
+    let result = get_player_data(client, video_id, ctt, yt_session.as_deref()).await?;
     let player = result.player;
     let client_config = result.client_config;
     // get_player_data already handled PoToken selection per attempt:
@@ -1387,63 +1480,30 @@ pub async fn stream_audio(
     let (tx, rx) = mpsc::channel::<Bytes>(64);
 
     // 4. Decode nsig if WEB_REMIX SABR URL has `n` parameter.
-    let mut server_url = player.server_abr_streaming_url;
-    if client_config.client_name == "WEB_REMIX" {
-        // Extract `n` param from URL
-        let n_value = {
-            let mut found = None;
-            if let Some(query_start) = server_url.find('?') {
-                for pair in server_url[query_start + 1..].split('&') {
-                    if let Some(val) = pair.strip_prefix("n=") {
-                        found = Some(val.to_owned());
-                        break;
-                    }
-                }
-            }
-            found
-        };
-
-        if let Some(ref n_val) = n_value {
-            if let Some(session) = yt_session {
-                if let Some(ref js) = session.player_js {
-                    tracing::info!("[sabr] decoding nsig: n len={}", n_val.len());
-                    let js_clone = js.clone();
-                    let n_clone = n_val.clone();
-                    let hash_clone = session.player_hash.clone().unwrap_or_default();
-                    match tokio::task::spawn_blocking(move || decode_nsig(&js_clone, &n_clone, &hash_clone)).await {
-                        Ok(Ok(decoded)) => {
-                            tracing::info!("[sabr] nsig decoded: len {} -> {}", n_val.len(), decoded.len());
-                            server_url = replace_n_param(&server_url, &decoded);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("[sabr] nsig decode failed: {}", e);
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            tracing::error!("[sabr] nsig task panicked: {}", e);
-                            return Err(format!("nsig task panicked: {}", e).into());
-                        }
-                    }
-                } else {
-                    tracing::warn!("[sabr] WEB_REMIX URL has n= but no player_js cached — CDN will 403");
-                }
-            } else {
-                tracing::warn!("[sabr] WEB_REMIX URL has n= but no session — CDN will 403");
-            }
-        }
-    }
+    let server_url = if client_config.client_name == "WEB_REMIX" {
+        solve_nsig(player.server_abr_streaming_url, yt_session.as_deref()).await?
+    } else {
+        player.server_abr_streaming_url
+    };
 
     check_streaming_url(&server_url)?;
 
     // 5. Spawn the SABR streaming loop.
     let http = client.clone();
     let ustreamer_config = player.ustreamer_config;
+    let reload_auth = match (ctt, yt_session) {
+        (Some(ctt), Some(session)) if client_config.client_name == "WEB_REMIX" => {
+            Some((ctt.to_owned(), session))
+        }
+        _ => None,
+    };
+    let mut reloader = HttpReloader { http: http.clone(), video_id: video_id.to_owned(), auth: reload_auth };
 
     let video_fmt_clone = video_fmt.clone();
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, gvs_po_token, &tx,
+            ustreamer_config, client_config, gvs_po_token, &tx, &mut reloader,
         ).await;
 
         match result {
@@ -1470,6 +1530,7 @@ async fn sabr_loop(
     client_config: &'static InnerTubeClient,
     po_token: Option<String>,
     tx: &mpsc::Sender<Bytes>,
+    reloader: &mut HttpReloader,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
@@ -1494,7 +1555,7 @@ async fn sabr_loop(
         }
     }
 
-    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }).await
+    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }, reloader).await
 }
 
 /// One SABR request/response round trip, boxed so `drive_loop` stays `Send`.
@@ -1517,12 +1578,108 @@ impl SabrCycle for HttpCycle<'_> {
     }
 }
 
+/// Streaming data from a reloaded /player response; the URL is nsig-solved
+/// and on a trusted host.
+struct ReloadedPlayer {
+    server_url: String,
+    ustreamer_config: Vec<u8>,
+    formats: Vec<AdaptiveFormat>,
+}
+
+type ReloadFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReloadedPlayer, SabrError>> + Send + 'a>>;
+
+/// Fetches a fresh /player response, with the server's reload token if any.
+trait PlayerReloader {
+    fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a>;
+}
+
+/// Reloads via WEB_REMIX with the same ctt and page session as the first
+/// /player call. The ctt lives here, in memory, only for this song's stream.
+struct HttpReloader {
+    http: reqwest::Client,
+    video_id: String,
+    /// `None` when the song did not stream via WEB_REMIX: no reload possible.
+    auth: Option<(String, std::sync::Arc<crate::music_session::YtMusicSession>)>,
+}
+
+impl PlayerReloader for HttpReloader {
+    fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a> {
+        Box::pin(async move {
+            let (ctt, session) = self
+                .auth
+                .as_ref()
+                .ok_or("player reload needs WEB_REMIX (cast ctt and YouTube Music session)")?;
+            let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
+            let player = innertube_player(
+                &self.http, &self.video_id, PlayerTarget::WebRemix(auth), None, None, token,
+            )
+            .await?;
+            tracing::info!("[sabr] reloaded /player lists itags {:?}", listed_itags(&player.formats));
+            let server_url = solve_nsig(player.server_abr_streaming_url, Some(session)).await?;
+            check_streaming_url(&server_url)?;
+            Ok(ReloadedPlayer {
+                server_url,
+                ustreamer_config: player.ustreamer_config,
+                formats: player.formats,
+            })
+        })
+    }
+}
+
+/// googlevideo reloads on every RELOAD_PLAYER_RESPONSE; this caps it per song
+/// so a server that keeps asking cannot loop /player calls forever.
+const MAX_RELOADS_PER_SONG: u32 = 2;
+
+/// Answer a RELOAD_PLAYER_RESPONSE: reload up to the cap; past it, a premium
+/// experiment song that has forwarded no audio yet switches to the regular
+/// format via a fresh /player call; otherwise the stream ends as before.
+async fn handle_reload(
+    state: &mut SabrState,
+    reloader: &mut impl PlayerReloader,
+    reload: ReloadRequested,
+) -> Result<(), SabrError> {
+    if state.stats.reloads < MAX_RELOADS_PER_SONG {
+        state.stats.reloads += 1;
+        tracing::info!(
+            "[sabr] reloading player response ({}/{})",
+            state.stats.reloads, MAX_RELOADS_PER_SONG,
+        );
+        let player = reloader.fetch(reload.token.as_deref()).await?;
+        return apply_reload(state, &player);
+    }
+
+    let premium = state.premium_itag.filter(|&itag| {
+        itag == state.audio_itag && !state.stats.audio_bytes_by_itag.contains_key(&itag)
+    });
+    let Some(premium) = premium else {
+        tracing::warn!(
+            "[sabr] server still asks for a player reload after {} reloads, giving up",
+            MAX_RELOADS_PER_SONG,
+        );
+        return Err(reload.into());
+    };
+
+    let player = reloader.fetch(None).await?;
+    apply_reload(state, &player)?;
+    let regular = choose_audio_format(&player.formats)?;
+    tracing::info!(
+        "[sabr] premium experiment: itag {} still asks for a reload after {} reloads, falling back to itag {}",
+        premium, MAX_RELOADS_PER_SONG, regular.itag,
+    );
+    switch_audio(state, regular);
+    state.premium_itag = None;
+    state.fell_back_from = Some(premium);
+    Ok(())
+}
+
 /// Repeat SABR request cycles until the stream is done, the consumer is
 /// gone, a non-retryable error arrives, or retries run out.
 async fn drive_loop(
     state: &mut SabrState,
     tx: &mpsc::Sender<Bytes>,
     cycle: &mut impl SabrCycle,
+    reloader: &mut impl PlayerReloader,
 ) -> Result<(), SabrError> {
     let mut consecutive_errors = 0u32;
     const MAX_RETRIES: u32 = 5;
@@ -1545,6 +1702,11 @@ async fn drive_loop(
                 if !should_continue || state.done {
                     break;
                 }
+            }
+            Err(e) if e.is::<ReloadRequested>() => {
+                let reload = *e.downcast::<ReloadRequested>().expect("checked by is()");
+                handle_reload(state, reloader, reload).await?;
+                continue;
             }
             Err(e) if !is_retryable(&e) => return Err(e),
             Err(e) => {
@@ -1907,7 +2069,7 @@ mod tests {
         let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
 
         let req = player_request(
-            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None,
+            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, None,
         )
         .unwrap();
 
@@ -1925,13 +2087,35 @@ mod tests {
         assert_eq!(req.headers()["x-goog-visitor-id"], "CgtWSVNJVE9SLUlE");
         assert!(req.headers().get(reqwest::header::COOKIE).is_none());
         assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        assert!(body["playbackContext"].get("reloadPlaybackContext").is_none());
+    }
+
+    #[test]
+    fn reload_player_request_carries_the_reload_token_with_ctt_and_session() {
+        let session = crate::music_session::test_fixtures::session();
+        let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
+
+        let req = player_request(
+            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, Some("reload-tok"),
+        )
+        .unwrap();
+
+        let body = body_json(&req);
+        assert_eq!(
+            body["playbackContext"]["reloadPlaybackContext"],
+            serde_json::json!({ "reloadPlaybackParams": { "token": "reload-tok" } })
+        );
+        assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20391);
+        assert_eq!(body["context"]["user"]["credentialTransferTokens"][0]["token"], "cast-token");
+        assert_eq!(req.url().host_str(), Some("music.youtube.com"));
+        assert!(req.headers().get(reqwest::header::COOKIE).is_none());
     }
 
     #[test]
     fn fallback_clients_send_no_stored_credentials() {
         for client in [&IOS_CLIENT, &ANDROID_CLIENT, &WEB_CLIENT] {
             let req = player_request(
-                credential_client(), "dQw4w9WgXcQ", PlayerTarget::Anonymous(client), Some("visitor"), None,
+                credential_client(), "dQw4w9WgXcQ", PlayerTarget::Anonymous(client), Some("visitor"), None, None,
             )
             .unwrap();
             assert_eq!(req.url().host_str(), Some("www.youtube.com"));
@@ -2133,37 +2317,171 @@ mod tests {
         assert!(!logs.contains("Premium"), "{logs}");
     }
 
+    // -- reload loop -------------------------------------------------------------
+
+    const RELOADED_URL: &str = "https://rr9---sn-new.googlevideo.com/videoplayback?r=1";
+
+    /// Answers every round trip with a RELOAD_PLAYER_RESPONSE while `reload_while`
+    /// holds, and ends the stream cleanly otherwise.
+    struct ReloadingCycle {
+        requests: u32,
+        reload_while: fn(&SabrState) -> bool,
+    }
+
+    impl SabrCycle for ReloadingCycle {
+        fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+            self.requests += 1;
+            Box::pin(async move {
+                if !(self.reload_while)(state) {
+                    return Ok(false);
+                }
+                handle_part(state, &reload_part(Some("tok")))?;
+                finish_response(state, &[ump::RELOAD_PLAYER_RESPONSE])?;
+                Ok(true)
+            })
+        }
+    }
+
+    /// Records the reload tokens it was asked with and serves a fixed player.
+    struct FakeReloader {
+        tokens: Vec<Option<String>>,
+        formats: Vec<AdaptiveFormat>,
+    }
+
+    impl FakeReloader {
+        fn new(formats: Vec<AdaptiveFormat>) -> Self {
+            Self { tokens: Vec::new(), formats }
+        }
+    }
+
+    impl PlayerReloader for FakeReloader {
+        fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a> {
+            self.tokens.push(token.map(str::to_owned));
+            let player = ReloadedPlayer {
+                server_url: RELOADED_URL.to_owned(),
+                ustreamer_config: vec![9, 9],
+                formats: self.formats.clone(),
+            };
+            Box::pin(async move { Ok(player) })
+        }
+    }
+
+    fn always(_: &SabrState) -> bool {
+        true
+    }
+
+    fn while_premium(state: &SabrState) -> bool {
+        state.audio_itag == 774
+    }
+
+    fn premium_state() -> SabrState {
+        let mut state = test_state(GOOD_URL);
+        let premium = audio(774, OPUS, 272_644);
+        switch_audio(&mut state, &premium);
+        state.premium_itag = Some(774);
+        state
+    }
+
+    fn reload_formats() -> Vec<AdaptiveFormat> {
+        vec![
+            audio(774, OPUS, 272_644),
+            audio(251, OPUS, 146_272),
+            audio(140, AAC, 134_111),
+            audio(160, "video/mp4", 100_000),
+        ]
+    }
+
     #[tokio::test]
-    async fn reload_request_stops_the_loop_after_one_request() {
+    async fn reload_swaps_in_the_new_streaming_data_and_continues() {
+        let mut state = test_state(GOOD_URL);
+        state.sabr_contexts.insert(2, vec![1]);
+        state.sabr_contexts_send.insert(2);
+        state.playback_cookie = Some(vec![7]);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = ReloadingCycle { requests: 0, reload_while: |s| s.server_url == GOOD_URL };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(reloader.tokens, vec![Some("tok".to_owned())]);
+        assert_eq!(cycle.requests, 2);
+        assert_eq!(state.server_url, RELOADED_URL);
+        assert_eq!(state.ustreamer_config, vec![9, 9]);
+        assert!(state.sabr_contexts.is_empty());
+        assert!(state.sabr_contexts_send.is_empty());
+        assert_eq!(state.playback_cookie, Some(vec![7]));
+        assert_eq!(state.stats.reloads, 1);
+        assert_eq!(state.audio_itag, 251);
+    }
+
+    #[tokio::test]
+    async fn reloads_are_capped_at_two_per_song() {
+        let logs = crate::storage::test_util::LogCapture::start();
         let mut state = test_state(GOOD_URL);
         let (tx, _rx) = mpsc::channel(1);
-        // The first round trip's UMP body is a single RELOAD_PLAYER_RESPONSE
-        // part (the network path refuses non-Google hosts). Any further round
-        // trip ends the stream cleanly, so a loop that ignores or retries the
-        // reload finishes with Ok instead of hanging.
-        struct ReloadOnce {
-            requests: u32,
-        }
-        impl SabrCycle for ReloadOnce {
-            fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
-                self.requests += 1;
-                let first = self.requests == 1;
-                Box::pin(async move {
-                    if !first {
-                        return Ok(false);
-                    }
-                    handle_part(state, &reload_part(None))?;
-                    finish_response(state, &[ump::RELOAD_PLAYER_RESPONSE])?;
-                    Ok(true)
-                })
+        let mut cycle = ReloadingCycle { requests: 0, reload_while: always };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        let err = drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap_err();
+
+        assert!(err.is::<ReloadRequested>(), "{err}");
+        assert_eq!(reloader.tokens.len(), 2);
+        assert_eq!(cycle.requests, 3);
+        assert_eq!(state.stats.reloads, 2);
+        assert!(logs.text().contains("reloading player response (1/2)"), "{}", logs.text());
+        assert!(!logs.text().contains("secret"), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn reload_fetch_failure_ends_the_stream() {
+        struct FailingReloader;
+        impl PlayerReloader for FailingReloader {
+            fn fetch<'a>(&'a mut self, _token: Option<&'a str>) -> ReloadFuture<'a> {
+                Box::pin(async { Err("reload needs WEB_REMIX".into()) })
             }
         }
-        let mut cycle = ReloadOnce { requests: 0 };
+        let mut state = test_state(GOOD_URL);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = ReloadingCycle { requests: 0, reload_while: always };
 
-        let result = drive_loop(&mut state, &tx, &mut cycle).await;
+        let err = drive_loop(&mut state, &tx, &mut cycle, &mut FailingReloader).await.unwrap_err();
 
-        let err = result.unwrap_err();
-        assert!(err.is::<ReloadRequested>(), "{err}");
+        assert!(err.to_string().contains("WEB_REMIX"), "{err}");
         assert_eq!(cycle.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn premium_falls_back_to_251_after_two_reloads() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let mut state = premium_state();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = ReloadingCycle { requests: 0, reload_while: while_premium };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        // Two reloads with the server's token, then a fresh /player without one.
+        assert_eq!(reloader.tokens, vec![Some("tok".to_owned()), Some("tok".to_owned()), None]);
+        assert_eq!(state.audio_itag, 251);
+        assert_eq!(state.audio_format_id.itag, Some(251));
+        assert_eq!(state.premium_itag, None);
+        assert_eq!(state.fell_back_from, Some(774));
+        assert_eq!(cycle.requests, 4);
+        assert!(logs.text().contains("falling back to itag 251"), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn premium_does_not_switch_formats_once_audio_was_forwarded() {
+        let mut state = premium_state();
+        state.stats.audio_bytes_by_itag.insert(774, 1000);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut cycle = ReloadingCycle { requests: 0, reload_while: while_premium };
+        let mut reloader = FakeReloader::new(reload_formats());
+
+        let err = drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap_err();
+
+        assert!(err.is::<ReloadRequested>(), "{err}");
+        assert_eq!(reloader.tokens.len(), 2);
+        assert_eq!(state.audio_itag, 774);
     }
 }
