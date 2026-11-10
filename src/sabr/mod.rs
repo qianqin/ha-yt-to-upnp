@@ -1,5 +1,6 @@
 pub mod ump;
 pub mod stream;
+pub mod url_transport;
 
 pub mod proto {
     pub mod misc {

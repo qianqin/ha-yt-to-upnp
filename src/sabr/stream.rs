@@ -281,13 +281,20 @@ pub(crate) fn credential_client() -> &'static reqwest::Client {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AdaptiveFormat {
     itag: i32,
     last_modified: u64,
     xtags: Option<String>,
     mime_type: String,
     bitrate: u64,
+    /// Direct media URL, or `signatureCipher` (url + s + sp); used only by
+    /// the premium experiment's url transport.
+    url: Option<String>,
+    signature_cipher: Option<String>,
+    content_length: Option<u64>,
+    is_drc: bool,
+    audio_track_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,24 +352,34 @@ async fn innertube_player(
     target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
-    reload_token: Option<&str>,
+    extras: PlayerExtras<'_>,
 ) -> Result<PlayerData, SabrError> {
-    let req = player_request(http, video_id, target, visitor_data, po_token, reload_token)?;
+    let req = player_request(http, video_id, target, visitor_data, po_token, extras)?;
     let resp = http.execute(req).await.map_err(|e| e.without_url())?;
     parse_player_data(video_id, resp).await
 }
 
+/// Optional /player body parts.
+#[derive(Clone, Copy, Default)]
+struct PlayerExtras<'a> {
+    /// Answers a RELOAD_PLAYER_RESPONSE (as googlevideo does).
+    reload_token: Option<&'a str>,
+    /// The cast's opaque `params` (Lounge setPlaylist), sent as `params`
+    /// like the phone's own player does.
+    params: Option<&'a str>,
+}
+
 /// Build the InnerTube /player request. The cast's ctt (in `context.user`)
 /// is the only authentication; no stored credential is ever attached.
-/// `reload_token` answers a RELOAD_PLAYER_RESPONSE (as googlevideo does).
 fn player_request(
     http: &reqwest::Client,
     video_id: &str,
     target: PlayerTarget<'_>,
     visitor_data: Option<&str>,
     po_token: Option<&str>,
-    reload_token: Option<&str>,
+    extras: PlayerExtras<'_>,
 ) -> Result<reqwest::Request, SabrError> {
+    let PlayerExtras { reload_token, params } = extras;
     // --- Build context ---
     // WEB_REMIX uses the page session's full 22+ field INNERTUBE_CONTEXT plus
     // the ctt. Without that context, WEB_REMIX /player returns UNPLAYABLE;
@@ -403,6 +420,10 @@ fn player_request(
         "playbackContext": playback_ctx,
     });
 
+    if let Some(params) = params {
+        body["params"] = serde_json::json!(params);
+    }
+
     if let Some(token) = po_token {
         body["serviceIntegrityDimensions"] = serde_json::json!({
             "poToken": token,
@@ -423,13 +444,14 @@ fn player_request(
         .unwrap_or(itclient.client_version);
 
     tracing::info!(
-        "[sabr] innertube /player for {} using {} v{}{}{}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}{}{}",
         video_id,
         itclient.client_name,
         client_version,
         if is_web_remix { " +ctt +session" } else { "" },
         if po_token.is_some() { " +potoken" } else { "" },
         if reload_token.is_some() { " +reload" } else { "" },
+        if params.is_some() { " +params" } else { "" },
     );
 
     let mut req = http
@@ -538,6 +560,11 @@ async fn parse_player_data(video_id: &str, resp: reqwest::Response) -> Result<Pl
             xtags,
             mime_type,
             bitrate,
+            url: f["url"].as_str().map(str::to_owned),
+            signature_cipher: f["signatureCipher"].as_str().map(str::to_owned),
+            content_length: f["contentLength"].as_str().and_then(|s| s.parse().ok()),
+            is_drc: f["isDrc"].as_bool().unwrap_or(false),
+            audio_track_id: f["audioTrack"]["id"].as_str().map(str::to_owned),
         });
     }
 
@@ -578,6 +605,7 @@ async fn get_player_data(
     video_id: &str,
     ctt: Option<&str>,
     yt_session: Option<&crate::music_session::YtMusicSession>,
+    params: Option<&str>,
 ) -> Result<PlayerResult, SabrError> {
     let gvs = fetch_pot_token(http, Some(video_id)).await;
 
@@ -586,7 +614,10 @@ async fn get_player_data(
     match crate::music_session::web_remix_auth(ctt, yt_session) {
         Ok(auth) => {
             tracing::info!("[sabr] WEB_REMIX /player (ctt=true, session=true)");
-            match innertube_player(http, video_id, PlayerTarget::WebRemix(auth), None, None, None).await {
+            match innertube_player(
+                http, video_id, PlayerTarget::WebRemix(auth), None, None,
+                PlayerExtras { reload_token: None, params },
+            ).await {
                 Ok(data) => {
                     tracing::info!("[sabr] WEB_REMIX /player OK");
                     return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
@@ -602,7 +633,7 @@ async fn get_player_data(
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, PlayerTarget::Anonymous(&IOS_CLIENT), None, None, None).await?;
+    let data = innertube_player(http, video_id, PlayerTarget::Anonymous(&IOS_CLIENT), None, None, PlayerExtras::default()).await?;
     tracing::info!("[sabr] IOS /player OK");
     Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
 }
@@ -699,24 +730,51 @@ const PREMIUM_ONLY_AUDIO_ITAGS: [i32; 2] = [774, 141];
 struct PremiumExperiment {
     /// The premium itag to prefer (774 or 141); `None` = experiment off.
     itag: Option<i32>,
-    /// Send no PoToken in SABR requests (yt-dlp: GVS PoToken not required
-    /// for Premium). Only with the experiment on.
+    /// Send no PoToken (yt-dlp: GVS PoToken not required for Premium).
     no_pot: bool,
+    /// How the premium itag is fetched.
+    transport: Transport,
+    /// SABR requests in googlevideo's audio-only shape (no video format).
+    audio_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Transport {
+    /// A SABR session, as for every regular song.
+    #[default]
+    Sabr,
+    /// The format's own URL in byte ranges, as the web player fetches 141.
+    Url,
 }
 
 const PREMIUM_AUDIO_ENV: &str = "YTCAST_PREMIUM_AUDIO";
 const PREMIUM_NO_POT_ENV: &str = "YTCAST_PREMIUM_NO_POT";
+const PREMIUM_TRANSPORT_ENV: &str = "YTCAST_PREMIUM_TRANSPORT";
+const PREMIUM_AUDIO_ONLY_ENV: &str = "YTCAST_PREMIUM_AUDIO_ONLY";
+const PLAYER_PARAMS_ENV: &str = "YTCAST_PREMIUM_PLAYER_PARAMS";
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn flag_set(env: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+    env(name).as_deref().map(str::trim) == Some("1")
+}
+
+/// Send the cast's `params` with /player (initial and reload). Its own flag:
+/// it changes the /player call for every song, premium or not.
+fn player_params_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    flag_set(&env, PLAYER_PARAMS_ENV)
+}
 
 impl PremiumExperiment {
     fn from_env() -> Self {
-        Self::parse(
-            std::env::var(PREMIUM_AUDIO_ENV).ok().as_deref(),
-            std::env::var(PREMIUM_NO_POT_ENV).ok().as_deref(),
-        )
+        Self::parse(env_var)
     }
 
-    fn parse(audio: Option<&str>, no_pot: Option<&str>) -> Self {
-        let itag = match audio.map(str::trim) {
+    fn parse(env: impl Fn(&str) -> Option<String>) -> Self {
+        let audio = env(PREMIUM_AUDIO_ENV);
+        let itag = match audio.as_deref().map(str::trim) {
             None | Some("") | Some("off") => None,
             Some(value) => match value.parse::<i32>() {
                 Ok(itag) if PREMIUM_ONLY_AUDIO_ITAGS.contains(&itag) => Some(itag),
@@ -729,8 +787,40 @@ impl PremiumExperiment {
                 }
             },
         };
-        Self { itag, no_pot: itag.is_some() && no_pot.map(str::trim) == Some("1") }
+        if itag.is_none() {
+            return Self::default();
+        }
+        let transport = match env(PREMIUM_TRANSPORT_ENV).as_deref().map(str::trim) {
+            Some("url") => Transport::Url,
+            _ => Transport::Sabr,
+        };
+        Self {
+            itag,
+            no_pot: flag_set(&env, PREMIUM_NO_POT_ENV),
+            transport,
+            audio_only: flag_set(&env, PREMIUM_AUDIO_ONLY_ENV),
+        }
     }
+}
+
+/// Every /player entry for `itag` (Premium itags can come in variants),
+/// with the fields that tell them apart. xtags are format descriptors, not
+/// secrets.
+fn describe_variants(formats: &[AdaptiveFormat], itag: i32) -> String {
+    let entries: Vec<String> = formats
+        .iter()
+        .filter(|f| f.itag == itag)
+        .map(|f| {
+            format!(
+                "xtags={} isDrc={} audioTrack={} lm={}",
+                f.xtags.as_deref().unwrap_or("-"),
+                f.is_drc,
+                f.audio_track_id.as_deref().unwrap_or("-"),
+                f.last_modified,
+            )
+        })
+        .collect();
+    format!("{} variants: [{}]", itag, entries.join(", "))
 }
 
 /// The PoToken for SABR requests, unless the experiment's no-PoToken variant
@@ -767,7 +857,10 @@ fn choose_audio_format(
     premium: Option<i32>,
 ) -> Result<&AdaptiveFormat, SabrError> {
     let audio = formats.iter().filter(|f| f.mime_type.starts_with("audio/"));
-    if let Some(chosen) = premium.and_then(|itag| audio.clone().find(|f| f.itag == itag)) {
+    // Among variants of the premium itag, the plain (non-DRC) one.
+    if let Some(chosen) = premium.and_then(|itag| {
+        audio.clone().filter(|f| f.itag == itag).min_by_key(|f| f.is_drc)
+    }) {
         return Ok(chosen);
     }
     if !formats.iter().any(|f| f.mime_type.starts_with("audio/")) {
@@ -861,6 +954,13 @@ struct SabrState {
     premium_itag: Option<i32>,
     fell_back_from: Option<i32>,
     stats: StreamStats,
+    /// Client version for StreamerContext.clientInfo: the page session's for
+    /// WEB_REMIX, so it matches the /player call.
+    client_version: String,
+    audio_is_drc: bool,
+    audio_track_id: Option<String>,
+    /// Premium experiment: googlevideo's audio-only request shape.
+    audio_only: bool,
 }
 
 /// Per-song tallies for the log and the premium experiment verdict.
@@ -924,6 +1024,10 @@ impl SabrState {
             premium_itag: None,
             fell_back_from: None,
             stats: StreamStats::default(),
+            client_version: client_config.client_version.to_owned(),
+            audio_is_drc: audio_format.is_drc,
+            audio_track_id: audio_format.audio_track_id.clone(),
+            audio_only: false,
         }
     }
 
@@ -934,13 +1038,15 @@ impl SabrState {
     /// - Only includes audio in selectedFormatIds after FORMAT_INIT received
     /// - Always includes both in preferredAudio/VideoFormatIds
     fn build_request(&self) -> vs::VideoPlaybackAbrRequest {
+        // Empty device fields are left out, as googlevideo does.
+        let non_empty = |v: &str| (!v.is_empty()).then(|| v.to_owned());
         let client_info = vs::streamer_context::ClientInfo {
-            device_make: Some(self.client_config.device_make.to_owned()),
-            device_model: Some(self.client_config.device_model.to_owned()),
+            device_make: non_empty(self.client_config.device_make),
+            device_model: non_empty(self.client_config.device_model),
             client_name: Some(self.client_config.client_name_id),
-            client_version: Some(self.client_config.client_version.to_owned()),
-            os_name: Some(self.client_config.os_name.to_owned()),
-            os_version: Some(self.client_config.os_version.to_owned()),
+            client_version: Some(self.client_version.clone()),
+            os_name: non_empty(self.client_config.os_name),
+            os_version: non_empty(self.client_config.os_version),
             android_sdk_version: self.client_config.android_sdk_version,
             ..Default::default()
         };
@@ -988,6 +1094,7 @@ impl SabrState {
 
         // Video: always "fully buffered" (discard trick).
         // This tells the server we have ALL video data, so it won't send any.
+        if !self.audio_only {
         buffered_ranges.push(vs::BufferedRange {
             format_id: self.video_format_id.clone(),
             start_time_ms: 0,
@@ -1001,11 +1108,12 @@ impl SabrState {
             }),
             ..Default::default()
         });
+        }
 
-        // -- selectedFormatIds --
-        // Per TS reference: video (discarded) is always in selectedFormatIds.
-        // Audio is only added after FORMAT_INITIALIZATION_METADATA is received.
-        let mut selected_format_ids = vec![self.video_format_id.clone()];
+        // -- selectedFormatIds (googlevideo: initialization_format_ids) --
+        // Discard trick: video is always listed. Audio-only shape: only
+        // initialized formats. Audio is added after FORMAT_INITIALIZATION_METADATA.
+        let mut selected_format_ids = if self.audio_only { Vec::new() } else { vec![self.video_format_id.clone()] };
         if self.audio_initialized {
             selected_format_ids.push(self.audio_format_id.clone());
         }
@@ -1022,6 +1130,9 @@ impl SabrState {
             player_time_ms: Some(player_time),
             visibility: Some(1),
             player_state: Some(1),
+            // Experiment only, so regular requests stay as they are.
+            drc_enabled: self.verbose.then_some(self.audio_is_drc),
+            audio_track_id: if self.verbose { self.audio_track_id.clone() } else { None },
             ..Default::default()
         };
 
@@ -1035,7 +1146,7 @@ impl SabrState {
                 Some(self.ustreamer_config.clone())
             },
             preferred_audio_format_ids: vec![self.audio_format_id.clone()],
-            preferred_video_format_ids: vec![self.video_format_id.clone()],
+            preferred_video_format_ids: if self.audio_only { Vec::new() } else { vec![self.video_format_id.clone()] },
             streamer_context: Some(streamer_context),
             ..Default::default()
         }
@@ -1055,6 +1166,8 @@ fn format_id(format: &AdaptiveFormat) -> misc::FormatId {
 fn switch_audio(state: &mut SabrState, format: &AdaptiveFormat) {
     state.audio_itag = format.itag;
     state.audio_format_id = format_id(format);
+    state.audio_is_drc = format.is_drc;
+    state.audio_track_id = format.audio_track_id.clone();
     state.audio_max_segment = -1;
     state.audio_downloaded_ms = 0;
     state.audio_init_sent = false;
@@ -1080,7 +1193,9 @@ fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), Sa
     state.sabr_contexts_send.clear();
     state.sabr_contexts_discard.clear();
     for id in [&mut state.audio_format_id, &mut state.video_format_id] {
-        if let Some(f) = player.formats.iter().find(|f| Some(f.itag) == id.itag) {
+        let same_itag = |f: &&AdaptiveFormat| Some(f.itag) == id.itag;
+        let same_variant = player.formats.iter().filter(same_itag).find(|f| f.xtags == id.xtags);
+        if let Some(f) = same_variant.or_else(|| player.formats.iter().find(same_itag)) {
             *id = format_id(f);
         }
     }
@@ -1578,15 +1693,24 @@ async fn sabr_request_cycle(
 pub async fn stream_audio(
     video_id: &str,
     ctt: Option<&str>,
+    player_params: Option<&str>,
     yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     if ctt.is_some() {
         tracing::info!("[sabr] stream_audio for {} with ctt=true", video_id);
     }
     let client = credential_client();
+    let params = player_params.filter(|_| player_params_enabled(env_var));
+    if player_params_enabled(env_var) {
+        tracing::info!(
+            "[sabr] {}: cast params {}",
+            PLAYER_PARAMS_ENV,
+            params.map_or("not sent by the phone".to_owned(), |p| format!("sent (len {})", p.len())),
+        );
+    }
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
-    let result = get_player_data(client, video_id, ctt, yt_session.as_deref()).await?;
+    let result = get_player_data(client, video_id, ctt, yt_session.as_deref(), params).await?;
     let player = result.player;
     let client_config = result.client_config;
     // get_player_data already handled PoToken selection per attempt:
@@ -1605,9 +1729,37 @@ pub async fn stream_audio(
     }
 
     // 2. Pick the best audio format + a video format for the discard trick.
-    let audio_fmt = choose_audio_format(&player.formats, experiment.itag)?.clone();
+    let mut audio_fmt = choose_audio_format(&player.formats, experiment.itag)?.clone();
     if let Some(itag) = experiment.itag.filter(|&itag| itag != audio_fmt.itag) {
         tracing::info!("[sabr] premium experiment: itag {} → media NO (not listed by /player)", itag);
+    }
+    if experiment.itag == Some(audio_fmt.itag) {
+        tracing::info!("[sabr] premium experiment: {}", describe_variants(&player.formats, audio_fmt.itag));
+        tracing::info!(
+            "[sabr] premium experiment: itag {} transport {:?}, audio-only shape {}, source {}",
+            audio_fmt.itag, experiment.transport, experiment.audio_only,
+            super::url_transport::describe_source(audio_fmt.url.as_deref(), audio_fmt.signature_cipher.as_deref()),
+        );
+        if experiment.transport == Transport::Url {
+            match premium_via_url(client, &audio_fmt, yt_session.clone(), gvs_po_token.as_deref()).await {
+                Ok(rx) => {
+                    let info = SabrStreamInfo {
+                        title: player.title.clone(),
+                        duration_secs: player.duration_secs,
+                        mime_type: audio_fmt.mime_type.clone(),
+                    };
+                    return Ok((info, rx));
+                }
+                Err(e) => {
+                    let regular = choose_audio_format(&player.formats, None)?.clone();
+                    tracing::info!(
+                        "[sabr] premium experiment: itag {} via url → media NO (bytes 0): {}; falling back to SABR itag {}",
+                        audio_fmt.itag, e, regular.itag,
+                    );
+                    audio_fmt = regular;
+                }
+            }
+        }
     }
     let video_fmt = choose_video_format(&player.formats)
         .ok_or("no video format found (needed for SABR discard trick)")?
@@ -1643,19 +1795,29 @@ pub async fn stream_audio(
     // 5. Spawn the SABR streaming loop.
     let http = client.clone();
     let ustreamer_config = player.ustreamer_config;
+    let session_version = match client_config.client_name {
+        "WEB_REMIX" => yt_session.as_deref().and_then(|s| s.client_version()).map(str::to_owned),
+        _ => None,
+    };
     let reload_auth = match (ctt, yt_session) {
         (Some(ctt), Some(session)) if client_config.client_name == "WEB_REMIX" => {
             Some((ctt.to_owned(), session))
         }
         _ => None,
     };
-    let mut reloader = HttpReloader { http: http.clone(), video_id: video_id.to_owned(), auth: reload_auth };
+    let mut reloader = HttpReloader {
+        http: http.clone(),
+        video_id: video_id.to_owned(),
+        auth: reload_auth,
+        params: params.map(str::to_owned),
+        premium_itag: experiment.itag.filter(|&itag| itag == audio_fmt.itag),
+    };
 
     let video_fmt_clone = video_fmt.clone();
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, gvs_po_token, &tx, &mut reloader, experiment,
+            ustreamer_config, client_config, session_version, gvs_po_token, &tx, &mut reloader, experiment,
         ).await;
 
         match result {
@@ -1666,6 +1828,45 @@ pub async fn stream_audio(
     });
 
     Ok((info, rx))
+}
+
+/// Byte-range size for the url transport (the web player uses ~0.5-1 MiB).
+const URL_CHUNK_SIZE: u64 = 1024 * 1024;
+
+/// Premium experiment, url transport: decipher the format URL and fetch its
+/// first range. `Err` before any byte, so the caller can fall back to SABR.
+async fn premium_via_url(
+    http: &reqwest::Client,
+    format: &AdaptiveFormat,
+    session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
+    po_token: Option<&str>,
+) -> Result<mpsc::Receiver<Bytes>, SabrError> {
+    use super::url_transport::{self as ut, PlayerJsDecipher};
+    let session = session.ok_or("url transport needs the YouTube Music session (base.js)")?;
+    let source = ut::format_source(format.url.as_deref(), format.signature_cipher.as_deref())?;
+    let cver = session.client_version().unwrap_or(WEB_REMIX_CLIENT.client_version).to_owned();
+    let pot = po_token.map(str::to_owned);
+    let started = std::time::Instant::now();
+    let url = tokio::task::spawn_blocking(move || {
+        let decipher = PlayerJsDecipher { session };
+        ut::resolve_url(&source, &decipher, pot.as_deref(), &cver, &ut::generate_cpn())
+    })
+    .await
+    .map_err(|e| format!("decipher task: {e}"))??;
+    tracing::info!(
+        "[url] itag {} decipher OK in {} ms (host {}, params {})",
+        format.itag, started.elapsed().as_millis(), host_for_log(&url),
+        ut::param_names(&url).join(", "),
+    );
+    ut::RangeFetch {
+        http: http.clone(),
+        url,
+        content_length: format.content_length,
+        chunk_size: URL_CHUNK_SIZE,
+        itag: format.itag,
+    }
+    .start()
+    .await
 }
 
 /// Inner SABR request loop. Runs until all audio segments are downloaded,
@@ -1680,6 +1881,7 @@ async fn sabr_loop(
     video_format: &AdaptiveFormat,
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
+    session_version: Option<String>,
     po_token: Option<String>,
     tx: &mpsc::Sender<Bytes>,
     reloader: &mut HttpReloader,
@@ -1688,8 +1890,12 @@ async fn sabr_loop(
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
+    if let Some(version) = session_version {
+        state.client_version = version;
+    }
     state.verbose = experiment.itag.is_some();
     state.premium_itag = experiment.itag.filter(|&itag| itag == audio_format.itag);
+    state.audio_only = experiment.audio_only && state.premium_itag.is_some();
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
     // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
@@ -1760,6 +1966,10 @@ struct HttpReloader {
     video_id: String,
     /// `None` when the song did not stream via WEB_REMIX: no reload possible.
     auth: Option<(String, std::sync::Arc<crate::music_session::YtMusicSession>)>,
+    /// The cast's `params`, when YTCAST_PREMIUM_PLAYER_PARAMS is on.
+    params: Option<String>,
+    /// Premium itag whose variants are logged after each reload.
+    premium_itag: Option<i32>,
 }
 
 impl PlayerReloader for HttpReloader {
@@ -1770,11 +1980,15 @@ impl PlayerReloader for HttpReloader {
                 .as_ref()
                 .ok_or("player reload needs WEB_REMIX (cast ctt and YouTube Music session)")?;
             let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
+            let extras = PlayerExtras { reload_token: token, params: self.params.as_deref() };
             let player = innertube_player(
-                &self.http, &self.video_id, PlayerTarget::WebRemix(auth), None, None, token,
+                &self.http, &self.video_id, PlayerTarget::WebRemix(auth), None, None, extras,
             )
             .await?;
             tracing::info!("[sabr] reloaded /player lists itags {:?}", listed_itags(&player.formats));
+            if let Some(itag) = self.premium_itag {
+                tracing::info!("[sabr] reloaded {}", describe_variants(&player.formats, itag));
+            }
             let server_url = solve_nsig(player.server_abr_streaming_url, Some(session)).await?;
             check_streaming_url(&server_url)?;
             Ok(ReloadedPlayer {
@@ -1844,6 +2058,7 @@ async fn fall_back_from_premium(
     );
     switch_audio(state, regular);
     state.premium_itag = None;
+    state.audio_only = false;
     state.fell_back_from = Some(premium);
     Ok(())
 }
@@ -1976,9 +2191,9 @@ mod tests {
         let fmt = AdaptiveFormat {
             itag: 251,
             last_modified: 1,
-            xtags: None,
             mime_type: "audio/webm".to_owned(),
             bitrate: 1,
+            ..Default::default()
         };
         SabrState::new(server_url.to_owned(), &fmt, &fmt, Vec::new(), &WEB_REMIX_CLIENT)
     }
@@ -2249,7 +2464,7 @@ mod tests {
         let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
 
         let req = player_request(
-            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, None,
+            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, PlayerExtras::default(),
         )
         .unwrap();
 
@@ -2268,6 +2483,7 @@ mod tests {
         assert!(req.headers().get(reqwest::header::COOKIE).is_none());
         assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
         assert!(body["playbackContext"].get("reloadPlaybackContext").is_none());
+        assert!(body.get("params").is_none());
     }
 
     #[test]
@@ -2276,7 +2492,8 @@ mod tests {
         let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
 
         let req = player_request(
-            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, Some("reload-tok"),
+            credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None,
+            PlayerExtras { reload_token: Some("reload-tok"), params: None },
         )
         .unwrap();
 
@@ -2295,7 +2512,7 @@ mod tests {
     fn fallback_clients_send_no_stored_credentials() {
         for client in [&IOS_CLIENT, &ANDROID_CLIENT, &WEB_CLIENT] {
             let req = player_request(
-                credential_client(), "dQw4w9WgXcQ", PlayerTarget::Anonymous(client), Some("visitor"), None, None,
+                credential_client(), "dQw4w9WgXcQ", PlayerTarget::Anonymous(client), Some("visitor"), None, PlayerExtras::default(),
             )
             .unwrap();
             assert_eq!(req.url().host_str(), Some("www.youtube.com"));
@@ -2311,9 +2528,9 @@ mod tests {
         AdaptiveFormat {
             itag,
             last_modified: 1,
-            xtags: None,
             mime_type: mime.to_owned(),
             bitrate,
+            ..Default::default()
         }
     }
 
@@ -2336,33 +2553,167 @@ mod tests {
 
     // -- premium audio experiment -------------------------------------------------
 
+    fn parse_env(vars: &[(&str, &str)]) -> PremiumExperiment {
+        PremiumExperiment::parse(|name| {
+            vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+        })
+    }
+
     #[test]
     fn premium_flag_is_off_unless_set_to_a_premium_itag() {
         let off = PremiumExperiment::default();
-        assert_eq!(PremiumExperiment::parse(None, None), off);
-        assert_eq!(PremiumExperiment::parse(Some("off"), Some("1")), off);
-        assert_eq!(PremiumExperiment::parse(Some(""), None), off);
-        assert_eq!(PremiumExperiment::parse(Some("251"), None), off);
-        assert_eq!(PremiumExperiment::parse(Some("loud"), None), off);
+        assert_eq!(parse_env(&[]), off);
+        assert_eq!(parse_env(&[("YTCAST_PREMIUM_AUDIO", "off"), ("YTCAST_PREMIUM_NO_POT", "1")]), off);
+        assert_eq!(parse_env(&[("YTCAST_PREMIUM_AUDIO", "")]), off);
+        assert_eq!(parse_env(&[("YTCAST_PREMIUM_AUDIO", "251")]), off);
+        assert_eq!(parse_env(&[("YTCAST_PREMIUM_AUDIO", "loud")]), off);
+        // Variant flags mean nothing without a premium itag.
         assert_eq!(
-            PremiumExperiment::parse(Some("774"), None),
-            PremiumExperiment { itag: Some(774), no_pot: false }
+            parse_env(&[("YTCAST_PREMIUM_TRANSPORT", "url"), ("YTCAST_PREMIUM_AUDIO_ONLY", "1")]),
+            off
         );
         assert_eq!(
-            PremiumExperiment::parse(Some(" 141 "), Some("1")),
-            PremiumExperiment { itag: Some(141), no_pot: true }
+            parse_env(&[("YTCAST_PREMIUM_AUDIO", "774")]),
+            PremiumExperiment { itag: Some(774), ..off }
         );
         assert_eq!(
-            PremiumExperiment::parse(Some("774"), Some("0")),
-            PremiumExperiment { itag: Some(774), no_pot: false }
+            parse_env(&[("YTCAST_PREMIUM_AUDIO", " 141 "), ("YTCAST_PREMIUM_NO_POT", "1")]),
+            PremiumExperiment { itag: Some(141), no_pot: true, ..off }
         );
+        assert_eq!(
+            parse_env(&[("YTCAST_PREMIUM_AUDIO", "774"), ("YTCAST_PREMIUM_NO_POT", "0")]),
+            PremiumExperiment { itag: Some(774), ..off }
+        );
+        assert_eq!(
+            parse_env(&[
+                ("YTCAST_PREMIUM_AUDIO", "141"),
+                ("YTCAST_PREMIUM_TRANSPORT", "url"),
+                ("YTCAST_PREMIUM_AUDIO_ONLY", "1"),
+            ]),
+            PremiumExperiment { itag: Some(141), transport: Transport::Url, audio_only: true, ..off }
+        );
+        assert_eq!(
+            parse_env(&[("YTCAST_PREMIUM_AUDIO", "774"), ("YTCAST_PREMIUM_TRANSPORT", "sabr")]),
+            PremiumExperiment { itag: Some(774), ..off }
+        );
+    }
+
+    #[test]
+    fn player_params_flag_works_on_its_own() {
+        assert!(player_params_enabled(|name| (name == "YTCAST_PREMIUM_PLAYER_PARAMS").then(|| "1".to_owned())));
+        assert!(!player_params_enabled(|_| None));
+        assert!(!player_params_enabled(|_| Some("0".to_owned())));
     }
 
     #[test]
     fn unknown_premium_flag_value_is_logged_and_ignored() {
         let logs = crate::storage::test_util::LogCapture::start();
-        assert_eq!(PremiumExperiment::parse(Some("999"), None), PremiumExperiment::default());
+        assert_eq!(parse_env(&[("YTCAST_PREMIUM_AUDIO", "999")]), PremiumExperiment::default());
         assert!(logs.text().contains("YTCAST_PREMIUM_AUDIO"), "{}", logs.text());
+    }
+
+    // -- premium variants (D), client info (C), player params (B), audio-only (E) --
+
+    fn variant(itag: i32, xtags: Option<&str>, is_drc: bool, track: Option<&str>) -> AdaptiveFormat {
+        AdaptiveFormat {
+            xtags: xtags.map(str::to_owned),
+            is_drc,
+            audio_track_id: track.map(str::to_owned),
+            ..audio(itag, OPUS, 272_644)
+        }
+    }
+
+    #[test]
+    fn premium_choice_prefers_the_non_drc_variant() {
+        let formats = [
+            variant(774, Some("CgsKA2RyYxIEdHJ1ZQ"), true, None),
+            variant(774, None, false, None),
+            audio(251, OPUS, 146_272),
+        ];
+        let chosen = choose_audio_format(&formats, Some(774)).unwrap();
+        assert_eq!((chosen.itag, chosen.is_drc, chosen.xtags.as_deref()), (774, false, None));
+    }
+
+    #[test]
+    fn reload_keeps_the_same_variant_of_the_itag() {
+        let mut state = test_state(GOOD_URL);
+        switch_audio(&mut state, &variant(774, None, false, None));
+        let mut drc = variant(774, Some("drc"), true, None);
+        drc.last_modified = 7;
+        let mut plain = variant(774, None, false, None);
+        plain.last_modified = 8;
+        let player = ReloadedPlayer { server_url: RELOADED_URL.to_owned(), ustreamer_config: vec![], formats: vec![drc, plain] };
+
+        apply_reload(&mut state, &player).unwrap();
+
+        assert_eq!(state.audio_format_id.last_modified, Some(8));
+        assert_eq!(state.audio_format_id.xtags, None);
+    }
+
+    #[test]
+    fn itag_variants_are_described_with_xtags_drc_and_track() {
+        let formats = [
+            variant(774, Some("CgsKA2RyYw"), true, Some("en.4")),
+            variant(774, None, false, None),
+            audio(251, OPUS, 146_272),
+        ];
+        assert_eq!(
+            describe_variants(&formats, 774),
+            "774 variants: [xtags=CgsKA2RyYw isDrc=true audioTrack=en.4 lm=1, xtags=- isDrc=false audioTrack=- lm=1]"
+        );
+    }
+
+    #[test]
+    fn experiment_requests_carry_drc_and_audio_track_of_the_chosen_format() {
+        let mut state = test_state(GOOD_URL);
+        switch_audio(&mut state, &variant(774, None, false, Some("en.4")));
+
+        let plain = state.build_request().client_abr_state.unwrap();
+        assert_eq!((plain.drc_enabled, plain.audio_track_id), (None, None));
+
+        state.verbose = true;
+        let experiment = state.build_request().client_abr_state.unwrap();
+        assert_eq!(experiment.drc_enabled, Some(false));
+        assert_eq!(experiment.audio_track_id.as_deref(), Some("en.4"));
+    }
+
+    #[test]
+    fn web_remix_client_info_uses_the_session_version_and_omits_empty_device_fields() {
+        let mut state = test_state(GOOD_URL);
+        state.client_version = "1.20261104.00.00".to_owned();
+
+        let info = state.build_request().streamer_context.unwrap().client_info.unwrap();
+
+        assert_eq!(info.client_version.as_deref(), Some("1.20261104.00.00"));
+        assert_eq!(info.client_name, Some(67));
+        assert_eq!((info.device_make, info.device_model, info.os_name, info.os_version), (None, None, None, None));
+    }
+
+    #[test]
+    fn player_params_go_into_the_player_body() {
+        let session = crate::music_session::test_fixtures::session();
+        let auth = crate::music_session::web_remix_auth(Some("cast-token"), Some(&session)).unwrap();
+        let extras = PlayerExtras { reload_token: None, params: Some("igMDCNgE") };
+
+        let req = player_request(credential_client(), "dQw4w9WgXcQ", PlayerTarget::WebRemix(auth), None, None, extras).unwrap();
+
+        assert_eq!(body_json(&req)["params"], "igMDCNgE");
+    }
+
+    #[test]
+    fn audio_only_shape_sends_no_video_format() {
+        let mut state = premium_state();
+        state.audio_only = true;
+
+        let req = state.build_request();
+        assert!(req.selected_format_ids.is_empty());
+        assert!(req.preferred_video_format_ids.is_empty());
+        assert!(req.buffered_ranges.is_empty());
+        assert_eq!(req.client_abr_state.unwrap().enabled_track_types_bitfield, Some(1));
+
+        state.audio_initialized = true;
+        let req = state.build_request();
+        assert_eq!(req.selected_format_ids, vec![state.audio_format_id.clone()]);
     }
 
     #[test]
@@ -2386,8 +2737,9 @@ mod tests {
     fn no_pot_variant_drops_the_potoken() {
         let pot = || Some("pot".to_owned());
         assert_eq!(sabr_po_token(PremiumExperiment::default(), pot()), pot());
-        assert_eq!(sabr_po_token(PremiumExperiment { itag: Some(774), no_pot: false }, pot()), pot());
-        assert_eq!(sabr_po_token(PremiumExperiment { itag: Some(774), no_pot: true }, pot()), None);
+        let on = PremiumExperiment { itag: Some(774), ..Default::default() };
+        assert_eq!(sabr_po_token(on, pot()), pot());
+        assert_eq!(sabr_po_token(PremiumExperiment { no_pot: true, ..on }, pot()), None);
     }
 
     #[test]

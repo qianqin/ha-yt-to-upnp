@@ -39,6 +39,9 @@ pub struct DialState {
     /// Credential transfer token from the casting session: the receiver's
     /// only authentication, sent per video with WEB_REMIX /player.
     pub ctt: std::sync::RwLock<Option<String>>,
+    /// The cast's opaque `params` (Lounge setPlaylist), kept in memory with
+    /// the ctt; sent with /player only when YTCAST_PREMIUM_PLAYER_PARAMS=1.
+    pub player_params: std::sync::RwLock<Option<String>>,
     /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
@@ -142,6 +145,7 @@ impl DialState {
             local_ip: std::net::Ipv4Addr::new(192, 0, 2, 1),
             port: 8008,
             ctt: std::sync::RwLock::new(None),
+            player_params: std::sync::RwLock::new(None),
             yt_session: None,
             screen_id: "test-screen".to_string(),
             stream_failure: Default::default(),
@@ -395,8 +399,9 @@ async fn stream_audio(
     }
 
     let ctt = state.ctt.read().unwrap().clone();
+    let player_params = state.player_params.read().unwrap().clone();
     let yt_session = state.yt_session.clone();
-    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session).await {
+    match crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), player_params.as_deref(), yt_session).await {
         Ok((info, rx)) => {
             state.note_stream_result(&video_id, Ok(()));
             // Build streaming response from the mpsc receiver.

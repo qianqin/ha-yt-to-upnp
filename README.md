@@ -58,7 +58,12 @@ Opt-in and off by default: without these variables format selection, PoToken use
 | Variable | Values | Effect |
 |---|---|---|
 | `YTCAST_PREMIUM_AUDIO` | `774` (Opus ~256k), `141` (AAC 256k), `off` (default) | Prefer that Premium itag when the ctt `/player` response lists it. Any other value is ignored with a warning. |
-| `YTCAST_PREMIUM_NO_POT` | `1` | With the experiment on: send no PoToken in SABR requests (yt-dlp: GVS PoToken not required for Premium). |
+| `YTCAST_PREMIUM_NO_POT` | `1` | With the experiment on: send no PoToken (SABR requests, and no `pot` on the url transport) (yt-dlp: GVS PoToken not required for Premium). |
+| `YTCAST_PREMIUM_TRANSPORT` | `sabr` (default), `url` | `url`: fetch the Premium itag through its own googlevideo URL in 1 MiB byte ranges, as the music.youtube.com web player does for 141: the format's `url` or `signatureCipher` (signature deciphered into `sp`), `n` solved, plus `pot`, `cpn` and `cver`. Plain GET with `range=a-b` first; if that gives no bytes, the web player's POST form (`ump=1`, 2-byte body, UMP MEDIA parts). No bytes from either, or no session for deciphering, falls back to SABR with the regular format (251) for that song. |
+| `YTCAST_PREMIUM_AUDIO_ONLY` | `1` | With the experiment on: SABR requests in googlevideo's audio-only shape (no video format in fields 2, 3 and 17; field 2 only lists initialized formats). |
+| `YTCAST_PREMIUM_PLAYER_PARAMS` | `1` | Independent of the itag: send the cast's `params` (Lounge setPlaylist) as `params` in every `/player` body, initial and reload, as the phone's own player does. Kept in memory with the ctt, logged by length only. |
+
+With the experiment on, SABR requests also set `drcEnabled` and `audioTrackId` from the chosen format, and of several `/player` entries for the Premium itag the non-DRC one is chosen (after a reload the entry with the same xtags). StreamerContext `clientInfo` always carries the page session's client version (the one `/player` used) and leaves out empty device fields.
 
 Per song, the reloads described above apply. If the Premium itag still gets a reload request after 2 reloads, or gets any `SABR_ERROR`, and no audio of it has been forwarded yet, the song falls back to the regular format (251) via a fresh `/player` call; after audio has started, the stream ends instead. A fallback from 141 (AAC/MP4) to 251 (Opus/WebM) keeps the already sent `Content-Type`, so the player has to detect the format itself.
 
@@ -66,6 +71,10 @@ What it logs at info (protocol detail that is otherwise at debug level):
 
 - `[sabr] premium experiment: want itag 774, PoToken sent|omitted|unavailable; /player lists itags [...]`
 - `[sabr] selected audio: itag=...` - the chosen itag
+- `[sabr] premium experiment: 774 variants: [xtags=... isDrc=... audioTrack=... lm=..., ...]` - every `/player` entry for the itag (again as `[sabr] reloaded 774 variants: ...` after each reload)
+- `[sabr] premium experiment: itag 141 transport Url, audio-only shape false, source signatureCipher (fields s, sp, url; url params ...)` or `source url (host ...; params ...)` - names only, never values
+- url transport: `[url] itag 141 decipher OK in N ms (host ..., params ...)`, `[url] itag 141 Get range 0-1048575: HTTP 403` per failed first attempt, `[url] itag 141 first bytes via Get|UmpPost from <host> after N ms (... bytes, clen ...)`, then at the end `[sabr] premium experiment: itag 141 via url → media OK|NO (bytes N)`; if no byte arrived: `[sabr] premium experiment: itag 141 via url → media NO (bytes 0): <reason>; falling back to SABR itag 251`
+- `[sabr] YTCAST_PREMIUM_PLAYER_PARAMS: cast params sent (len N)` and `+params` on the `/player` log line
 - `[sabr] request #N formats: selected audio [774 lm=… xtags=…] selected video [...] init [...] cookie audio=… video=…` - the format ids each SABR request sends (fields 16, 17, 2) and the itags named in the playback cookie; no tokens
 - `[sabr] response #N parts: 20,21x3,22,35` - the UMP part ids of each response (consecutive repeats as `idxN`; 46 = reload request, 47 = playback start policy, 35 = next request policy, 44 = SABR error, 58 = stream protection status)
 - `[sabr] RELOAD_PLAYER_RESPONSE (token len=N)`, `[sabr] reloading player response (1/2)`, `[sabr] reloaded /player lists itags [...]`
