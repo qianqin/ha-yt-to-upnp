@@ -2105,7 +2105,7 @@ class PauseFollowTest(unittest.TestCase):
 
 class VolumeFollowTest(unittest.TestCase):
     """The phone's volume (MPD's, a null mixer) is the speaker's own, scaled to 0..max_volume:
-    a change is sent to the zone renderer (RenderingControl SetVolume) at once; at a takeover
+    a change is sent as the room's own volume (SetRoomVolume) at once; at a takeover
     and on the speaker's own changes the speaker's volume is given to MPD instead, so the
     phone shows it and the loudness does not jump."""
 

@@ -1132,7 +1132,7 @@ class RendererVolumeTest(unittest.TestCase):
         self.assertEqual(self.ctl.get_volume(), 33)
         self.ctl.set_volume(25)
         self.assertEqual(self.rf.volume, 25)
-        self.assertEqual(self.rf.volume_actions(), ["GetVolume", "SetVolume 25"])
+        self.assertEqual(self.rf.volume_actions(), ["GetRoomVolume", "SetRoomVolume 25"])
         self.assertEqual(self.rf.soap_actions(), [])  # nothing on AVTransport
         self.assertEqual(self.rf.api_calls(), [])
 

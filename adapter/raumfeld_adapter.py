@@ -10,8 +10,9 @@ UDN, never by IP: the host by SSDP (or at RAUMFELD_HOST, verified by knowing our
 the zone renderer by an SSDP search for the zone UDN (answered by RAUMFELD_HOST, if set) and
 its description's UDN. Both are found at start and cached until a request fails or the
 zone changes. The phone's volume (MPD's, a null mixer that leaves the samples alone) is the
-zone renderer's RenderingControl volume, scaled so that 100 % is MAX_VOLUME; nothing else
-on RenderingControl is ever sent.
+room's own volume (the zone renderer's RenderingControl GetRoomVolume/SetRoomVolume for
+RAUMFELD_ROOM_UDN), scaled so that 100 % is MAX_VOLUME; nothing else on RenderingControl
+is ever sent, never the zone's SetVolume.
 """
 
 import errno
@@ -876,9 +877,10 @@ class Controller:
         soap_call(self._known_control(), "Play", [("Speed", "1")])
 
     def get_volume(self):
-        """The zone renderer's volume (RenderingControl, Master), 0-100."""
-        reply = soap_call(self._known_rendering(), "GetVolume", [("Channel", "Master")],
-                          RENDERING_CONTROL)
+        """The room's own volume, 0-100: RenderingControl GetRoomVolume on the zone renderer.
+        Never the zone's volume, which scales every room in the zone."""
+        reply = soap_call(self._known_rendering(), "GetRoomVolume",
+                          [("Room", self.config.room_udn)], RENDERING_CONTROL)
         volume = reply.get("CurrentVolume", "")
         if not re.fullmatch(r"[0-9]{1,3}", volume) or int(volume) > 100:
             raise RaumfeldError("invalid volume %r" % volume[:MAX_STATE_LEN])
@@ -887,8 +889,9 @@ class Controller:
     def set_volume(self, volume):
         if type(volume) is not int or not 0 <= volume <= 100:
             raise ValueError("refusing volume %r" % (volume,))
-        soap_call(self._known_rendering(), "SetVolume",
-                  [("Channel", "Master"), ("DesiredVolume", str(volume))], RENDERING_CONTROL)
+        soap_call(self._known_rendering(), "SetRoomVolume",
+                  [("Room", self.config.room_udn), ("DesiredVolume", str(volume))],
+                  RENDERING_CONTROL)
 
     def has_volume(self):
         """The zone renderer of the last takeover or look has RenderingControl."""

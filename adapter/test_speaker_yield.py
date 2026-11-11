@@ -28,8 +28,8 @@ def make_controller(rf, discover):
 
 
 def assert_speaker_left_alone(test, rf, restarts=0, max_volume=ra.DEFAULT_MAX_VOLUME):
-    """In every scenario: the speaker's volume only through RenderingControl GetVolume and
-    SetVolume, never set above max_volume; and the adapter never stops or powers down the
+    """In every scenario: the speaker's volume only as the room's own volume (RenderingControl
+    GetRoomVolume, SetRoomVolume; never the zone's SetVolume), never set above max_volume; and the adapter never stops or powers down the
     room itself (the Raumfeld's own auto power-off does that); a Stop only as part of the
     expected number of renderer restarts (Stop, Play)."""
     for method, path, action, body in rf.requests:
@@ -37,8 +37,8 @@ def assert_speaker_left_alone(test, rf, restarts=0, max_volume=ra.DEFAULT_MAX_VO
             test.assertNotIn("Volume", path + (action or "") + body)
         test.assertNotIn("Standby", path.replace("leaveStandby", ""))
     for action in rf.volume_actions():
-        test.assertRegex(action, r"^(GetVolume|SetVolume \d+)$")
-        if action.startswith("SetVolume"):
+        test.assertRegex(action, r"^(GetRoomVolume|SetRoomVolume \d+)$")
+        if action.startswith("SetRoomVolume"):
             test.assertLessEqual(int(action.split()[1]), max_volume)
     test.assertEqual(rf.soap_actions().count("Stop"), restarts)
 
@@ -382,7 +382,7 @@ class StuckRendererScenarioTest(unittest.TestCase):
         self.poll()
         self.assertEqual(self.follower.take_mpd_requests(), [])
         self.assertFalse(self.follower.yielded)
-        self.assertEqual(set(self.rf.volume_actions()), {"GetVolume"})  # polls; no SetVolume
+        self.assertEqual(set(self.rf.volume_actions()), {"GetRoomVolume"})  # polls; no SetVolume
 
 
 class StartGateScenarioTest(unittest.TestCase):
@@ -918,7 +918,7 @@ class VolumeScenarioTest(unittest.TestCase):
             self.follower.on_mpd_state("pause", "1")
         self.assertEqual(self.follower.take_mpd_volume(), 40)
         self.follower.on_mpd_volume(40)  # MPD reports our setvol: no echo
-        self.assertEqual(self.rf.volume_actions(), ["GetVolume"])
+        self.assertEqual(self.rf.volume_actions(), ["GetRoomVolume"])
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.clock.now += ra.GATE_POLL_S
             self.follower.tick()
@@ -934,10 +934,10 @@ class VolumeScenarioTest(unittest.TestCase):
             self.poll()
         self.assertEqual(self.follower.take_mpd_volume(), 20)
         self.follower.on_mpd_volume(20)
-        self.assertEqual(self.rf.volume_actions(), ["GetVolume"])  # no SetVolume back
+        self.assertEqual(self.rf.volume_actions(), ["GetRoomVolume"])  # no SetVolume back
 
     def test_a_failing_volume_call_is_logged_and_the_cast_goes_on(self):
-        self.rf.fail_actions.update({"GetVolume", "SetVolume"})
+        self.rf.fail_actions.update({"GetRoomVolume", "SetRoomVolume"})
         with self.assertLogs("raumfeld_adapter", "INFO") as logs:
             self.follower.on_mpd_state("play", "1")
             self.requests()

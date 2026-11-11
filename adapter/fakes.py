@@ -91,7 +91,7 @@ class FakeRaumfeld:
         return [a for m, p, a, b in self.requests if a and p != RENDERING_PATH]
 
     def volume_actions(self):
-        """RenderingControl requests, e.g. "GetVolume", "SetVolume 25"."""
+        """RenderingControl requests, e.g. "GetRoomVolume", "SetRoomVolume 25"."""
         out = []
         for m, p, a, b in self.requests:
             if a and p == RENDERING_PATH:
@@ -183,11 +183,13 @@ class FakeRaumfeld:
     def _rendering(self, action, body):
         root = ET.fromstring(body)
         args = {el.tag: (el.text or "") for el in root.iter() if "}" not in el.tag}
-        assert args.get("InstanceID") == "0" and args.get("Channel") == "Master", args
+        # The Raumfeld zone renderer's per-room volume: the room's own, not the zone's (the
+        # zone's SetVolume would scale every room in it). Nothing else is answered.
+        assert args.get("InstanceID") == "0" and args.get("Room") == ROOM_UDN, args
         out = ""
-        if action == "GetVolume":
+        if action == "GetRoomVolume":
             out = "<CurrentVolume>%s</CurrentVolume>" % self.volume
-        elif action == "SetVolume":
+        elif action == "SetRoomVolume":
             self.volume = int(args["DesiredVolume"])
         else:
             raise AssertionError("unknown RenderingControl action " + action)
