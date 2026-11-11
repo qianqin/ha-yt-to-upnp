@@ -162,8 +162,10 @@ Raumfeld room play the receiver's MPD stream automatically.
   taken away, as before). On the resume of the same song (MPD pause -> play) it
   asks the renderer again: still `PAUSED_PLAYBACK` on our stream, it holds MPD
   at the resume point (`pause 1`; a resume gate, `START_GATE_SECONDS=0`: just
-  `Play`), looks at the renderer once more right before `Play` and sends it (the
-  Raumfeld reconnects to the stream and its position starts at 0:00), then
+  `Play`), looks at the renderer and the room (`getZones`, transport, URI) once
+  more right before `Play` and sends it (the Raumfeld reconnects to the stream
+  and its position starts at 0:00); a room that left our zone, went to standby
+  or plays another source by then is not resumed (yield). Then it
   releases MPD as the start gate does: with FLAC right after `Play`, otherwise
   once the renderer plays. Found playing another source at either look (chosen
   during the pause, before a poll saw it), the speaker is not taken back: the
@@ -171,8 +173,12 @@ Raumfeld room play the receiver's MPD stream automatically.
   fails, the adapter looks at the room (`getZones`, transport, URI) and yields
   if it was taken away (standby, no zone, another source), or takes it over,
   still behind the gate; a failed look releases MPD and leaves it to the polls.
-  At the first look (MPD has resumed) anything other than paused on our stream
-  is a resume as without the pause. **Where the resume continues:** the speaker
+  At the first look (MPD has resumed), anything other than paused on our stream
+  (or a failed `Play` without the gate) is followed by a look at the room:
+  taken away, the adapter yields; otherwise it takes the room over as without
+  the pause. A look that fails leaves it to the polls, with one more takeover
+  (one that respects another source) before a stopped renderer counts as
+  taken away. **Where the resume continues:** the speaker
   drops what it had buffered when `Play` reconnects it, so MPD is that far
   ahead of what was heard. At the pause the adapter measures it, as the time
   since its `Play` connected the speaker less the renderer's `RelTime`
@@ -182,7 +188,9 @@ Raumfeld room play the receiver's MPD stream automatically.
   paused) before `pause 0`. A seek MPD refuses (`ACK`, e.g. a song that can't be
   sought yet) is logged and the resume goes on; one that takes longer than 2 s
   ends the MPD connection, which is reconnected without the seek. No seek for
-  another song, a speaker that left the pause, or without the gate. Another
+  another song (also one that arrives while the resume gate holds MPD), a
+  speaker that left the pause, a seek on the phone while paused (MPD resumes
+  further from the paused point than the lead), or without the gate. Another
   song while the speaker is paused (the phone picks or skips one) is a start,
   through the start gate, not a resume. A pause then stop (the session ended)
   sends no `Play`, and the adapter lets go of the room (stops polling): the
@@ -276,7 +284,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   away or yielded, with MPD stopped, or from the start gate's checks, restarts
   and re-takeovers. A failing volume request is logged and changes nothing
   else (after a failed `SetRoomVolume` the next look gives MPD the room's
-  volume again, so the phone shows what plays). A renderer description without
+  volume again, so the phone shows what plays); a `GetRoomVolume` that keeps
+  failing is a warning once, then logged at debug until it works again. A renderer description without
   RenderingControl, or with its control URL on another host, only disables
   volume, without a warning at each look.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that

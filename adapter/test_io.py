@@ -985,5 +985,34 @@ class ReviewPinsIoTest(unittest.TestCase):
         self.assertEqual(follower.take_mpd_volume(), 60)
 
 
+
+class SeekBackPinsTest(unittest.TestCase):
+    def client(self, mpd):
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        return client
+
+    def test_the_bound_is_three_seconds(self):
+        mpd = FakeMpd([["pause"]])
+        client = self.client(mpd)
+        client.seek_back(3.0)
+        with self.assertRaises(ValueError):
+            client.seek_back(3.1)
+        self.assertEqual(mpd.commands, ["seekcur -3.000"])
+
+    def test_the_socket_timeout_is_restored_after_a_seek(self):
+        for seek in ("ok", "ack"):
+            with self.subTest(seek=seek):
+                mpd = FakeMpd([["pause"]])
+                mpd.seek = seek
+                client = self.client(mpd)
+                try:
+                    client.seek_back(1.0)
+                except ra.MpdError:
+                    pass
+                self.assertEqual(client.sock.gettimeout(), client.timeout)
+
+
 if __name__ == "__main__":
     unittest.main()
