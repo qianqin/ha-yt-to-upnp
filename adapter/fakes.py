@@ -64,6 +64,7 @@ class FakeRaumfeld:
         self.volume = 30  # the zone renderer's RenderingControl volume, 0-100
         self.rel_time = "0:00:00"  # GetPositionInfo RelTime: what the speaker has played
         self.rendering_control = True  # False: the description lists no RenderingControl
+        self.rendering_url = RENDERING_PATH  # its controlURL as the description gives it
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.description_udn = None  # the UDN the description names, if not the zone's
         self.room_listed = True  # False: a host that doesn't know our room (a wrong host)
@@ -128,7 +129,7 @@ class FakeRaumfeld:
 
     def device_xml(self):
         rendering = ("<service><serviceType>%s</serviceType><controlURL>%s</controlURL>"
-                     "</service>" % (RC_NS, RENDERING_PATH)) if self.rendering_control else ""
+                     "</service>" % (RC_NS, self.rendering_url)) if self.rendering_control else ""
         return (
             "<?xml version='1.0'?><root xmlns='urn:schemas-upnp-org:device-1-0'><device>"
             "<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>"

@@ -1190,5 +1190,24 @@ class RendererPositionTest(unittest.TestCase):
             self.ctl.position()
 
 
+
+class RenderingControlOnAnotherHostTest(unittest.TestCase):
+    def test_a_rendering_control_url_on_another_host_is_ignored(self):
+        rf = FakeRaumfeld()
+        self.addCleanup(rf.close)
+        rf.rendering_url = "http://192.0.2.99/RenderingControl/ctrl"
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(rf), SPEAKER_UDN),
+                            api_port=rf.port, sleep=lambda s: None)
+        rf.power, rf.current_uri, rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.assertEqual(ctl.check(), ra.OURS)  # the transport still works
+        self.assertFalse(ctl.has_volume())
+        with self.assertRaises(ra.RaumfeldError):
+            ctl.get_volume()
+
+
 if __name__ == "__main__":
     unittest.main()

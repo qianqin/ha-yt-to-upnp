@@ -925,5 +925,65 @@ class SeekBackTest(unittest.TestCase):
         self.assertEqual(follower.requeued, [ra.RESUME_PLAYER])
 
 
+
+class ReviewPinsIoTest(unittest.TestCase):
+    def test_a_volume_change_reported_just_before_noidle_is_kept(self):
+        mpd = FakeMpd([["play"]])
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        client.sock.close()
+        client.sock = ScriptedSocket([socket.timeout("idle wait over"),
+                                      b"changed: mixer\nOK\n"])
+        self.assertEqual(client.wait_changes(0.1), {"mixer"})
+
+    def test_a_volume_above_100_from_mpd_is_refused(self):
+        mpd = FakeMpd([["play"]])
+        mpd.volume = 101
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        with self.assertRaises(ra.MpdError):
+            client.volume()
+
+    def test_one_wake_up_with_player_and_mixer_follows_both(self):
+        class Mpd:
+            waits = 0
+
+            def status(self):
+                return ra.MpdStatus("play", "1", 0.0)
+
+            def volume(self):
+                return 40
+
+            def wait_changes(self, timeout):
+                self.waits += 1
+                if self.waits > 1:
+                    raise ConnectionError("done")
+                return frozenset({"player", "mixer"})
+
+            def close(self):
+                pass
+
+        follower = RecordingFollower(stop_after=2)
+        ra.run(follower, Mpd, sleep=lambda s: None,
+               should_stop=lambda: len(getattr(follower, "volumes", [])) >= 1)
+        self.assertEqual(follower.states, ["play", "play"])  # the connect, then the wake-up
+        self.assertEqual(follower.volumes, [40])
+
+    def test_a_setvol_lost_with_the_connection_is_requeued(self):
+        ctl = RecordingController()
+        follower = ra.Follower(ctl, poll_seconds=5, clock=FakeClock(), start_gate_seconds=0)
+        follower.on_mpd_state("play", "1")  # takeover: MPD is to get 60
+
+        class Mpd:
+            def set_volume(self, volume):
+                raise ConnectionError("gone")
+
+        with self.assertRaises(ConnectionError):
+            ra._serve_requests(follower, Mpd())
+        self.assertEqual(follower.take_mpd_volume(), 60)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1049,9 +1049,15 @@ class Controller:
         udn = device_udn(description)
         if udn != zone:
             raise RaumfeldError("device at %r has UDN %r, not the zone's %r" % (location, udn, zone))
+        control = check_device_url(avtransport_control_url(description, location), host)
         rendering = service_control_url(description, location, RENDERING_CONTROL)
-        return (check_device_url(avtransport_control_url(description, location), host),
-                rendering and check_device_url(rendering, host))
+        if rendering is not None:
+            try:
+                check_device_url(rendering, host)
+            except RaumfeldError as e:
+                log.warning("ignoring the zone renderer's RenderingControl (%s): no volume", e)
+                rendering = None
+        return control, rendering
 
 
 # --------------------------------------------------------------------------- MPD
@@ -1536,6 +1542,9 @@ class Follower:
             self.controller.set_volume(target)
         except _ERRORS as e:
             log.warning("setting the speaker volume to %d failed: %r", target, e)
+            # The phone shows a volume the speaker doesn't play: the next poll gives MPD the
+            # speaker's own again.
+            self._speaker_volume = None
             return
         self._speaker_volume = target
         log.info("volume %d %% from the phone: speaker volume %d (of max %d)", volume, target,
