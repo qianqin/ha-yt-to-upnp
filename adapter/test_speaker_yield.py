@@ -826,7 +826,9 @@ class PauseFollowScenarioTest(unittest.TestCase):
         self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.follower.on_mpd_state("pause", "1")  # our pause 1 holds the resume point
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo", "Play"])
+        # Looked at when MPD resumed, and again right before Play.
+        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo"] * 2
+                         + ["Play"])
         self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.gate_tick()
