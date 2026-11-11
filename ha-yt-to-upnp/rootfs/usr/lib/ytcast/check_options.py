@@ -29,7 +29,7 @@ SCHEMA = {
     "start_gate_seconds": "int(0,60)?",
     "stuck_seconds": "int(1,300)?",
     "max_volume": "int(1,100)?",
-    "stream_format": "list(flac|mp3)",
+    "stream_format": "list(wav|flac|mp3)",
     "log_level": "list(debug|info|warning|error)",
 }
 

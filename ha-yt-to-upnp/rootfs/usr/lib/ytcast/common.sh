@@ -17,6 +17,9 @@ readonly YTCAST_MPD_CONF=/run/ytcast/mpd.conf
 # The stream's URL ends in .<stream_format>; MPD ignores the path.
 ytcast_stream_encoder() {
     case "$1" in
+        # Uncompressed PCM, ~1.5 Mbit/s: unlike FLAC it sends silence while MPD is
+        # paused, which the speaker needs to start during the start gate.
+        wav) printf '%s' 'encoder     "wave"' ;;
         # Level 5 is libFLAC's default: a fraction of a core, ~1-1.5 Mbit/s.
         flac) printf '%s\n    %s' 'encoder     "flac"' 'compression "5"' ;;
         mp3) printf '%s\n    %s' 'encoder     "lame"' 'bitrate     "320"' ;;
@@ -25,6 +28,7 @@ ytcast_stream_encoder() {
 }
 ytcast_stream_mime() {
     case "$1" in
+        wav) echo audio/wav ;;
         flac) echo audio/flac ;;
         mp3) echo audio/mpeg ;;
         *) bashio::exit.nok "unknown stream format '$1'" ;;

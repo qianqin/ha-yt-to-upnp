@@ -17,6 +17,15 @@
   volume and the phone is shown it; a volume changed on the speaker itself
   shows on the phone within about 5 s. Replaces "the speaker's volume is never
   changed".
+- New default `stream_format: wav` (uncompressed 16-bit/48 kHz PCM, about
+  1.5 Mbit/s on the LAN, still lossless). With FLAC, MPD sends no data while
+  it is paused, and the app holds it paused at every cast start and resume
+  until the speaker plays, so the speaker waited for the gate to give up
+  (about 20 s); WAV and MP3 carry silence then, and the speaker starts in
+  about 2 s. `flac` stays accepted (installs that have it saved keep
+  working) but is documented as slow; switch to `wav`. Open: MPD's WAV
+  header announces about 23 minutes of data; casts longer than that are
+  still to be verified on the speaker.
 
 ## 0.4.0
 

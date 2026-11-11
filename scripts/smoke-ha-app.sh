@@ -6,7 +6,7 @@
 # services come up and stay up, run as their own users, listen where they
 # should, get the options as environment and cannot read the Supervisor token;
 # that the receiver's /silence answers on loopback only; that MPD's stream on
-# port 8000 is FLAC 48 kHz 16-bit or MP3 320 kbit/s as stream_format says, under
+# port 8000 is WAV or FLAC 48 kHz 16-bit or MP3 320 kbit/s as stream_format says, under
 # a URL that names it; that the PoToken helper mints a token; that the adapter
 # keeps running whether it looks for the Raumfeld host by SSDP or is given an
 # unreachable raumfeld_host; and that invalid options stop the app with one
@@ -14,8 +14,8 @@
 #
 # --quick: a check in seconds before a live test, not a replacement for the full
 # run (which reviews need). One container with the default stream_format
-# (flac): the four services up as their users, MPD answers, port 8000 serves
-# FLAC while MPD plays, the DIAL description has the cast name, the PoToken
+# (wav): the four services up as their users, MPD answers, port 8000 serves
+# WAV while MPD plays, the DIAL description has the cast name, the PoToken
 # helper answers /ping (it mints no token), the adapter gets its options; plus,
 # in parallel, one invalid option that must stop the app. No stability wait.
 # The image is built with the classic builder (no BuildKit cache is left) on a
@@ -163,6 +163,8 @@ trap 'exit 130' INT TERM
 
 step "option validator matches config.yaml's schema (host)"
 python3 -I "$root/scripts/ha_options_test.py"
+step "stream_format encoders and MIME types (host; MPD check if mpd is installed)"
+python3 -I "$root/scripts/ha_mpd_conf_test.py"
 
 # The full run builds as the Supervisor does: BuildKit, on a builder of its own
 # so that the build cache stays out of the default builder.
@@ -432,9 +434,15 @@ def play_silence():
         time.sleep(0.5)
     return mpd("clear", "add smoke.wav", "repeat 1", "play")
 
-# What the start of a stream says about itself: FLAC's STREAMINFO block, or the
-# first MP3 frame header (after an ID3v2 tag, if there is one).
+# What the start of a stream says about itself: WAV's fmt chunk, FLAC's
+# STREAMINFO block, or the first MP3 frame header (after an ID3v2 tag, if any).
 def stream_params(head):
+    if head[:4] == b"RIFF":
+        if len(head) < 36 or head[8:16] != b"WAVEfmt ":
+            return {"codec": "wav", "error": "no fmt chunk first"}
+        channels, rate = int.from_bytes(head[22:24], "little"), int.from_bytes(head[24:28], "little")
+        return {"codec": "wav", "rate": rate, "channels": channels,
+                "bits": int.from_bytes(head[34:36], "little")}
     if head[:4] == b"fLaC":
         if len(head) < 42 or head[4] & 0x7f != 0:
             return {"codec": "flac", "error": "no STREAMINFO first"}
@@ -634,23 +642,23 @@ expect_stopped() {
 }
 
 if [ "$mode" != full ]; then
-  step "quick run: default options (flac), raumfeld_host given; an invalid stream_format in parallel"
+  step "quick run: default options (wav), raumfeld_host given; an invalid stream_format in parallel"
   started=$SECONDS
   start_app "$run_id-quick" '{"cast_name": "Smoke Test",
     "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
-    "raumfeld_host": "192.0.2.20", "stream_format": "flac", "log_level": "info"}'
+    "raumfeld_host": "192.0.2.20", "stream_format": "wav", "log_level": "info"}'
   start_app "$run_id-badformat" '{"cast_name": "Smoke Test",
     "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
     "raumfeld_host": "192.0.2.20", "stream_format": "flac24", "log_level": "info"}'
   wait_for_checks "$run_id-quick" quick '{"cast_name": "Smoke Test",
-    "stream": {"path": "/stream.flac", "mime": "audio/flac",
-               "params": {"codec": "flac", "rate": 48000, "channels": 2, "bits": 16}},
-    "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "STREAM_MIME": "audio/flac",
-                    "STREAM_URL": "http://{ip}:8000/stream.flac",
+    "stream": {"path": "/stream.wav", "mime": "audio/wav",
+               "params": {"codec": "wav", "rate": 48000, "channels": 2, "bits": 16}},
+    "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "STREAM_MIME": "audio/wav",
+                    "STREAM_URL": "http://{ip}:8000/stream.wav",
                     "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001"},
     "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"]}'
   echo "services up and checked $((SECONDS - started))s after the start"
-  expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of flac, mp3"
+  expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of wav, flac, mp3"
   if [ "$mode" = release ]; then
     step "release path: the image's programs are the tarball's"
     expected_info="$(tar -xzOf "$tarball" artefacts/BUILD-INFO)"
@@ -668,7 +676,7 @@ if [ "$mode" != full ]; then
   exit 0
 fi
 
-step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected, FLAC stream (default)"
+step "run 1: all options set, Raumfeld host by SSDP, stream host auto-detected, FLAC stream (kept for existing installs)"
 main="$run_id-main"
 start_app "$main" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
@@ -797,6 +805,6 @@ step "run 7: an invalid stream_format stops the app with one clear error"
 expect_fatal "$run_id-badformat" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_host": "192.0.2.20", "stream_format": "flac24", "log_level": "info"}' \
-  "option 'stream_format' is invalid: must be one of flac, mp3"
+  "option 'stream_format' is invalid: must be one of wav, flac, mp3"
 
 step "smoke test passed"

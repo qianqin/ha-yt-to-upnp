@@ -25,7 +25,7 @@ VALID = {
     "cast_name": "Living Room",
     "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
     "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
-    "stream_format": "flac",
+    "stream_format": "wav",
     "log_level": "info",
 }
 
@@ -90,8 +90,10 @@ class DefaultsInStep(unittest.TestCase):
             if schema[name].endswith("?"):
                 self.assertNotEqual(value, "null", name)
 
-    def test_stream_format_defaults_to_flac(self):
-        self.assertEqual(config_block("options").get("stream_format"), "flac")
+    def test_stream_format_defaults_to_wav(self):
+        # WAV streams silence while MPD is held; FLAC sends nothing then, so the speaker
+        # waits out the start gate.
+        self.assertEqual(config_block("options").get("stream_format"), "wav")
 
 
 class TranslationsInStep(unittest.TestCase):
@@ -147,7 +149,8 @@ class Valid(unittest.TestCase):
         self.assertIsNone(problem(options))
 
     def test_stream_formats(self):
-        for fmt in ("flac", "mp3"):
+        # flac stays valid: existing installs have it saved.
+        for fmt in ("wav", "flac", "mp3"):
             self.assertIsNone(problem(dict(VALID, stream_format=fmt)), fmt)
 
     def test_bounds(self):
@@ -207,7 +210,7 @@ class Invalid(unittest.TestCase):
             self.assertProblem(dict(VALID, stream_host=bad), "stream_host")
 
     def test_stream_format(self):
-        for bad in ("FLAC", "ogg", "wav", "flac24", " flac", 1):
+        for bad in ("FLAC", "WAV", "wave", "ogg", "flac24", " wav", 1):
             self.assertProblem(dict(VALID, stream_format=bad), "stream_format")
 
     def test_log_level(self):

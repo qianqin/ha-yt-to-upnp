@@ -22,7 +22,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: scripts/run-ha-app-local.sh --name NAME --room-udn UDN
            (--speaker-udn UDN | --raumfeld-host HOST [--speaker-udn UDN])
-           [--stream-format flac|mp3] [--stream-host HOST] [--log-level LEVEL]
+           [--stream-format wav|flac|mp3] [--stream-host HOST] [--log-level LEVEL]
            [--start-gate-seconds N] [--stuck-seconds N] [--app-dir DIR]
        scripts/run-ha-app-local.sh --stop
   --app-dir DIR  assembled app folder (default dist/ha-yt-to-upnp)
@@ -64,7 +64,7 @@ esac
 app="$root/dist/ha-yt-to-upnp"
 # Options as the Supervisor writes them: defaults from config.yaml, unset
 # optional options left out.
-opts=(stream_format flac log_level info)
+opts=(stream_format wav log_level info)
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || { usage; exit 2; }
   case "$1" in
