@@ -23,7 +23,7 @@ usage() {
 usage: scripts/run-ha-app-local.sh --name NAME --room-udn UDN
            (--speaker-udn UDN | --raumfeld-host HOST [--speaker-udn UDN])
            [--stream-format flac|mp3] [--stream-host HOST] [--log-level LEVEL]
-           [--start-gate-seconds N] [--stuck-seconds N] [--app-dir DIR]
+           [--start-gate-seconds N] [--stuck-seconds N] [--max-volume N] [--app-dir DIR]
        scripts/run-ha-app-local.sh --stop
   --app-dir DIR  assembled app folder (default dist/ha-yt-to-upnp)
 USAGE

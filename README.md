@@ -44,7 +44,7 @@ solving with the vendored yt-dlp/ejs solver in QuickJS.
   a speaker that didn't start, restarts a renderer stuck in `TRANSITIONING`,
   respects standby, line-in and other sources, and releases the cast when the
   speaker is taken away. Follows the phone's pause, resume and volume to the
-  speaker (its own volume, scaled to `max_volume`).
+  speaker (the room's own volume, scaled to `max_volume`).
 - **FLAC 16-bit/48 kHz stream** to the speaker (from 0.4.0, see below).
 - **Home Assistant app packaging:** the programs are built on the release
   machine (a Mac) from pinned, checksummed inputs and published as a GitHub
@@ -70,7 +70,7 @@ Raumfeld adapter  --UPnP AVTransport-->  Raumfeld zone renderer (the room)
 The phone stays the remote: play, pause, seek, skip and volume go to the
 receiver over the Lounge API and become MPD commands. MPD's volume is only a
 number (null mixer, the stream stays bit-perfect); the adapter sets the
-speaker's own volume from it, scaled so that 100 % is `max_volume` (default
+room's own volume on the speaker from it, scaled so that 100 % is `max_volume` (default
 50), and gives MPD the speaker's volume at a cast start and after a change on
 the speaker, which the receiver reports to the phone.
 
@@ -98,8 +98,10 @@ formats (always 251 via SABR).
   points the zone renderer at MPD's stream and resumes MPD once the speaker
   plays. The song replaces the silence and starts at 0:00 on the speaker.
 - **Pause / resume** from the phone: done in MPD and followed to the speaker
-  (UPnP `Pause`, then `Play` with MPD held until the speaker plays again), so a
-  pause is heard at once, not after the speaker's few seconds of buffer.
+  (UPnP `Pause`, then `Play`), so a pause is heard at once, not after the
+  speaker's few seconds of buffer. A resume sounds after about 1 s and goes on
+  where the pause was heard (MPD is set back by what the speaker had
+  buffered).
 - **Seek / skip** from the phone: done in MPD; the speaker keeps playing the
   stream. Premium songs are seekable; SABR songs only once fully buffered.
 - **Speaker switched off, auto power-off, or switched to line-in or another

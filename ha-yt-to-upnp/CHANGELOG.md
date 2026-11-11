@@ -4,19 +4,26 @@
 
 - Pause from the phone is heard at once: the adapter follows a user pause to
   the speaker (UPnP AVTransport `Pause` on the zone renderer) instead of
-  letting it play its 5-6 s buffer out. On resume it sends `Play` and holds
-  MPD at the resume point until the speaker plays again (like at a cast
-  start), so nothing is lost while the speaker reconnects. A speaker switched
-  to another source during the pause is not taken back; a speaker that left
-  the pause (standby, stopped) is taken over as before.
-- Volume from the phone sets the speaker's own volume (UPnP RenderingControl
-  on the room's zone renderer), at once instead of after the speaker's buffer,
-  scaled so that 100 % on the phone is the new option `max_volume` (1-100,
-  default 50), never louder. MPD plays at a fixed 100 % (`mixer_type "null"`,
-  the FLAC stream stays bit-perfect). At a cast start the speaker keeps its
-  volume and the phone is shown it; a volume changed on the speaker itself
-  shows on the phone within about 5 s. Replaces "the speaker's volume is never
-  changed".
+  letting it play its 5-6 s buffer out. A resume sends `Play` and sounds
+  after about 1 s, where the pause was heard: the speaker drops what it had
+  buffered, so the adapter measures that at the pause and sets MPD back by it
+  (about 1 s) before releasing it. A speaker switched to another source
+  during the pause is not taken back; one that stopped during the pause (a
+  stop the poll had not yet seen) is taken over as before. Picking another
+  song while paused starts it like a new cast.
+- Faster start with FLAC: MPD's FLAC stream carries no data while MPD is
+  paused, so the speaker could only start when the start gate gave up (about
+  20 s at every start). With FLAC the adapter now releases MPD right after
+  telling the speaker to play; it starts in about 1 s. MP3 keeps holding the
+  song until the speaker plays.
+- Volume from the phone sets the room's own volume (UPnP RenderingControl
+  `SetRoomVolume` on the room's zone renderer; other rooms in the zone keep
+  theirs), at once instead of after the speaker's buffer, scaled so that
+  100 % on the phone is the new option `max_volume` (1-100, default 50),
+  never louder. MPD plays at a fixed 100 % (`mixer_type "null"`, the FLAC
+  stream stays bit-perfect). At a cast start the speaker keeps its volume and
+  the phone is shown it; a volume changed on the speaker itself shows on the
+  phone within about 5 s. Replaces "the speaker's volume is never changed".
 
 ## 0.4.0
 

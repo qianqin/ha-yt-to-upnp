@@ -1383,13 +1383,18 @@ class Follower:
 
     User pause and resume are followed to the speaker, which would otherwise play its
     buffer (5-6 s) on: a user pause (MPD play -> pause, same song, on a zone we own) sends
-    AVTransport Pause at once if the renderer plays our stream. Its resume, with the
-    renderer still PAUSED_PLAYBACK on our stream, sends Play behind a resume gate (the
-    start gate's mechanics: MPD held at the resume point while the renderer reconnects to
-    the stream); a failed Play takes the speaker over instead, behind the same gate. A
-    renderer playing another source by then was chosen during the pause: not taken back
-    (yield). Anything else is a resume as without the pause. A pause on the speaker
-    itself (MPD still playing) is not ours: it counts as stopped, as before.
+    AVTransport Pause at once if the renderer plays our stream, after measuring how much
+    of the stream the speaker had buffered (the lead). Its resume (same song), with the
+    renderer still PAUSED_PLAYBACK on our stream, goes through a resume gate: MPD held,
+    the renderer looked at again, MPD set back by the lead (seekcur), Play, and MPD
+    released as at a start. Another source playing by then was chosen during the pause:
+    not taken back (yield); otherwise, or if Play fails, the room is looked at and taken
+    over behind the gate unless it was taken away. Another song while paused is a start;
+    a stop while paused lets go of the room. A pause on the speaker itself (MPD still
+    playing) is not ours: it counts as stopped, as before.
+
+    With hold_until_playing False (FLAC: no data while MPD is paused) every gate releases
+    MPD right after its takeover or Play returned instead of when the renderer plays.
 
     Volume: while it owns the zone and MPD plays or is paused, a change of MPD's volume
     (the phone's) is sent to the renderer at once, scaled to 0..max_volume. The speaker's

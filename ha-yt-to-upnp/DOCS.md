@@ -22,8 +22,8 @@ persistent state is under the app's `/data`: the receiver's device identity
 and decoder cache (`/data/ytcast`), MPD's state (`/data/mpd`, with the last volume) and
 where the adapter last found the room's zone renderer (`/data/adapter`, no
 secrets), so a restart needs no search for it.
-The volume from the phone sets the speaker's own volume (UPnP RenderingControl
-on the room's zone renderer), scaled so that 100 % on the phone is
+The volume from the phone sets the room's own volume on the speaker (UPnP
+RenderingControl `SetRoomVolume` on the room's zone renderer), scaled so that 100 % on the phone is
 `max_volume`, never more; MPD itself plays at full volume (the stream is left
 untouched). See [Volume](#volume).
 
@@ -90,8 +90,8 @@ set`). Fix the option and start the app again.
 
 ### Volume
 
-The phone's volume slider moves the speaker's own volume at once (no wait for
-the speaker's buffer): phone 0-100 % is speaker volume 0..`max_volume`,
+The phone's volume slider moves the room's own volume at once (no wait for
+the speaker's buffer; other rooms in the same zone keep theirs): phone 0-100 % is speaker volume 0..`max_volume`,
 linear. At a cast start the speaker keeps its volume and the phone is shown
 it (speaker volume × 100 / `max_volume`), so the loudness does not jump; a
 speaker louder than `max_volume` shows 100 % and is left as it is until you
@@ -120,13 +120,19 @@ stream between a 44.1 kHz and a 48 kHz song.
   24-bit FLAC stream but never starts playing it (it stays in
   `TRANSITIONING`). 16 bits are more than YouTube's lossy sources carry.
   Encoding takes MPD a small fraction of one CPU core (compression level 5).
+  While MPD is paused a FLAC stream carries no data at all, so the app does
+  not hold MPD until the speaker plays: it releases MPD right after telling
+  the speaker to play, and the speaker starts in about 1 s. At a cast start
+  the song loses at most that time.
 - **No WAV:** an uncompressed WAV stream would carry silence while MPD is
   paused, but its header announces a fixed length (about 23 minutes with
   MPD) after which the Raumfeld stops; FLAC starts and resumes as fast
   without that limit.
 - **MP3** is the fallback: use it if the speaker does not play the FLAC
   stream, or if the network to the speaker (Wi-Fi with a weak signal, for
-  example) drops out with FLAC's higher bandwidth.
+  example) drops out with FLAC's higher bandwidth. An MP3 stream carries
+  silence while MPD is paused, so the app holds the song until the speaker
+  plays (up to `start_gate_seconds`): nothing of it is lost.
 
 The change takes effect when the app is restarted. The adapter announces the
 stream to the speaker with the matching MIME type.
@@ -157,8 +163,11 @@ Troubleshooting).
 2. On the phone (same LAN), open YouTube Music, tap Cast and pick the name.
 3. While the cast loads, the receiver already plays silence into MPD, so the
    adapter wakes the room and connects it to the stream before the song is
-   there. The song then takes over the stream, held at its start (up to
-   `start_gate_seconds`) until the speaker plays.
+   there. The song then takes over the stream (with `mp3` held at its start,
+   up to `start_gate_seconds`, until the speaker plays).
+4. Pause and resume on the phone reach the speaker too: a pause is heard at
+   once, a resume after about 1 s, where the pause was heard (the app sets
+   MPD back by what the speaker had buffered).
 
 Each process is restarted by the app's supervisor if it exits; the log says
 which one and with which exit code.

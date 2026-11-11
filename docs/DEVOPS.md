@@ -396,7 +396,7 @@ runs the same four processes natively instead, configured as the app is:
 ```sh
 scripts/run-ha-app-local.sh --name "<cast name>" --room-udn <room UDN> \
   --raumfeld-host <speaker IPv4> [--speaker-udn <UDN>] [--stream-format flac|mp3] \
-  [--stream-host <Mac's LAN IPv4>] [--log-level debug]
+  [--stream-host <Mac's LAN IPv4>] [--log-level debug] [--max-volume N]
 scripts/run-ha-app-local.sh --stop
 ```
 
