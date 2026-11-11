@@ -163,6 +163,8 @@ trap 'exit 130' INT TERM
 
 step "option validator matches config.yaml's schema (host)"
 python3 -I "$root/scripts/ha_options_test.py"
+step "stream_format encoders and MIME types (host; MPD check if mpd is installed)"
+python3 -I "$root/scripts/ha_mpd_conf_test.py"
 
 # The full run builds as the Supervisor does: BuildKit, on a builder of its own
 # so that the build cache stays out of the default builder.

@@ -277,6 +277,10 @@ after the full run.
 It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
 exactly the schema in `config.yaml` and accepts and rejects the right values.
+Then `scripts/ha_mpd_conf_test.py`: every `stream_format` in the schema has an
+encoder and a MIME type in `common.sh`, and, if `mpd` is installed, MPD
+starts with the template and serves each format with its MIME type
+(loopback, ephemeral ports).
 Then it builds the image from the assembled folder for `linux/amd64` the way
 the Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
 `config.yaml`, `BUILD_ARCH=amd64`) in a buildx builder of its own, and runs it

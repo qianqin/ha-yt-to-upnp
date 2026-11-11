@@ -120,6 +120,10 @@ stream between a 44.1 kHz and a 48 kHz song.
   24-bit FLAC stream but never starts playing it (it stays in
   `TRANSITIONING`). 16 bits are more than YouTube's lossy sources carry.
   Encoding takes MPD a small fraction of one CPU core (compression level 5).
+- **No WAV:** an uncompressed WAV stream would carry silence while MPD is
+  paused, but its header announces a fixed length (about 23 minutes with
+  MPD) after which the Raumfeld stops; FLAC starts and resumes as fast
+  without that limit.
 - **MP3** is the fallback: use it if the speaker does not play the FLAC
   stream, or if the network to the speaker (Wi-Fi with a weak signal, for
   example) drops out with FLAC's higher bandwidth.

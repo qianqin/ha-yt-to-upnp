@@ -19,8 +19,8 @@ audio_output {
     # source's own rate ("*:16:2"), MPD's httpd output closes its clients
     # whenever the rate changes between songs, and the speaker drops the stream.
     format      "48000:16:2"
-    always_on   "yes"           # keep the stream open between tracks and while paused (silence),
-                                # so the speaker neither drops it nor stalls during the start gate
+    always_on   "yes"           # keep the stream open between tracks and while paused (MP3:
+                                # silence; FLAC: no data while paused)
     tags        "yes"
     # The phone's volume is just a number in MPD (httpd has no mixer, so without a
     # mixer_type setvol fails with "No mixer"); "null" leaves the samples alone. The
