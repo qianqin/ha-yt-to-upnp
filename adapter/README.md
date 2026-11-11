@@ -69,11 +69,20 @@ Raumfeld room play the receiver's MPD stream automatically.
   buffer, while MPD starts the song right away. So when MPD starts playing and
   the adapter doesn't own the room (a new cast, or a resume after the room was
   taken away), it first sends MPD `pause 1`, which holds the song where MPD has
-  got to by then, a moment after its start;
-  MPD's httpd output keeps streaming silence while paused (`always_on`), so the
-  speaker can connect. Then it wakes the room and starts the stream as usual,
-  asks the zone renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL`,
-  and sends `pause 0` as soon as it is. **Re-takeover:** if the renderer has not
+  got to by then, a moment after its start. Then it wakes the room and starts
+  the stream as usual. **What happens next depends on the stream:**
+  - **FLAC** (`STREAM_MIME` `audio/flac`): MPD's FLAC stream carries no data at
+    all while MPD is paused, so a speaker waiting for it would only start when
+    the gate gives up. MPD is released (`pause 0`) as soon as the takeover
+    returned, logged as `MPD released right after Play`; the speaker then
+    starts within about 1 s (measured live). The re-takeover and restart rules
+    below don't apply; instead a renderer not yet seen playing gets one more
+    takeover before a stopped renderer counts as taken away, and one stuck in
+    `TRANSITIONING` gets the usual restarts (`STUCK_SECONDS`).
+  - **Other formats** (MP3): MPD's httpd output keeps streaming silence while
+    paused (`always_on`), so the speaker can connect. The adapter asks the zone
+    renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL` and sends
+    `pause 0` as soon as it is. **Re-takeover:** if the renderer has not
   loaded or does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover
   returned (`STOPPED`, `NO_MEDIA_PRESENT`, no URI at all whatever its state, a
   URI not ours that does not play, back on the source it played before the
@@ -138,9 +147,56 @@ Raumfeld room play the receiver's MPD stream automatically.
   (the phone, or the receiver ending the silence after 60 s), the adapter does
   not unpause. **Limit:** a pause from the phone during the gate can't be
   told apart from the adapter's own pause (MPD is already paused, so nothing
-  changes), and is undone when the gate opens. Song changes and resumes while
-  the adapter owns the room are not gated: the speaker already plays the stream.
-  The phone shows the position standing still during the gate.
+  changes), and is undone when the gate opens. Song changes while the adapter
+  owns the room are not gated: the speaker already plays the stream. The phone
+  shows the position standing still during the gate.
+- **Pause and resume from the phone reach the speaker.** The Raumfeld buffers
+  5-6 s of the stream, so a pause done only in MPD would be heard that much
+  later. On a user pause (MPD play -> pause with the same song, on a zone the
+  adapter owns; never the gate's own `pause 1`, nor the receiver's held
+  hand-over, which comes with a new song) the adapter asks the zone renderer
+  (`GetTransportInfo`/`GetMediaInfo`) and, if it plays `STREAM_URL`, sends
+  AVTransport `Pause` right away and logs it. While MPD stays paused, a renderer
+  `PAUSED_PLAYBACK` on our stream is the adapter's own pause: no takeover, no
+  restart, no yield (standby, another source or leaving the zone still count as
+  taken away, as before). On the resume of the same song (MPD pause -> play) it
+  asks the renderer again: still `PAUSED_PLAYBACK` on our stream, it holds MPD
+  at the resume point (`pause 1`; a resume gate, `START_GATE_SECONDS=0`: just
+  `Play`), looks at the renderer and the room (`getZones`, transport, URI) once
+  more right before `Play` and sends it (the Raumfeld reconnects to the stream
+  and its position starts at 0:00); a room that left our zone, went to standby
+  or plays another source by then is not resumed (yield). Then it
+  releases MPD as the start gate does: with FLAC right after `Play`, otherwise
+  once the renderer plays. Found playing another source at either look (chosen
+  during the pause, before a poll saw it), the speaker is not taken back: the
+  adapter yields (pauses MPD, releases the cast). Found otherwise, or if `Play`
+  fails, the adapter looks at the room (`getZones`, transport, URI) and yields
+  if it was taken away (standby, no zone, another source), or takes it over,
+  still behind the gate; a failed look releases MPD and leaves it to the polls.
+  At the first look (MPD has resumed), anything other than paused on our stream
+  (or a failed `Play` without the gate) is followed by a look at the room:
+  taken away, the adapter yields; otherwise it takes the room over as without
+  the pause. A look that fails leaves it to the polls, with one more takeover
+  (one that respects another source) before a stopped renderer counts as
+  taken away. **Where the resume continues:** the speaker
+  drops what it had buffered when `Play` reconnects it, so MPD is that far
+  ahead of what was heard. At the pause the adapter measures it, as the time
+  since its `Play` connected the speaker less the renderer's `RelTime`
+  (`GetPositionInfo`, whole seconds, so less 0.5 s more); a value outside
+  0.1-3 s, or none, counts as 1.0 s (measured live: 0.8-1.0 s). At the resume
+  of the same song, still held, MPD is set back by it (`seekcur -<s>`; it stays
+  paused) before `pause 0`. A seek MPD refuses (`ACK`, e.g. a song that can't be
+  sought yet) is logged and the resume goes on; one that takes longer than 2 s
+  ends the MPD connection, which is reconnected without the seek. No seek for
+  another song (also one that arrives while the resume gate holds MPD), a
+  speaker that left the pause, a seek on the phone while paused (MPD resumes
+  further from the paused point than the lead), or without the gate. Another
+  song while the speaker is paused (the phone picks or skips one) is a start,
+  through the start gate, not a resume. A pause then stop (the session ended)
+  sends no `Play`, and the adapter lets go of the room (stops polling): the
+  next play is a start. A pause done on the speaker itself while MPD plays is
+  not the adapter's: it counts as a stopped renderer, as before. A failed
+  `Pause` is logged; the speaker then plays its buffer out.
 - If the zone already plays the stream, it does nothing. **An explicit cast
   wins at takeover:** a new cast or a user resume takes the room over from any
   other source, e.g. the Raumfeld **line-in** (a Chromecast Audio or a karaoke
@@ -204,10 +260,34 @@ Raumfeld room play the receiver's MPD stream automatically.
   setting.
 - Apart from these restarts it never stops the zone, and it never puts the room
   into standby itself; the Raumfeld's own auto power-off does that.
-- It never changes the Raumfeld's volume and sends no RenderingControl requests
-  at all. Volume from the phone is MPD's software volume: the httpd output needs
-  `mixer_type "software"` (as in [`mpd.conf.example`](mpd.conf.example)),
-  otherwise MPD answers the phone's volume change with `ACK ... {setvol} No mixer`.
+- **Volume: the phone's slider is the room's own volume**, scaled so that
+  phone 100 % is `MAX_VOLUME` (default 50; the speaker's real maximum would be
+  far too loud). MPD's volume is just a number: the httpd output needs
+  `mixer_type "null"` (as in [`mpd.conf.example`](mpd.conf.example); without a
+  mixer MPD answers the phone's volume change with `ACK ... {setvol} No mixer`,
+  and `"software"` would scale the samples), and the adapter waits for
+  `idle player mixer`. While it owns the zone and MPD plays or is paused, a
+  change of MPD's volume is sent at once to the zone renderer as
+  RenderingControl `SetRoomVolume` for `RAUMFELD_ROOM_UDN` (the room's own
+  volume; never the zone's `SetVolume`, which would scale every room in the
+  zone): `round(v * MAX_VOLUME / 100)`, half up, never above `MAX_VOLUME`. The
+  other way, the room's volume (`GetRoomVolume`) is given
+  to MPD as `min(100, round(speaker * 100 / MAX_VOLUME))`: at each takeover of a
+  zone the adapter did not own (the phone's volume is never pushed to the
+  speaker then, so the loudness does not jump; a speaker louder than
+  `MAX_VOLUME` shows 100 % and is left alone until the slider moves) and at each
+  look at the room (`SPEAKER_POLL_SECONDS`), where a change made on the speaker
+  itself is noticed. MPD's report of the adapter's own `setvol` is not sent back
+  (no feedback loop), and the round trip maps back onto the same speaker volume.
+  The receiver tells the phone (`onVolumeChanged`) when MPD's volume changes
+  other than by the phone. No volume requests without a cast, on a zone taken
+  away or yielded, with MPD stopped, or from the start gate's checks, restarts
+  and re-takeovers. A failing volume request is logged and changes nothing
+  else (after a failed `SetRoomVolume` the next look gives MPD the room's
+  volume again, so the phone shows what plays); a `GetRoomVolume` that keeps
+  failing is a warning once, then logged at debug until it works again. A renderer description without
+  RenderingControl, or with its control URL on another host, only disables
+  volume, without a warning at each look.
 - Devices are untrusted: it only fetches plain `http://` URLs on the host that
   answered SSDP or is `RAUMFELD_HOST` (redirects included), caps replies at 256 KiB and each request
   at 10 s in total (connect, headers, body), refuses XML with DOCTYPE/ENTITY,
@@ -251,6 +331,7 @@ the stream (the phone shows it paused).
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
 | `START_GATE_SECONDS` | `15` | How long (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. A takeover in the gate always gets 5 s to start playing, so the hold can run past this value, but never past 60 s: holding the song any longer only leaves the phone standing still |
+| `MAX_VOLUME` | `50` | The speaker volume (1-100) at phone 100 %; the phone's volume is scaled linearly to 0..`MAX_VOLUME`, never above it |
 | `STUCK_SECONDS` | `15` | How long (seconds, 1-300) the renderer may stay `TRANSITIONING` on the stream while MPD plays before it is restarted with `Stop`, `Play` |
 | `MPD_HOST` / `MPD_PORT` | `localhost` / `6600` | MPD control connection |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
@@ -260,7 +341,7 @@ naming the variable. `IDLE_MINUTES` is no longer used; if it is set, the
 adapter logs a warning and ignores it.
 
 See [`mpd.conf.example`](mpd.conf.example) for a matching MPD setup (httpd
-output on port 8000, MP3 or FLAC, software mixer for the phone's volume).
+output on port 8000, MP3 or FLAC, null mixer for the phone's volume).
 
 ## Run
 

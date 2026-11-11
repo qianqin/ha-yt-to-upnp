@@ -287,8 +287,11 @@ It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
 exactly the schema in `config.yaml` and accepts and rejects the right values;
 `scripts/ha_mpd_conf_test.py`: MPD's configuration gets the encoder in place
-of the template's one `@STREAM_ENCODER@` (none or two stop the app);
-`scripts/fetch_artefacts_test.py` (see the artefacts stage above).
+of the template's one `@STREAM_ENCODER@` (none or two stop the app), every
+`stream_format` in the schema has an encoder and a MIME type in `common.sh`,
+and, if `mpd` is installed, MPD starts with the configuration `ytcast_mpd_conf`
+writes for each format and serves it with its MIME type (loopback, ephemeral
+ports); `scripts/fetch_artefacts_test.py` (see the artefacts stage above).
 Then it builds the image from the assembled folder for `linux/amd64` the way
 the Supervisor does (the folder's `Dockerfile`, `BUILD_VERSION` from
 `config.yaml`, `BUILD_ARCH=amd64`) in a buildx builder of its own, and runs it
@@ -404,7 +407,7 @@ runs the same four processes natively instead, configured as the app is:
 ```sh
 scripts/run-ha-app-local.sh --name "<cast name>" --room-udn <room UDN> \
   --raumfeld-host <speaker IPv4> [--speaker-udn <UDN>] [--stream-format flac|mp3] \
-  [--stream-host <Mac's LAN IPv4>] [--log-level debug]
+  [--stream-host <Mac's LAN IPv4>] [--log-level debug] [--max-volume N]
 scripts/run-ha-app-local.sh --stop
 ```
 

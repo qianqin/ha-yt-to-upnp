@@ -1067,5 +1067,147 @@ class RendererRestartTest(unittest.TestCase):
         self.assertEqual(self.rf.requests, [])
 
 
+class RendererPauseTest(unittest.TestCase):
+    """Scenario: a user pause is followed to the zone renderer of the last look (Pause), its
+    resume plays it again (Play); the URI is left as it is, nothing else is sent."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def test_pause_then_play_on_the_checked_zone(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.assertEqual(self.ctl.check(), ra.OURS)
+        self.rf.requests.clear()
+        self.ctl.pause_renderer()
+        self.assertEqual(self.rf.soap_actions(), ["Pause"])
+        self.assertEqual(self.ctl.renderer_state(), "PAUSED_PLAYBACK")
+        self.rf.requests.clear()
+        self.ctl.play_renderer()
+        self.assertEqual(self.rf.soap_actions(), ["Play"])
+        self.assertIn("<Speed>1</Speed>", self.rf.soap_body("Play"))
+        self.assertEqual(self.rf.transport_state, "PLAYING")
+        self.assertEqual(self.rf.current_uri, STREAM_URL)
+        self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
+
+    def test_pause_and_play_without_a_checked_zone_raise(self):
+        for call in (self.ctl.pause_renderer, self.ctl.play_renderer):
+            with self.assertRaises(ra.RaumfeldError):
+                call()
+        self.assertEqual(self.rf.requests, [])
+
+
+class RendererVolumeTest(unittest.TestCase):
+    """Scenario: the speaker's volume is the zone renderer's RenderingControl volume (Master
+    channel) on the zone of the last look."""
+
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def tearDown(self):
+        assert_speaker_left_alone(self, self.rf)
+
+    def checked(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.assertEqual(self.ctl.check(), ra.OURS)
+        self.rf.requests.clear()
+
+    def test_get_and_set_volume_on_the_checked_zone(self):
+        self.checked()
+        self.rf.volume = 33
+        self.assertEqual(self.ctl.get_volume(), 33)
+        self.ctl.set_volume(25)
+        self.assertEqual(self.rf.volume, 25)
+        self.assertEqual(self.rf.volume_actions(), ["GetRoomVolume", "SetRoomVolume 25"])
+        self.assertEqual(self.rf.soap_actions(), [])  # nothing on AVTransport
+        self.assertEqual(self.rf.api_calls(), [])
+
+    def test_a_volume_out_of_range_is_refused_before_it_is_sent(self):
+        self.checked()
+        for volume in (-1, 101, 2.5, True):
+            with self.subTest(volume=volume), self.assertRaises(ValueError):
+                self.ctl.set_volume(volume)
+        self.assertEqual(self.rf.requests, [])
+
+    def test_a_device_volume_that_is_no_volume_is_an_error(self):
+        self.checked()
+        for reported in ("", "loud", "101", "-3"):
+            with self.subTest(reported=reported):
+                self.rf.volume = reported
+                with self.assertRaises(ra.RaumfeldError):
+                    self.ctl.get_volume()
+
+    def test_volume_without_a_checked_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.get_volume()
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.set_volume(10)
+        self.assertEqual(self.rf.requests, [])
+
+    def test_a_renderer_without_rendering_control_has_no_volume_but_plays(self):
+        self.rf.rendering_control = False
+        self.checked()
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.get_volume()
+        self.assertEqual(self.rf.requests, [])
+
+
+
+class RendererPositionTest(unittest.TestCase):
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def test_position_is_the_renderers_reltime(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.ctl.check()
+        self.rf.rel_time = "0:03:20"
+        self.assertEqual(self.ctl.position(), 200)
+        self.rf.rel_time = "NOT_IMPLEMENTED"
+        self.assertIsNone(self.ctl.position())
+
+    def test_position_without_a_checked_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.position()
+
+
+
+class RenderingControlOnAnotherHostTest(unittest.TestCase):
+    def test_a_rendering_control_url_on_another_host_is_ignored(self):
+        rf = FakeRaumfeld()
+        self.addCleanup(rf.close)
+        rf.rendering_url = "http://192.0.2.99/RenderingControl/ctrl"
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(rf), SPEAKER_UDN),
+                            api_port=rf.port, sleep=lambda s: None)
+        rf.power, rf.current_uri, rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.assertEqual(ctl.check(), ra.OURS)  # the transport still works
+        self.assertFalse(ctl.has_volume())
+        with self.assertRaises(ra.RaumfeldError):
+            ctl.get_volume()
+
+
 if __name__ == "__main__":
     unittest.main()

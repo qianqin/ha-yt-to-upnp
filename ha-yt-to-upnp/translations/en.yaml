@@ -34,6 +34,11 @@ configuration:
     description: >-
       How long the speaker may hang while buffering before it is restarted
       (1-300). Default 15.
+  max_volume:
+    name: Speaker volume at phone 100 %
+    description: >-
+      The phone's volume moves the speaker's own volume, scaled so that 100 %
+      on the phone is this speaker volume (1-100), never more. Default 50.
   stream_format:
     name: Stream format
     description: >-

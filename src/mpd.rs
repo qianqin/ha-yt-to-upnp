@@ -64,8 +64,9 @@ pub const RELEASE_CHANNEL: &str = "ytcast";
 /// the cast has to end.
 pub const RELEASE_MESSAGE: &str = "release";
 /// `message` wakes the idle connection when the adapter posts to a channel
-/// this connection subscribed to.
-pub const IDLE_COMMAND: &str = "idle player message";
+/// this connection subscribed to; `mixer` when MPD's volume changes (the
+/// adapter gives MPD the speaker's own volume).
+pub const IDLE_COMMAND: &str = "idle player mixer message";
 
 pub fn subscribe_command(channel: &str) -> String {
     format!("subscribe {channel}")
@@ -75,6 +76,7 @@ pub fn subscribe_command(channel: &str) -> String {
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct IdleChanges {
     pub player: bool,
+    pub mixer: bool,
     pub message: bool,
 }
 
@@ -83,6 +85,7 @@ pub fn parse_idle_changes(lines: &[String]) -> IdleChanges {
     for line in lines {
         match line.strip_prefix("changed: ") {
             Some("player") => changes.player = true,
+            Some("mixer") => changes.mixer = true,
             Some("message") => changes.message = true,
             _ => {}
         }
@@ -133,6 +136,8 @@ pub struct IdleEvent {
     pub player: bool,
     /// The adapter sent `release` on the `ytcast` channel.
     pub release: bool,
+    /// MPD's volume changed.
+    pub mixer: bool,
 }
 
 impl IdleEvent {
@@ -141,6 +146,7 @@ impl IdleEvent {
         IdleEvent {
             player: self.player || other.player,
             release: self.release || other.release,
+            mixer: self.mixer || other.mixer,
         }
     }
 }
@@ -434,7 +440,7 @@ mod real {
         /// Block until the player changes (song ends, play/pause/stop) or the
         /// adapter posts on our channel.
         ///
-        /// `idle player message` blocks server-side, which gives instant
+        /// `idle player mixer message` blocks server-side, which gives instant
         /// song-end detection without polling. Pending channel messages are
         /// read on this same connection, which is free again once idle returns.
         pub async fn wait_event(&mut self) -> Result<IdleEvent> {
@@ -444,7 +450,7 @@ mod real {
             } else {
                 false
             };
-            Ok(IdleEvent { player: changes.player, release })
+            Ok(IdleEvent { player: changes.player, release, mixer: changes.mixer })
         }
 
         /// Send one command and collect its response lines up to `OK`.
@@ -618,18 +624,20 @@ mod tests {
     }
 
     #[test]
-    fn idle_command_listens_for_player_and_messages() {
-        assert_eq!(IDLE_COMMAND, "idle player message");
+    fn idle_command_listens_for_player_volume_and_messages() {
+        assert_eq!(IDLE_COMMAND, "idle player mixer message");
         assert_eq!(subscribe_command(RELEASE_CHANNEL), "subscribe ytcast");
     }
 
     #[test]
     fn idle_changes_are_parsed_per_subsystem() {
-        assert_eq!(parse_idle_changes(&lines("changed: player")), IdleChanges { player: true, message: false });
-        assert_eq!(parse_idle_changes(&lines("changed: message")), IdleChanges { player: false, message: true });
+        let only = |player, mixer, message| IdleChanges { player, mixer, message };
+        assert_eq!(parse_idle_changes(&lines("changed: player")), only(true, false, false));
+        assert_eq!(parse_idle_changes(&lines("changed: mixer")), only(false, true, false));
+        assert_eq!(parse_idle_changes(&lines("changed: message")), only(false, false, true));
         assert_eq!(
-            parse_idle_changes(&lines("changed: player\nchanged: message")),
-            IdleChanges { player: true, message: true }
+            parse_idle_changes(&lines("changed: player\nchanged: mixer\nchanged: message")),
+            only(true, true, true)
         );
         assert_eq!(parse_idle_changes(&[]), IdleChanges::default());
     }
@@ -661,9 +669,16 @@ mod tests {
 
     #[test]
     fn idle_events_merge_without_losing_a_release() {
-        let a = IdleEvent { player: true, release: false };
-        let b = IdleEvent { player: false, release: true };
-        assert_eq!(a.merge(b), IdleEvent { player: true, release: true });
+        let a = IdleEvent { player: true, release: false, mixer: false };
+        let b = IdleEvent { player: false, release: true, mixer: false };
+        assert_eq!(a.merge(b), IdleEvent { player: true, release: true, mixer: false });
+    }
+
+    #[test]
+    fn idle_events_merge_without_losing_a_volume_change() {
+        let a = IdleEvent { player: true, release: false, mixer: false };
+        let b = IdleEvent { player: false, release: false, mixer: true };
+        assert_eq!(a.merge(b), IdleEvent { player: true, release: false, mixer: true });
     }
 
     #[cfg(not(feature = "mock-mpd"))]
@@ -782,19 +797,19 @@ mod tests {
         async fn connect_subscribes_and_release_message_is_reported() {
             let (port, server) = fake_mpd(vec![
                 ("subscribe ytcast", "OK\n"),
-                ("idle player message", "changed: message\nOK\n"),
+                ("idle player mixer message", "changed: message\nOK\n"),
                 ("readmessages", "channel: ytcast\nmessage: release\nOK\n"),
             ])
             .await;
 
             let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
             let event = idle.wait_event().await.unwrap();
-            assert_eq!(event, IdleEvent { player: false, release: true });
+            assert_eq!(event, IdleEvent { player: false, release: true, mixer: false });
 
             drop(idle);
             assert_eq!(
                 server.await.unwrap(),
-                vec!["subscribe ytcast", "idle player message", "readmessages"]
+                vec!["subscribe ytcast", "idle player mixer message", "readmessages"]
             );
         }
 
@@ -802,23 +817,39 @@ mod tests {
         async fn player_change_alone_does_not_read_messages() {
             let (port, server) = fake_mpd(vec![
                 ("subscribe ytcast", "OK\n"),
-                ("idle player message", "changed: player\nOK\n"),
+                ("idle player mixer message", "changed: player\nOK\n"),
             ])
             .await;
 
             let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
             let event = idle.wait_event().await.unwrap();
-            assert_eq!(event, IdleEvent { player: true, release: false });
+            assert_eq!(event, IdleEvent { player: true, release: false, mixer: false });
 
             drop(idle);
-            assert_eq!(server.await.unwrap(), vec!["subscribe ytcast", "idle player message"]);
+            assert_eq!(server.await.unwrap(), vec!["subscribe ytcast", "idle player mixer message"]);
+        }
+
+        #[tokio::test]
+        async fn volume_change_is_reported_without_reading_messages() {
+            let (port, server) = fake_mpd(vec![
+                ("subscribe ytcast", "OK\n"),
+                ("idle player mixer message", "changed: mixer\nOK\n"),
+            ])
+            .await;
+
+            let mut idle = MpdIdleClient::connect("127.0.0.1", port).await.unwrap();
+            let event = idle.wait_event().await.unwrap();
+            assert_eq!(event, IdleEvent { player: false, release: false, mixer: true });
+
+            drop(idle);
+            assert_eq!(server.await.unwrap(), vec!["subscribe ytcast", "idle player mixer message"]);
         }
 
         #[tokio::test]
         async fn unknown_messages_are_ignored() {
             let (port, _server) = fake_mpd(vec![
                 ("subscribe ytcast", "OK\n"),
-                ("idle player message", "changed: message\nOK\n"),
+                ("idle player mixer message", "changed: message\nOK\n"),
                 ("readmessages", "channel: ytcast\nmessage: something-else\nOK\n"),
             ])
             .await;

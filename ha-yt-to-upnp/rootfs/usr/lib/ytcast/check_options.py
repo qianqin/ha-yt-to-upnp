@@ -28,6 +28,7 @@ SCHEMA = {
     "stream_host": "match(^[0-9A-Za-z.-]{1,253}$)?",
     "start_gate_seconds": "int(0,60)?",
     "stuck_seconds": "int(1,300)?",
+    "max_volume": "int(1,100)?",
     "stream_format": "list(flac|mp3)",
     "log_level": "list(debug|info|warning|error)",
 }

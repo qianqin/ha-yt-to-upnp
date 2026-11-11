@@ -2,6 +2,28 @@
 
 ## 0.4.1
 
+- Pause from the phone is heard at once: the adapter follows a user pause to
+  the speaker (UPnP AVTransport `Pause` on the zone renderer) instead of
+  letting it play its 5-6 s buffer out. A resume sends `Play` and sounds
+  after about 1 s, where the pause was heard: the speaker drops what it had
+  buffered, so the adapter measures that at the pause and sets MPD back by it
+  (about 1 s) before releasing it. A speaker switched to another source
+  during the pause is not taken back; one that stopped during the pause (a
+  stop the poll had not yet seen) is taken over as before. Picking another
+  song while paused starts it like a new cast.
+- Faster start with FLAC: MPD's FLAC stream carries no data while MPD is
+  paused, so the speaker could only start when the start gate gave up (about
+  20 s at every start). With FLAC the adapter now releases MPD right after
+  telling the speaker to play; it starts in about 1 s. MP3 keeps holding the
+  song until the speaker plays.
+- Volume from the phone sets the room's own volume (UPnP RenderingControl
+  `SetRoomVolume` on the room's zone renderer; other rooms in the zone keep
+  theirs), at once instead of after the speaker's buffer, scaled so that
+  100 % on the phone is the new option `max_volume` (1-100, default 50),
+  never louder. MPD plays at a fixed 100 % (`mixer_type "null"`, the FLAC
+  stream stays bit-perfect). At a cast start the speaker keeps its volume and
+  the phone is shown it; a volume changed on the speaker itself shows on the
+  phone within about 5 s. Replaces "the speaker's volume is never changed".
 - Artefacts stage: the test-only `ARTEFACTS_URL` is checked as a whole and
   as one line; before, a second line or a backslash escape such as `\c`
   (which `echo` in dash acts on) left part of the value unchecked, so user
@@ -15,7 +37,9 @@
 - Tests: `scripts/fetch_artefacts_test.py` (URL check, sha256 in the lock,
   512 MB cap, no setuid/setgid bits) and `scripts/ha_mpd_conf_test.py`
   (exactly one `@STREAM_ENCODER@` in `mpd.conf.template`, now checked by
-  `ytcast_mpd_conf` in `common.sh`), both run by `scripts/smoke-ha-app.sh`;
+  `ytcast_mpd_conf` in `common.sh`; every `stream_format` has an encoder and
+  a MIME type, and MPD serves each with it), both run by
+  `scripts/smoke-ha-app.sh`;
   more cases for `scripts/publish-release.sh` and `scripts/pack_artefacts.py`.
 - `ytcast_mpd_conf` puts the encoder settings in as they are (quoted
   replacement: bash 5.2 would turn an `&` into the placeholder).
