@@ -45,8 +45,7 @@ solving with the vendored yt-dlp/ejs solver in QuickJS.
   respects standby, line-in and other sources, and releases the cast when the
   speaker is taken away. Follows the phone's pause, resume and volume to the
   speaker (its own volume, scaled to `max_volume`).
-- **Lossless 16-bit/48 kHz stream** to the speaker: WAV by default (from
-  0.4.1; FLAC from 0.4.0 stays selectable but starts slowly, see below).
+- **FLAC 16-bit/48 kHz stream** to the speaker (from 0.4.0, see below).
 - **Home Assistant app packaging:** the programs are built on the release
   machine (a Mac) from pinned, checksummed inputs and published as a GitHub
   Release asset; Home Assistant installs the app from this repository.
@@ -61,7 +60,7 @@ receiver (Rust, ytcast-lite)  <-- audio from YouTube: Premium URL or SABR,
     |                              PoToken from the local helper (127.0.0.1:4416)
     |  http://localhost:8008/stream/<id>   (loopback only)
     v
-MPD  --httpd output-->  http://<ha-host>:8000/stream.wav  (or .flac, .mp3)
+MPD  --httpd output-->  http://<ha-host>:8000/stream.flac  (or .mp3)
     ^                        |
     |  MPD state (127.0.0.1:6600)  |  fetched by the speaker
     |                        v
@@ -79,20 +78,15 @@ the speaker, which the receiver reports to the phone.
 
 | Source (from YouTube) | Used when | Stream to the speaker |
 | --- | --- | --- |
-| itag 774, Opus ~256 kbit/s, 48 kHz | Premium cast, first choice | WAV 16-bit/48 kHz |
-| itag 141, AAC 256 kbit/s, 44.1 kHz | Premium cast, if 774 fails | WAV 16-bit/48 kHz (resampled) |
-| itag 251, Opus ~160 kbit/s, 48 kHz, via SABR | other casts, and the fallback | WAV 16-bit/48 kHz |
+| itag 774, Opus ~256 kbit/s, 48 kHz | Premium cast, first choice | FLAC 16-bit/48 kHz |
+| itag 141, AAC 256 kbit/s, 44.1 kHz | Premium cast, if 774 fails | FLAC 16-bit/48 kHz (resampled) |
+| itag 251, Opus ~160 kbit/s, 48 kHz, via SABR | other casts, and the fallback | FLAC 16-bit/48 kHz |
 
-MPD decodes the source and serves it as uncompressed PCM (WAV, about
-1.5 Mbit/s), so there is no second lossy step; `stream_format: mp3`
-(320 kbit/s) is the fallback for a weak network. `flac` is lossless too but
-slow: while the adapter holds MPD paused (start gate, resume) MPD's FLAC
-stream carries no data, so the speaker only starts when the gate gives up
-(about 20 s); WAV and MP3 carry silence then and start in about 2 s. The rate
+MPD decodes the source and re-encodes it losslessly as FLAC, so there is no
+second lossy step; `stream_format: mp3` (320 kbit/s) is the fallback. The rate
 is fixed at 48 kHz because MPD's HTTP stream drops its clients when the rate
-changes between songs. FLAC and `stream_format` arrive with **0.4.0**, WAV as
-the default with **0.4.1**; earlier versions (local apps) stream MP3
-192 kbit/s.
+changes between songs. FLAC and `stream_format` arrive with **0.4.0**;
+earlier versions (local apps) stream MP3 192 kbit/s.
 
 Setting `YTCAST_AUDIO_QUALITY=standard` on the receiver disables Premium
 formats (always 251 via SABR).
@@ -150,7 +144,7 @@ Main options (full list, rules and troubleshooting in
 | `raumfeld_speaker_udn` | UDN of the speaker device that hosts the Raumfeld API; required unless `raumfeld_host` is set |
 | `raumfeld_host` | Optional IPv4 address (recommended) or DNS name of that device, e.g. `192.0.2.20`, for a faster start |
 | `stream_host` | Optional address the speaker fetches the stream from; default: the host's detected LAN address |
-| `stream_format` | `wav` (default), `flac` (slow to start and resume) or `mp3` |
+| `stream_format` | `flac` (default) or `mp3` |
 | `start_gate_seconds`, `stuck_seconds` | Optional start-gate and stuck-renderer timings |
 | `log_level` | `debug`, `info` (default), `warning` or `error` |
 
@@ -216,8 +210,8 @@ The parts also run on any Linux host (or a Mac for testing,
 1. **MPD** on the same host with an `httpd` output and `mixer_type
    "null"` (the adapter turns the phone's volume into the speaker's), control
    on localhost: see
-   [adapter/mpd.conf.example](adapter/mpd.conf.example), `encoder "wave"`
-   and `format "48000:16:2"` (16-bit, fixed 48 kHz, as the app does).
+   [adapter/mpd.conf.example](adapter/mpd.conf.example). For FLAC use
+   `format "48000:16:2"` (16-bit, fixed 48 kHz, as the app does).
 2. **PoToken helper:** [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
    on Deno, listening on `127.0.0.1:4416` (the receiver asks it there).
    Without it, streams are throttled after about a minute. For the restricted
@@ -235,8 +229,8 @@ The parts also run on any Linux host (or a Mac for testing,
 
 4. **Raumfeld adapter:** `python3 -m adapter` with `RAUMFELD_ROOM_UDN`,
    `RAUMFELD_SPEAKER_UDN` or `RAUMFELD_HOST`, `STREAM_URL`
-   (`http://<receiver-host>:8000/stream.wav`) and `STREAM_MIME`
-   (`audio/wav`); all settings in [adapter/README.md](adapter/README.md).
+   (`http://<receiver-host>:8000/stream.flac`) and `STREAM_MIME`
+   (`audio/flac`); all settings in [adapter/README.md](adapter/README.md).
 
 Keep MPD's control port and the PoToken helper on loopback, as the app does.
 

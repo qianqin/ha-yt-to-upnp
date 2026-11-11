@@ -42,10 +42,9 @@ configuration:
   stream_format:
     name: Stream format
     description: >-
-      Format of the stream the speaker plays: wav (lossless, 48 kHz 16-bit,
-      about 1.5 Mbit/s on the LAN; starts and resumes fastest), flac
-      (lossless, but slow to start and resume) or mp3 (320 kbit/s), if the
-      network is too weak for wav. Default wav.
+      Format of the stream the speaker plays: flac (lossless, 48 kHz 16-bit,
+      about 1-1.5 Mbit/s on the LAN) or mp3 (320 kbit/s), if FLAC does not
+      play. Default flac.
   log_level:
     name: Log level
     description: Log level of the receiver and the adapter.

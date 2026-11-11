@@ -17,7 +17,7 @@ host_network: true
 options:
   cast_name: YouTube to UPnP
   raumfeld_room_udn: null
-  stream_format: wav
+  stream_format: flac
   log_level: info
   # Optional options are not listed: the Supervisor rejects a null default as a
   # missing option, even for an optional one.
@@ -36,8 +36,6 @@ schema:
   stuck_seconds: int(1,300)?
   # The speaker's volume at phone 100 % (the adapter's MAX_VOLUME, default 50).
   max_volume: int(1,100)?
-  # WAV 48 kHz 16-bit (default), FLAC 16-bit (the Raumfeld does not play 24-bit
-  # FLAC streams; slow to start and resume, kept for existing installs) or MP3
-  # 320 kbit/s.
-  stream_format: list(wav|flac|mp3)
+  # FLAC 16-bit (the Raumfeld does not play 24-bit FLAC streams) or MP3 320 kbit/s.
+  stream_format: list(flac|mp3)
   log_level: list(debug|info|warning|error)

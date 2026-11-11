@@ -70,10 +70,8 @@ Raumfeld room play the receiver's MPD stream automatically.
   the adapter doesn't own the room (a new cast, or a resume after the room was
   taken away), it first sends MPD `pause 1`, which holds the song where MPD has
   got to by then, a moment after its start;
-  MPD's httpd output keeps streaming silence while paused (`always_on`) with
-  the WAV or MP3 encoder, so the speaker can connect and start. **Not with
-  FLAC:** MPD's FLAC encoder sends no data while paused, so the speaker stays
-  `TRANSITIONING` until the gate gives up (about 20 s); use WAV. Then it wakes the room and starts the stream as usual,
+  MPD's httpd output keeps streaming silence while paused (`always_on`), so the
+  speaker can connect. Then it wakes the room and starts the stream as usual,
   asks the zone renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL`,
   and sends `pause 0` as soon as it is. **Re-takeover:** if the renderer has not
   loaded or does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover
@@ -288,8 +286,8 @@ the stream (the phone shows it paused).
 | `RAUMFELD_SPEAKER_UDN` | required without `RAUMFELD_HOST` | UDN of the speaker device that hosts the Raumfeld API; found by multicast SSDP. Not used with `RAUMFELD_HOST` (checked if set) |
 | `RAUMFELD_HOST` | unset | IPv4 address or DNS name of the Raumfeld host (no port, scheme or path), e.g. `<raumfeld-host>.local`. Reaches its API directly (no SSDP for the host) and takes only that address's answer to the multicast search for the zone renderer (the Raumfeld doesn't answer unicast SSDP). The room and zone UDNs are still checked: a wrong host is an error. Must resolve to the address the host answers SSDP from; an IPv4 address binds firmest (no DNS) |
 | `ADAPTER_STATE_DIR` | unset | Absolute path of an existing, writable directory (e.g. `/data` in a container) where the zone renderer's location is kept across restarts, so a restart needs no search. Unset: in-memory cache only |
-| `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.wav` |
-| `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata (`audio/wav` for the WAV stream of [`mpd.conf.example`](mpd.conf.example)) |
+| `STREAM_URL` | required | MPD httpd stream (`http://` or `https://`), e.g. `http://<receiver-host>:8000/stream.mp3` |
+| `STREAM_MIME` | `audio/mpeg` | MIME type announced in the DIDL-Lite metadata |
 | `STREAM_METADATA` | `1` | `0` sends empty `CurrentURIMetaData` instead of DIDL-Lite |
 | `SPEAKER_POLL_SECONDS` | `5` | How often (seconds, at least 1) the room is checked while the adapter owns the zone |
 | `START_GATE_SECONDS` | `15` | How long (seconds, 0-60) MPD is held at the start of the song while the speaker wakes; `0` turns the start gate off. A takeover in the gate always gets 5 s to start playing, so the hold can run past this value, but never past 60 s: holding the song any longer only leaves the phone standing still |
@@ -303,7 +301,7 @@ naming the variable. `IDLE_MINUTES` is no longer used; if it is set, the
 adapter logs a warning and ignores it.
 
 See [`mpd.conf.example`](mpd.conf.example) for a matching MPD setup (httpd
-output on port 8000, WAV (MP3 and FLAC variants), null mixer for the phone's volume).
+output on port 8000, MP3 or FLAC, null mixer for the phone's volume).
 
 ## Run
 
@@ -311,7 +309,7 @@ From the repository root:
 
 ```sh
 RAUMFELD_ROOM_UDN=uuid:... RAUMFELD_SPEAKER_UDN=uuid:... \
-STREAM_URL=http://<receiver-host>:8000/stream.wav STREAM_MIME=audio/wav \
+STREAM_URL=http://<receiver-host>:8000/stream.mp3 \
 python3 -m adapter
 # or: python3 adapter/raumfeld_adapter.py
 ```

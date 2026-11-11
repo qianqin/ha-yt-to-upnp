@@ -29,10 +29,8 @@ audio_output {
     # changes (a 44.1 kHz song after a 48 kHz one), httpd closes every client,
     # so the speaker would lose the stream between songs.
     format      "48000:16:2"
-    # Keep the stream open between tracks and while paused, so the speaker does
-    # not drop it. While paused, WAV and MP3 carry silence, which lets the
-    # speaker start during the adapter's start gate; FLAC sends nothing then,
-    # so with flac the speaker waits until the gate gives up.
+    # Keep the stream open between tracks and while paused (silence), so the
+    # speaker neither drops it nor stalls during the adapter's start gate.
     always_on   "yes"
     tags        "yes"
     # The phone's volume is just a number in MPD (setvol works, the samples are
