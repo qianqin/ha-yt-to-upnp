@@ -120,9 +120,17 @@ stream between a 44.1 kHz and a 48 kHz song.
   what MPD decoded, 16-bit/48 kHz PCM, about 1.5 Mbit/s on the LAN. While the
   app holds MPD paused (the start gate at a cast start, and the resume after
   a pause) the WAV stream carries silence, so the speaker connects and plays
-  within about 2 s. **Open question:** MPD's WAV header announces about 23
-  minutes of data (the stream itself goes on); whether the Raumfeld stops
-  after that in a longer cast is still to be verified.
+  within about 2 s. **Length of a connection:** MPD's WAV header announces
+  about 23 minutes of data (the stream itself goes on), and the Raumfeld
+  plays just that much, then closes the connection (after the third time it
+  stays stopped). The app reads that length from the stream and gives the
+  speaker a new connection before it runs out: at the first song change after
+  about 17 minutes it holds the new song at its start for a few seconds (the
+  speaker plays out the end of the song before), sets the stream again and
+  goes on once the speaker plays, a gap of a few seconds between two songs.
+  A single song longer than that (or a speaker that stops at the length
+  anyway) is taken over again as soon as the app sees it stopped: a short gap
+  within the song.
 - **FLAC** is lossless too, but while MPD is paused its stream carries no data
   at all, so the speaker stays `TRANSITIONING` until the app's start gate gives
   up: about 20 s at every cast start and every resume. It is still accepted so

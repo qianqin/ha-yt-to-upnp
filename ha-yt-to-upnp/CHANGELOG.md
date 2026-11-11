@@ -23,9 +23,14 @@
   until the speaker plays, so the speaker waited for the gate to give up
   (about 20 s); WAV and MP3 carry silence then, and the speaker starts in
   about 2 s. `flac` stays accepted (installs that have it saved keep
-  working) but is documented as slow; switch to `wav`. Open: MPD's WAV
-  header announces about 23 minutes of data; casts longer than that are
-  still to be verified on the speaker.
+  working) but is documented as slow; switch to `wav`.
+- WAV connections are renewed before they run out: the Raumfeld stops after
+  the data length MPD's WAV header announces (about 23 minutes). The adapter
+  reads that length from the stream and, at the first song change after
+  about 17 minutes, holds the new song for a few seconds while the speaker
+  plays out its buffer, sets the stream again and resumes once the speaker
+  plays. A speaker that stops at the length anyway (a song longer than that)
+  is taken over again behind the start gate instead of ending the cast.
 
 ## 0.4.0
 

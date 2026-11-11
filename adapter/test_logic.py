@@ -427,6 +427,8 @@ class RecordingController:
         self.volume_calls = []
         self.speaker_volume = 30
         self.volume_fail = None
+        self.lifetime = None  # seconds a connection to the stream lasts (WAV); None: no limit
+        self.reload_fail = None
         self.plays = True
         self.plays_fail = None
         self.renderer = "STOPPED"  # what renderer_state reports while not playing
@@ -479,6 +481,14 @@ class RecordingController:
         self.calls.append("play_renderer")
         if self.play_fail:
             raise self.play_fail
+
+    def stream_lifetime(self):
+        return self.lifetime
+
+    def reload_stream(self):
+        self.calls.append("reload_stream")
+        if self.reload_fail:
+            raise self.reload_fail
 
     def get_volume(self):
         self.volume_calls.append("get_volume")
@@ -2237,6 +2247,264 @@ class VolumeFollowTest(unittest.TestCase):
     def test_max_volume_defaults_like_the_config(self):
         self.assertEqual(ra.Follower(self.ctl).max_volume, ra.DEFAULT_MAX_VOLUME)
         self.assertEqual(ra.DEFAULT_MAX_VOLUME, 50)
+
+
+
+def wav_header(data_len=0x0FFFFFFF, byte_rate=192000, fmt_size=16, extra=b""):
+    """MPD's httpd WAV header: RIFF, fmt, (extra chunks), data with its announced length."""
+    fmt = (b"\x01\x00\x02\x00" + (48000).to_bytes(4, "little") + byte_rate.to_bytes(4, "little")
+           + b"\x04\x00\x10\x00").ljust(fmt_size, b"\0")
+    body = (b"WAVE" + b"fmt " + fmt_size.to_bytes(4, "little") + fmt + (b"\0" if fmt_size % 2 else b"")
+            + extra + b"data" + data_len.to_bytes(4, "little"))
+    return b"RIFF" + (len(body) + data_len).to_bytes(4, "little")[:4] + body
+
+
+class WavHeaderTest(unittest.TestCase):
+    """How long a speaker's connection to the WAV stream lasts: the Raumfeld plays the data
+    length the header announces, then closes the connection."""
+
+    def test_mpds_header(self):
+        self.assertAlmostEqual(ra.wav_stream_seconds(wav_header()), 0x0FFFFFFF / 192000)
+        self.assertAlmostEqual(ra.WAV_FALLBACK_S, 0x0FFFFFFF / 192000)
+
+    def test_other_chunks_and_an_odd_fmt_size_are_skipped(self):
+        list_chunk = b"LIST" + (5).to_bytes(4, "little") + b"abcde\0"  # odd: padded
+        self.assertEqual(ra.wav_stream_seconds(
+            wav_header(data_len=1920000, fmt_size=18, extra=list_chunk)), 10)
+
+    def test_trailing_stream_data_is_ignored(self):
+        self.assertEqual(ra.wav_stream_seconds(wav_header(data_len=192000) + b"\0" * 5000), 1)
+
+    def test_no_length_without_a_complete_header(self):
+        head = wav_header()
+        for bad in (b"", head[:11], head[:30], head[:-1], b"RIFX" + head[4:],
+                    head[:8] + b"AVI " + head[12:], b"ID3\x03" + head[4:],
+                    wav_header(byte_rate=0), wav_header(fmt_size=12)):
+            with self.subTest(bad=bad[:16]):
+                self.assertIsNone(ra.wav_stream_seconds(bad))
+
+    def test_data_before_fmt_has_no_length(self):
+        head = b"RIFF\0\0\0\0WAVE" + b"data" + (100).to_bytes(4, "little")
+        self.assertIsNone(ra.wav_stream_seconds(head))
+
+
+class StreamReloadTest(unittest.TestCase):
+    """A speaker connected to the WAV stream for the length its header announces stops (it
+    reconnects twice, then stays stopped). So at a song change after most of that length
+    the stream is set again behind the gate, and a renderer stopped by the length while MPD
+    plays is taken over again instead of counting as taken away."""
+
+    LIFETIME = 1400.0
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.ctl.clock = self.clock
+        self.ctl.lifetime = self.LIFETIME
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=15)
+
+    def advance(self, seconds):
+        self.clock.now += seconds
+        self.f.tick()
+
+    def requests(self):
+        return self.f.take_mpd_requests()
+
+    def owned(self):
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", "1")
+        self.ctl.calls.clear()
+
+    def age(self, seconds):
+        """Time passes with the speaker playing (polls)."""
+        end = self.clock.now + seconds
+        while self.clock.now + 5 <= end:
+            self.advance(5)
+        self.clock.now = end
+        self.ctl.calls.clear()
+
+    def next_song(self, song="2"):
+        self.f.on_mpd_state("stop", None)
+        self.f.on_mpd_state("play", song)
+
+    # -- at a song change
+
+    def test_an_old_connection_is_renewed_at_the_next_song(self):
+        self.owned()
+        self.age(1100)
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.next_song()
+        self.assertTrue(any("WAV" in m for m in logs.output), logs.output)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held at the song's start
+        self.assertNotIn("ensure_playing(no wake)", self.ctl.calls)
+        self.f.on_mpd_state("pause", "2")
+        self.assertEqual(self.ctl.calls, [])  # the speaker plays its buffer out first
+        self.advance(ra.RELOAD_DRAIN_S - ra.GATE_POLL_S)
+        self.assertEqual(self.ctl.calls, [])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.ctl.calls, ["reload_stream"])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)  # the renderer plays again
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", "2")
+        self.assertEqual(self.f.seconds_until_deadline(), 5)
+        # A new connection: the next song plays on without a renewal.
+        self.ctl.calls.clear()
+        self.next_song("3")
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.ctl.calls, ["ensure_playing(no wake)"])
+
+    def test_a_young_connection_is_left_alone(self):
+        self.owned()
+        self.age(1000)
+        self.next_song()
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.ctl.calls, ["ensure_playing(no wake)"])
+
+    def test_the_last_five_minutes_count_for_a_short_lifetime(self):
+        self.ctl.lifetime = 1000.0  # 0.75 of it is 750 s, but 5 min before its end is 700 s
+        self.owned()
+        self.age(710)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.next_song()
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+
+    def test_no_renewal_without_a_length_limit(self):
+        self.ctl.lifetime = None  # mp3, flac
+        self.owned()
+        self.age(5000)
+        self.next_song()
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.ctl.calls, ["ensure_playing(no wake)"])
+
+    def test_a_user_resume_is_no_song_change(self):
+        self.owned()
+        self.ctl.plays = False  # nothing of ours to pause: a plain resume
+        self.age(1100)
+        self.f.on_mpd_state("pause", "1")
+        self.f.on_mpd_state("play", "1")
+        self.assertEqual(self.requests(), [])
+        self.assertNotIn("reload_stream", self.ctl.calls)
+
+    def test_a_failed_renewal_takes_the_speaker_over_within_the_gate(self):
+        self.owned()
+        self.age(1100)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.next_song()
+            self.requests()
+            self.f.on_mpd_state("pause", "2")
+        self.ctl.reload_fail = ra.RaumfeldError("HTTP 500")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.advance(ra.RELOAD_DRAIN_S)
+        self.assertEqual(self.ctl.calls, ["reload_stream", "ensure_playing"])
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+
+    def test_without_the_gate_the_stream_is_set_again_at_once(self):
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
+        f.on_mpd_state("play", "1")
+        self.clock.now += 1100
+        f.on_mpd_state("stop", None)
+        self.ctl.calls.clear()
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("play", "2")
+        self.assertEqual(self.ctl.calls, ["reload_stream"])
+        self.assertEqual(f.take_mpd_requests(), [])
+
+    def test_every_new_connection_restarts_the_count(self):
+        self.owned()
+        self.age(1100)
+        self.ctl.verdict = ra.TRANSITIONING  # stuck: restarted (Stop, Play) after STUCK_S
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            self.age(ra.STUCK_S + 10)
+        self.ctl.verdict = ra.OURS
+        self.age(10)
+        self.next_song()
+        self.assertEqual(self.requests(), [])
+
+    # -- the safety net
+
+    def test_a_renderer_stopped_by_the_length_is_taken_over_again(self):
+        self.owned()
+        self.age(self.LIFETIME - 30)
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.ctl.plays = False
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])  # held, not yielded
+        self.assertFalse(self.f.yielded)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")  # no buffer left to play out
+        self.assertEqual(self.ctl.calls, ["check", "reload_stream"])
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(ra.GATE_POLL_S)
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+
+    def test_a_renderer_transitioning_at_the_length_is_taken_over_again(self):
+        self.owned()
+        self.age(self.LIFETIME - 30)
+        self.ctl.verdict = ra.TRANSITIONING
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+
+    def test_a_stopped_renderer_on_a_young_connection_still_counts_as_taken_away(self):
+        self.owned()
+        self.age(600)
+        self.ctl.verdict = ra.NOT_PLAYING
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(ra.STOPPED_GRACE_POLLS + 1):
+                self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+
+    def test_another_source_at_the_length_is_not_fought(self):
+        self.owned()
+        self.age(self.LIFETIME)
+        self.ctl.verdict = ra.OTHER_SOURCE
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+        self.assertEqual(self.requests(), [ra.PAUSE_PLAYER, ra.RELEASE_CAST])
+        self.assertNotIn("reload_stream", self.ctl.calls)
+
+    def test_the_safety_net_is_bounded_by_the_new_connection(self):
+        self.owned()
+        self.age(self.LIFETIME)
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.ctl.plays = False
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.advance(5)
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+            for _ in range(GATE_LOOKS):  # the renderer never plays: the gate gives up
+                self.advance(ra.GATE_POLL_S)
+                if ra.RESUME_PLAYER in self.f._requests:
+                    break
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", "1")
+        # The connection is young now: as after any gate that gave up, one more takeover,
+        # then the stopped renderer counts as taken away.
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(2 * (ra.STOPPED_GRACE_POLLS + 1)):
+                self.advance(5)
+        self.assertIn(ra.RELEASE_CAST, self.requests())
+        self.assertEqual(self.ctl.calls.count("reload_stream"), 1)
+
+    def test_no_safety_net_while_mpd_is_paused(self):
+        self.owned()
+        self.age(self.LIFETIME)
+        self.ctl.plays = False  # nothing of ours to pause
+        self.f.on_mpd_state("pause", "1")
+        self.ctl.verdict = ra.NOT_PLAYING
+        self.advance(5)
+        self.assertEqual(self.requests(), [])
 
 
 if __name__ == "__main__":

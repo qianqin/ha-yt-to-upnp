@@ -287,6 +287,32 @@ def phone_volume(speaker, max_volume):
     return max(0, min(100, (200 * speaker + max_volume) // (2 * max_volume)))
 
 
+# MPD's httpd WAV header announces 0x0FFFFFFF bytes of data; at 48 kHz, 16-bit stereo that
+# is about 23 min. The Raumfeld plays that much, then closes the connection. Taken when the
+# header can't be read.
+WAV_FALLBACK_S = 0x0FFFFFFF / (48000 * 2 * 2)
+WAV_MIMES = ("audio/wav", "audio/x-wav", "audio/wave")
+WAV_HEAD_MAX = 4096  # MPD's header is 44 bytes; other chunks before "data" are short
+
+
+def wav_stream_seconds(head):
+    """Seconds of audio a WAV header announces (its data length over the fmt byte rate), or
+    None if `head` holds no complete RIFF/WAVE header with fmt before data."""
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos, byte_rate = 12, None
+    while pos + 8 <= len(head):
+        chunk, size = head[pos:pos + 4], int.from_bytes(head[pos + 4:pos + 8], "little")
+        if chunk == b"data":
+            return size / byte_rate if byte_rate else None
+        if chunk == b"fmt ":
+            if size < 16 or pos + 8 + 16 > len(head):
+                return None
+            byte_rate = int.from_bytes(head[pos + 16:pos + 20], "little")
+        pos += 8 + size + (size & 1)  # chunks are padded to an even length
+    return None
+
+
 def build_didl(stream_url, mime):
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -623,6 +649,29 @@ def http_get(url, deadline_s=HTTP_TIMEOUT_S):
     return _fetch("GET", url, deadline_s)
 
 
+def read_stream_head(url, timeout=3):
+    """The start of the (endless) stream at `url`: enough for a WAV header, at most
+    WAV_HEAD_MAX bytes; the connection is closed right after."""
+    parts = urlsplit(url)
+    if parts.scheme != "http" or not parts.hostname:
+        raise RaumfeldError("refusing non-http stream URL %r" % url)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    try:
+        conn.request("GET", (parts.path or "/") + ("?" + parts.query if parts.query else ""))
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise RaumfeldError("HTTP %d from %r" % (resp.status, url))
+        head = b""
+        while len(head) < WAV_HEAD_MAX and wav_stream_seconds(head) is None:
+            chunk = resp.read1(WAV_HEAD_MAX - len(head))
+            if not chunk:
+                break
+            head += chunk
+        return head
+    finally:
+        conn.close()
+
+
 def soap_call(control_url, action, args, service=AVTRANSPORT):
     body = soap_envelope(action, [("InstanceID", "0")] + list(args), service).encode("utf-8")
     headers = {"Content-Type": 'text/xml; charset="utf-8"',
@@ -756,6 +805,7 @@ class Controller:
         # stream; "" if none (standby, no zone, nothing loaded).
         self._source_before = ""
         self._lookups = 0  # devices looked for so far
+        self._lifetime = None  # seconds a connection to the WAV stream lasts, once read
         self._wake_s = 0.0  # the current takeover's wait for the room to wake
         self.last_takeover = TakeoverStats(wake_s=0.0, lookups=0)
 
@@ -821,13 +871,45 @@ class Controller:
                 zone = self._wait_awake(room.api, had_zone=zone is not None)
                 self._wake_s = self.clock() - woken
         zone = zone or self._connect_zone(room.api, room_param)
+        self._set_stream(zone)
+        log.info("zone %r now plays %s", zone, self.config.stream_url)
+        return decision
+
+    def _set_stream(self, zone):
         metadata = (build_didl(self.config.stream_url, self.config.stream_mime)
                     if self.config.stream_metadata else "")
         self._zone_soap(zone, "SetAVTransportURI",
                         [("CurrentURI", self.config.stream_url), ("CurrentURIMetaData", metadata)])
         self._zone_soap(zone, "Play", [("Speed", "1")])
-        log.info("zone %r now plays %s", zone, self.config.stream_url)
-        return decision
+
+    def reload_stream(self):
+        """SetAVTransportURI and Play our stream again on the zone of the last takeover or
+        look: the renderer opens a new connection to it. No wake, no zone change."""
+        self._known_control()
+        self._set_stream(self._zone)
+        log.info("zone %r: stream set again", self._zone)
+
+    def stream_lifetime(self):
+        """Seconds a renderer's connection to the stream lasts: for WAV the length its header
+        announces (the Raumfeld stops there), read once from the stream; None for other
+        formats. If the header can't be read, WAV_FALLBACK_S, and it is read again next time."""
+        if self.config.stream_mime.lower() not in WAV_MIMES:
+            return None
+        if self._lifetime is None:
+            try:
+                seconds = wav_stream_seconds(read_stream_head(self.config.stream_url))
+            except _ERRORS as e:
+                log.warning("could not read the WAV stream's header (%r); taking %.0f s", e,
+                            WAV_FALLBACK_S)
+                return WAV_FALLBACK_S
+            if seconds is None:
+                log.warning("no WAV header at the start of the stream; taking %.0f s",
+                            WAV_FALLBACK_S)
+                return WAV_FALLBACK_S
+            self._lifetime = seconds
+            log.info("the WAV stream's header announces %.0f s: a connection lasts that long",
+                     seconds)
+        return self._lifetime
 
     def check(self):
         """Read-only look at the room: the judge_speaker verdict."""
@@ -1244,6 +1326,16 @@ GATE_MAX_RETAKES = 2
 # the phone can't pause a song it hasn't played yet so soon after the hand-over.
 AFTER_GATE_HANDOVER_S = 5
 HANDOVER_ELAPSED_S = 1.0
+# The WAV stream's length (Controller.stream_lifetime): a connection older than
+# min(RELOAD_AGE_SHARE * lifetime, lifetime - RELOAD_MARGIN_S) gets a new one at the next
+# song change; MPD is held at the song's start for RELOAD_DRAIN_S first, so the speaker plays
+# out its buffer of the song before (WAV carries silence meanwhile). A renderer stopped or
+# TRANSITIONING within LIFETIME_SLACK_S of the length while MPD plays is taken over again
+# behind the gate instead of counting as taken away.
+RELOAD_AGE_SHARE = 0.75
+RELOAD_MARGIN_S = 300
+RELOAD_DRAIN_S = 6
+LIFETIME_SLACK_S = 60
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
@@ -1256,19 +1348,26 @@ _GATE = "gate"
 
 # Start gate phases: our pause 1 is on its way; MPD is held while the speaker wakes and
 # buffers; our pause 0 is on its way.
+# What a gate does once MPD is held: take the room over (a cast start), Play a renderer we
+# paused (a user resume), or set the stream again (a WAV connection near its length).
+_START = "start"
+_RESUME = "resume"
+_RELOAD = "reload"
+
 _PAUSING = "pausing"
 _HOLDING = "holding"
 _RESUMING = "resuming"
 
 
 class _Gate:
-    def __init__(self, song, started, seconds, resume=False):
+    def __init__(self, song, started, seconds, kind=_START, drain_s=0):
         self.phase = _PAUSING
-        # A user resume of a renderer we paused: Play instead of a takeover, and no pre-roll.
-        self.resume = resume
+        self.kind = kind  # _RESUME and _RELOAD renew our own connection; no pre-roll then
+        # _RELOAD: the speaker plays out its buffer until then, before the stream is set again.
+        self.drain_until = started + drain_s if drain_s else None
         self.song = song
         self.started = started
-        self.deadline = started + seconds
+        self.deadline = started + max(seconds, drain_s)
         self.taken = None  # when the last takeover (or restart) in the gate returned
         self.retakes = 0
         self.restarted = False  # a renderer TRANSITIONING on our stream was restarted
@@ -1385,6 +1484,7 @@ class Follower:
         self.stopped_polls = 0
         # We paused the renderer on our stream (a user pause in MPD); its resume is ours.
         self.speaker_paused = False
+        self._connected_at = None  # when we last made the renderer open the stream
         self._requests = []
 
     def on_mpd_connected(self):
@@ -1434,6 +1534,9 @@ class Follower:
             self._start_gate(songid)
         elif state == "play" and self.speaker_paused:
             self._resume_speaker(songid)
+        elif (state == "play" and self.owned and previous != "pause" and songid != previous_song
+              and self._reload_due()):
+            self._reload_stream(songid, "at the song change", RELOAD_DRAIN_S)
         elif state == "play":
             # Only a user resume may wake a zone we own; a song change must not.
             self.wake = previous == "pause" or not self.owned
@@ -1549,24 +1652,65 @@ class Follower:
             self.wake = True
             return self._attempt(_PLAY)
         if self.start_gate_seconds > 0:
-            return self._start_gate(song, resume=True)
+            return self._start_gate(song, _RESUME)
         try:
             self.controller.play_renderer()
         except _ERRORS as e:
             log.warning("MPD resumed; resuming the speaker failed (%r); taking it over", e)
             self.wake = True
             return self._attempt(_PLAY)
+        self._connected()
         log.info("MPD resumed by the user; speaker resumed (AVTransport Play)")
         self._schedule(_POLL)
 
-    def _start_gate(self, song, resume=False):
-        if resume:
+    def _connected(self):
+        self._connected_at = self.clock()
+
+    def _stream_age(self):
+        """(age, lifetime) of the renderer's connection to a stream whose connections last
+        only so long (WAV), or None."""
+        if self._connected_at is None:
+            return None
+        lifetime = self.controller.stream_lifetime()
+        if lifetime is None:
+            return None
+        return self.clock() - self._connected_at, lifetime
+
+    def _reload_due(self):
+        """At a song change: the connection is old enough to be renewed before it runs out."""
+        aged = self._stream_age()
+        return aged is not None and aged[0] > min(RELOAD_AGE_SHARE * aged[1],
+                                                  aged[1] - RELOAD_MARGIN_S)
+
+    def _stream_ran_out(self):
+        aged = self._stream_age()
+        return aged is not None and aged[0] >= aged[1] - LIFETIME_SLACK_S
+
+    def _reload_stream(self, song, why, drain_s):
+        age, lifetime = self._stream_age()
+        log.info("speaker connected to the WAV stream for %.0f s of its %.0f s (%s): setting "
+                 "the stream again", age, lifetime, why)
+        if self.start_gate_seconds > 0:
+            return self._start_gate(song, _RELOAD, drain_s)
+        try:
+            self.controller.reload_stream()
+        except _ERRORS as e:
+            log.warning("setting the stream again failed: %r", e)
+        else:
+            self._connected()
+        self._schedule(_POLL)
+
+    def _start_gate(self, song, kind=_START, drain_s=0):
+        if kind == _START:
+            log.info("holding MPD at the start of the song while the speaker wakes "
+                     "(at most %g s)", self.start_gate_seconds)
+        elif kind == _RESUME:
             log.info("holding MPD at the resume point while the speaker resumes (at most %g s)",
                      self.start_gate_seconds)
         else:
-            log.info("holding MPD at the start of the song while the speaker wakes "
-                     "(at most %g s)", self.start_gate_seconds)
-        self._gate = _Gate(song, self.clock(), self.start_gate_seconds, resume)
+            log.info("holding MPD at the start of the song while the speaker gets a new "
+                     "connection (playing out its buffer for %g s first)", drain_s)
+        self._gate = _Gate(song, self.clock(), self.start_gate_seconds, kind, drain_s)
         self._requests.append(PAUSE_PLAYER)
         # Should our pause never be confirmed, the gate deadline still takes over.
         self.pending, self.deadline = _GATE, self._gate.deadline
@@ -1643,10 +1787,9 @@ class Follower:
         now = self.clock()
         held = (" (song %r held %.1f s)" % (gate.song, now - gate.song_at)
                 if gate.song_at is not None else "")
-        log.info("%s: MPD resumed at +%.1f s%s", "resume" if gate.resume else "start",
-                 now - gate.started, held)
-        # After a resume there is no pre-roll to hand over.
-        self._after_gate = None if gate.resume else (gate, now)
+        log.info("%s: MPD resumed at +%.1f s%s", gate.kind, now - gate.started, held)
+        # Only a cast start has a pre-roll to hand over.
+        self._after_gate = (gate, now) if gate.kind == _START else None
 
     def _preroll_song(self, gate, state, previous, song):
         """The pre-roll's song, replacing the silence after the gate that started on it. The
@@ -1678,8 +1821,10 @@ class Follower:
                  "speaker already playing" if gate.playing else "speaker not playing")
 
     def _gate_take_over(self):
-        if self._gate.resume:
-            return self._gate_play()
+        if self._gate.drain_until is not None:
+            return self._schedule(_GATE)  # _gate_check renews once the buffer played out
+        if self._gate.kind != _START:
+            return self._gate_renew()
         self.wake = True
         self._attempt(_PLAY)
         if self.owned:
@@ -1694,18 +1839,24 @@ class Follower:
             # The takeover failed and is retried later; never keep the phone waiting for it.
             self._release_gate("the takeover failed")
 
-    def _gate_play(self):
-        """The resume gate holds MPD: Play the renderer we paused. Should Play fail, the
-        speaker is taken over instead, still behind the gate."""
+    def _gate_renew(self):
+        """MPD is held: renew our own connection, Play on the renderer we paused (resume) or
+        the stream set again (reload). Should that fail, the speaker is taken over instead,
+        still behind the gate."""
         gate = self._gate
+        if gate.kind == _RESUME:
+            renew, what = self.controller.play_renderer, "AVTransport Play"
+        else:
+            renew, what = self.controller.reload_stream, "SetAVTransportURI, Play"
         try:
-            self.controller.play_renderer()
+            renew()
         except _ERRORS as e:
-            log.warning("resume: AVTransport Play failed (%r); taking the speaker over", e)
-            gate.resume = False
+            log.warning("%s: %s failed (%r); taking the speaker over", gate.kind, what, e)
+            gate.kind = _START
             self.owned = False  # so a failed takeover releases the gate and is retried
             return self._gate_take_over()
-        log.info("resume: AVTransport Play sent at +%.1f s", self.clock() - gate.started)
+        self._connected()
+        log.info("%s: %s sent at +%.1f s", gate.kind, what, self.clock() - gate.started)
         self._give_time()
 
     def _gate_check(self):
@@ -1718,6 +1869,11 @@ class Follower:
             self.wake = True
             return self._attempt(_PLAY)
         gate = self._gate
+        if gate.drain_until is not None:
+            if self.clock() < gate.drain_until:
+                return self._schedule(_GATE)
+            gate.drain_until = None
+            return self._gate_renew()
         try:
             gate.seen = self.controller.renderer_state()
         except _ERRORS as e:
@@ -1756,6 +1912,8 @@ class Follower:
             # A failed retake counts and gets its time too; its error propagates up to the
             # _attempt that runs this gate check, which logs it.
             self._give_time()
+        if decision == TAKE_OVER:
+            self._connected()
         if decision in TAKEN_AWAY:
             self._gate_yield("someone started another source during the takeover")
 
@@ -1766,6 +1924,7 @@ class Follower:
                  "restarting it (Stop, Play)", now - gate.taken)
         try:
             self.controller.restart_renderer()
+            self._connected()
         finally:
             self._give_time()
 
@@ -1827,6 +1986,8 @@ class Follower:
             self._yield(decision)
         else:
             newly_owned, self.owned = not self.owned, True
+            if decision == TAKE_OVER:
+                self._connected()
             self._schedule(_POLL)
             if newly_owned:
                 self._speaker_volume = None  # whatever it was, the phone is shown it
@@ -1840,9 +2001,17 @@ class Follower:
                      _REASONS[verdict])
             self.owned = False
             self.speaker_paused = False
+            self._connected_at = None
             return
         if verdict in TAKEN_AWAY:
             return self._yield(verdict)
+        if (verdict in (NOT_PLAYING, TRANSITIONING) and self.mpd_state == "play"
+                and self._stream_ran_out()):
+            # The Raumfeld stops (or reconnects) once it played the length the WAV header
+            # announces: not the user's doing. A new connection resets the age, so this
+            # happens once per connection.
+            self.stopped_polls, self._stuck = 0, None
+            return self._reload_stream(self.mpd_song, "the zone renderer is %s" % verdict, 0)
         if verdict != NOT_PLAYING:
             self._unstarted = False
         if verdict == NOT_PLAYING and self.mpd_state == "play":
@@ -1885,6 +2054,7 @@ class Follower:
                     now - since, restarts, STUCK_MAX_RESTARTS)
         self.stopped_polls = 0
         self.controller.restart_renderer()
+        self._connected()
 
     def _take_over_unstarted(self):
         log.info("zone renderer has never played since the start gate gave up; taking over "
@@ -1895,6 +2065,8 @@ class Follower:
         # poll, which logs it; polling must go on.
         self._schedule(_POLL)
         decision = self.controller.ensure_playing(wake=True, retake=True)
+        if decision == TAKE_OVER:
+            self._connected()
         if decision in TAKEN_AWAY:
             self.pending = None
             self._yield(decision)
@@ -1909,6 +2081,7 @@ class Follower:
         self.yielded = True
         self.owned = False
         self.speaker_paused = False
+        self._connected_at = None
 
     def _schedule(self, action):
         self.pending = action
