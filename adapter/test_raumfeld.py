@@ -1,7 +1,6 @@
 """Feature: Raumfeld follows the cast -- Controller against a fake Raumfeld host."""
 
 import errno
-import http.server
 import json
 import logging
 import os
@@ -17,7 +16,7 @@ import xml.etree.ElementTree as ET
 import raumfeld_adapter as ra
 from fakes import (LINE_IN_URI, NEW_ZONE_UDN, ROOM_UDN, SPEAKER_UDN, STREAM_URL, ZONE_UDN,
                    FakeDiscovery, FakeRaumfeld, FakeSsdpResponder)
-from test_logic import no_logs, wav_header
+from test_logic import no_logs
 from test_speaker_yield import assert_speaker_left_alone
 
 OTHER_URI = "http://radio.invalid/live.mp3"
@@ -1164,102 +1163,6 @@ class RendererVolumeTest(unittest.TestCase):
         self.checked()
         with self.assertRaises(ra.RaumfeldError):
             self.ctl.get_volume()
-        self.assertEqual(self.rf.requests, [])
-
-
-
-class StreamLifetimeTest(unittest.TestCase):
-    """The WAV stream's header says how long a connection lasts; it is read from the stream
-    once (a short GET, then closed) and kept. Other formats have no limit."""
-
-    def setUp(self):
-        self.served = []
-        self.head = wav_header(data_len=192000 * 600)
-
-        test = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                test.served.append(self.path)
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav")
-                self.end_headers()
-                try:
-                    self.wfile.write(test.head + b"\0" * 20000)  # the live stream goes on
-                except OSError:
-                    pass
-
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-
-    def controller(self, mime="audio/wav", url=None):
-        config = ra.Config.from_env({
-            "RAUMFELD_ROOM_UDN": ROOM_UDN, "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
-            "STREAM_URL": url or "http://127.0.0.1:%d/stream.wav" % self.server.server_port,
-            "STREAM_MIME": mime})
-        return ra.Controller(config, ra.SsdpLocator(lambda st: None, SPEAKER_UDN))
-
-    def test_the_wav_header_gives_the_lifetime_once(self):
-        ctl = self.controller()
-        with self.assertLogs("raumfeld_adapter", "INFO"):
-            self.assertEqual(ctl.stream_lifetime(), 600)
-        self.assertEqual(ctl.stream_lifetime(), 600)
-        self.assertEqual(self.served, ["/stream.wav"])
-
-    def test_other_formats_have_no_lifetime(self):
-        for mime in ("audio/flac", "audio/mpeg"):
-            self.assertIsNone(self.controller(mime).stream_lifetime())
-        self.assertEqual(self.served, [])
-
-    def test_an_unreadable_header_falls_back_and_is_read_again_later(self):
-        self.head = b"not a wav header" * 300
-        ctl = self.controller()
-        with self.assertLogs("raumfeld_adapter", "WARNING"):
-            self.assertEqual(ctl.stream_lifetime(), ra.WAV_FALLBACK_S)
-        self.head = wav_header(data_len=192000 * 600)
-        with self.assertLogs("raumfeld_adapter", "INFO"):
-            self.assertEqual(ctl.stream_lifetime(), 600)
-
-    def test_an_unreachable_stream_falls_back(self):
-        port = self.server.server_port
-        self.server.shutdown()
-        self.server.server_close()
-        ctl = self.controller(url="http://127.0.0.1:%d/stream.wav" % port)
-        with self.assertLogs("raumfeld_adapter", "WARNING"):
-            self.assertEqual(ctl.stream_lifetime(), ra.WAV_FALLBACK_S)
-
-
-class StreamReloadControllerTest(unittest.TestCase):
-    def setUp(self):
-        self.rf = FakeRaumfeld()
-        self.addCleanup(self.rf.close)
-        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
-                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
-                                     "STREAM_URL": STREAM_URL})
-        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
-                                 api_port=self.rf.port, sleep=lambda s: None)
-
-    def tearDown(self):
-        assert_speaker_left_alone(self, self.rf)
-
-    def test_reload_sets_the_stream_again_and_plays_on_the_checked_zone(self):
-        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
-        self.ctl.check()
-        self.rf.requests.clear()
-        self.ctl.reload_stream()
-        self.assertEqual(self.rf.soap_actions(), ["SetAVTransportURI", "Play"])
-        self.assertIn("DIDL-Lite", self.rf.soap_body("SetAVTransportURI"))
-        self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
-        self.assertEqual(self.rf.transport_state, "PLAYING")
-
-    def test_reload_without_a_checked_zone_raises(self):
-        with self.assertRaises(ra.RaumfeldError):
-            self.ctl.reload_stream()
         self.assertEqual(self.rf.requests, [])
 
 

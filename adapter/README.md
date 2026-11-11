@@ -73,27 +73,7 @@ Raumfeld room play the receiver's MPD stream automatically.
   MPD's httpd output keeps streaming silence while paused (`always_on`) with
   the WAV or MP3 encoder, so the speaker can connect and start. **Not with
   FLAC:** MPD's FLAC encoder sends no data while paused, so the speaker stays
-  `TRANSITIONING` until the gate gives up (about 20 s); use WAV.
-- **WAV connections are renewed before they run out.** The Raumfeld honours
-  the data length a WAV header announces: it plays that much, closes the
-  connection, reconnects from 0 twice and then stays `STOPPED`. MPD's httpd
-  WAV header announces `0x0FFFFFFF` bytes, about 23.3 min at 48 kHz 16-bit
-  stereo. With `STREAM_MIME` `audio/wav` the adapter reads the header once from
-  `STREAM_URL` (a short GET, closed after the `data` chunk header;
-  unreadable: 23.3 min, read again next time) and counts how long the
-  renderer's current connection has run, from every takeover, re-takeover,
-  restart, resume `Play` or renewal the adapter made. At a song change (MPD
-  plays a new `songid`, not a user resume) with the connection older than
-  three quarters of the length, or within 5 min of it, it renews the
-  connection behind a gate: MPD held at the song's start, 6 s
-  (`RELOAD_DRAIN_S`) for the speaker to play out its buffer of the previous
-  song (WAV carries silence meanwhile), then `SetAVTransportURI` and `Play`
-  again, `pause 0` once the renderer plays (a failure: the whole takeover,
-  still behind the gate). Safety net: while MPD plays, a renderer `STOPPED` or
-  `TRANSITIONING` on the stream within 60 s of the length is taken over again
-  the same way (no drain) instead of counting as taken away; the new
-  connection resets the count, so this happens once per connection. Another
-  source is still respected. Other formats have no limit. Then it wakes the room and starts the stream as usual,
+  `TRANSITIONING` until the gate gives up (about 20 s); use WAV. Then it wakes the room and starts the stream as usual,
   asks the zone renderer every 0.25 s whether it is `PLAYING` on `STREAM_URL`,
   and sends `pause 0` as soon as it is. **Re-takeover:** if the renderer has not
   loaded or does not play `STREAM_URL` 5 s (`GATE_RETAKE_S`) after the takeover
