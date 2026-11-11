@@ -808,7 +808,9 @@ class PauseFollowScenarioTest(unittest.TestCase):
     def user_pauses(self):
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.follower.on_mpd_state("pause", "1")
-        self.assertEqual(self.rf.soap_actions(), ["GetTransportInfo", "GetMediaInfo", "Pause"])
+        # Looked at, its position read (how much it had buffered), paused.
+        self.assertEqual(self.rf.soap_actions(),
+                         ["GetTransportInfo", "GetMediaInfo", "GetPositionInfo", "Pause"])
         self.assertEqual(self.rf.transport_state, "PAUSED_PLAYBACK")
         self.rf.requests.clear()
 
@@ -832,7 +834,9 @@ class PauseFollowScenarioTest(unittest.TestCase):
         self.assertEqual(self.rf.api_calls(), [])  # no wake, no zone change
         with self.assertLogs("raumfeld_adapter", "INFO"):
             self.gate_tick()
-        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        # MPD set back by what the speaker had buffered, then released.
+        self.assertEqual(self.requests(), [ra.SEEK_BACK, ra.RESUME_PLAYER])
+        self.assertEqual(self.follower.take_seek_back(), ra.DEFAULT_LEAD_S)
         self.follower.on_mpd_state("play", "1")
         self.assertEqual(self.rf.current_uri, STREAM_URL)
         self.assertEqual(self.rf.transport_state, "PLAYING")

@@ -62,6 +62,7 @@ class FakeRaumfeld:
         self.fail_paths = set()  # substrings of paths that answer 500
         self.fail_actions = set()  # SOAP actions that answer 500 (a UPnP fault)
         self.volume = 30  # the zone renderer's RenderingControl volume, 0-100
+        self.rel_time = "0:00:00"  # GetPositionInfo RelTime: what the speaker has played
         self.rendering_control = True  # False: the description lists no RenderingControl
         self.control_url = "AVTransport/ctrl"  # as advertised in the device description
         self.description_udn = None  # the UDN the description names, if not the zone's
@@ -229,6 +230,8 @@ class FakeRaumfeld:
         elif action == "Pause":
             if self.transport_state == "PLAYING":
                 self.transport_state = "PAUSED_PLAYBACK"
+        elif action == "GetPositionInfo":
+            out = "<Track>1</Track><RelTime>%s</RelTime>" % _xml_escape(self.rel_time)
         else:
             raise AssertionError("unknown SOAP action " + action)
         return (
@@ -377,6 +380,8 @@ class FakeMpd:
         # next player change after the one of our pause 0 ("next").
         self.handover_on_resume = None
         self.volume = 100  # MPD's (null) mixer volume
+        # seekcur: "ok", "ack" (e.g. a stream that can't seek yet) or "hang" (never answers)
+        self.seek = "ok"
         self.connections = 0
         self.commands = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -447,6 +452,12 @@ class FakeMpd:
                             state, songid, elapsed = "pause", handover, 0.0
                         else:
                             states.insert(0, ("pause", handover, 0.0))
+                    f.write(b"OK\n")
+                elif cmd.startswith("seekcur ") and self.seek == "hang":
+                    continue
+                elif cmd.startswith("seekcur ") and self.seek == "ack":
+                    f.write(b"ACK [2@0] {seekcur} Not seekable\n")
+                elif cmd.startswith("seekcur "):
                     f.write(b"OK\n")
                 elif cmd.startswith("setvol "):
                     self.volume, mixer_by_client = int(cmd.split()[1]), True

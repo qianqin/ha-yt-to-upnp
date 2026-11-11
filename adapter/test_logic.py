@@ -435,6 +435,9 @@ class RecordingController:
         self.speaker_volume = 30
         self.volume_fail = None
         self.rendering = True  # the renderer has RenderingControl
+        self.position_calls = []
+        self.heard = None  # GetPositionInfo RelTime in seconds; None: unknown
+        self.position_fail = None
         self.plays = True
         self.plays_fail = None
         self.renderer = "STOPPED"  # what renderer_state reports while not playing
@@ -487,6 +490,12 @@ class RecordingController:
         self.calls.append("play_renderer")
         if self.play_fail:
             raise self.play_fail
+
+    def position(self):
+        self.position_calls.append(self.clock.now if self.clock else None)
+        if self.position_fail:
+            raise self.position_fail
+        return self.heard
 
     def has_volume(self):
         return self.rendering
@@ -1886,6 +1895,8 @@ class PauseFollowTest(unittest.TestCase):
             self.f.on_mpd_state("pause", "1")  # our pause 1
         # Looked at again right before Play: still paused on our stream.
         self.assertEqual(self.ctl.calls, ["renderer_state", "renderer_state", "play_renderer"])
+        # MPD is set back by what the speaker had buffered (ResumeCompensationTest).
+        self.assertEqual(self.requests(), [ra.SEEK_BACK])
         self.ctl.renderer = "TRANSITIONING"  # reconnecting to the stream
         self.advance(ra.GATE_POLL_S)
         self.assertEqual(self.requests(), [])
@@ -1906,6 +1917,7 @@ class PauseFollowTest(unittest.TestCase):
             self.f.on_mpd_state("play", "1")
             self.requests()
             self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.requests(), [ra.SEEK_BACK])
         self.ctl.renderer = "STOPPED"  # Play dropped
         with self.assertLogs("raumfeld_adapter", "INFO"):
             for _ in range(GATE_LOOKS):
@@ -2409,7 +2421,7 @@ class FlacReleaseTest(unittest.TestCase):
             self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
             self.f.on_mpd_state("pause", "1")
         self.assertEqual(self.ctl.calls, ["renderer_state", "renderer_state", "play_renderer"])
-        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.assertEqual(self.requests(), [ra.SEEK_BACK, ra.RESUME_PLAYER])
 
 
 
@@ -2426,6 +2438,154 @@ class NoRenderingControlTest(unittest.TestCase):
                 f.tick()
             f.on_mpd_volume(70)
         self.assertEqual(ctl.volume_calls, [])
+
+
+
+class RelTimeTest(unittest.TestCase):
+    def test_reltime_is_parsed_to_seconds(self):
+        self.assertEqual(ra.reltime_seconds("0:01:05"), 65)
+        self.assertEqual(ra.reltime_seconds("1:02:03"), 3723)
+        self.assertEqual(ra.reltime_seconds("00:00:07.500"), 7.5)
+        for bad in ("", "NOT_IMPLEMENTED", "1:60:00", "-0:00:01", "0:1:2", "x" * 70):
+            self.assertIsNone(ra.reltime_seconds(bad), bad)
+
+
+class ResumeCompensationTest(unittest.TestCase):
+    """The speaker has some of the stream buffered when it is paused, and drops it when Play
+    reconnects it: MPD is that much ahead of what was heard. At the pause the lead is
+    measured (time since our Play connected it, less RelTime); at the resume of the same song
+    MPD is set back by it (seekcur, while still held) before it is released."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.ctl.clock = self.clock
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=15,
+                             hold_until_playing=False)
+
+    def requests(self):
+        return self.f.take_mpd_requests()
+
+    def playing(self):
+        """A FLAC cast start: the speaker is connected at the takeover's Play."""
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertEqual(self.requests(), [ra.RESUME_PLAYER])
+        self.f.on_mpd_state("play", "1")
+        self.ctl.calls.clear()
+
+    def paused_after(self, seconds, heard):
+        self.playing()
+        self.clock.now += seconds
+        self.ctl.heard = heard
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("pause", "1")
+        return logs.output
+
+    def resumed(self):
+        with self.assertLogs("raumfeld_adapter", "INFO") as logs:
+            self.f.on_mpd_state("play", "1")
+            self.assertEqual(self.requests(), [ra.PAUSE_PLAYER])
+            self.f.on_mpd_state("pause", "1")
+        return logs.output
+
+    def test_the_measured_lead_is_taken_back_at_the_resume(self):
+        logs = self.paused_after(100, 98)  # 2 s not heard, less half RelTime's resolution
+        self.assertTrue(any("1.5 s" in m for m in logs), logs)
+        self.resumed()
+        self.assertEqual(self.requests(), [ra.SEEK_BACK, ra.RESUME_PLAYER])  # seek first
+        self.assertEqual(self.f.take_seek_back(), 1.5)
+        self.assertIsNone(self.f.take_seek_back())  # handed out once
+
+    def test_the_lead_is_measured_before_the_pause(self):
+        self.paused_after(100, 98)
+        self.assertEqual(self.ctl.position_calls, [self.clock.now])
+        self.assertEqual(self.ctl.calls, ["renderer_state", "pause_renderer"])
+
+    def test_an_unknown_or_odd_lead_is_one_second(self):
+        for heard, fail in ((None, None), (98, OSError("timeout")), (100, None), (90, None),
+                            (99.5, None)):
+            with self.subTest(heard=heard, fail=fail):
+                self.setUp()
+                self.ctl.position_fail = fail
+                self.paused_after(100, heard)
+                self.resumed()
+                self.assertEqual(self.requests(), [ra.SEEK_BACK, ra.RESUME_PLAYER])
+                self.assertEqual(self.f.take_seek_back(), ra.DEFAULT_LEAD_S)
+
+    def test_a_resume_after_a_retake_measures_from_the_new_connection(self):
+        self.paused_after(100, 98)
+        self.resumed()
+        self.requests()
+        self.f.take_seek_back()
+        self.f.on_mpd_state("play", "1")  # our pause 0: the speaker reconnected at Play
+        self.ctl.calls.clear()
+        self.ctl.plays = True
+        self.clock.now += 30
+        self.ctl.heard = 28  # 30 s since the resume Play, 28 heard
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")
+        self.resumed()
+        self.requests()
+        self.assertEqual(self.f.take_seek_back(), 1.5)
+
+    def test_no_compensation_for_another_song(self):
+        self.paused_after(100, 98)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "2")
+            self.requests()
+            self.f.on_mpd_state("pause", "2")
+        self.assertNotIn(ra.SEEK_BACK, self.requests())
+        self.assertIsNone(self.f.take_seek_back())
+
+    def test_no_compensation_when_the_speaker_left_the_pause(self):
+        self.paused_after(100, 98)
+        self.ctl.renderer = "STOPPED"
+        self.ctl.verdict = ra.NOT_PLAYING
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+        self.assertNotIn(ra.SEEK_BACK, self.requests())
+        self.assertIsNone(self.f.take_seek_back())
+
+    def test_no_compensation_after_a_pause_that_was_not_followed(self):
+        self.playing()
+        self.ctl.plays, self.ctl.renderer = False, "STOPPED"
+        self.f.on_mpd_state("pause", "1")
+        self.f.on_mpd_state("play", "1")
+        self.assertNotIn(ra.SEEK_BACK, self.requests())
+
+    def test_no_compensation_without_the_gate(self):
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
+        f.on_mpd_state("play", "1")
+        self.clock.now += 100
+        self.ctl.heard = 98
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("pause", "1")
+            f.on_mpd_state("play", "1")
+        self.assertEqual(f.take_mpd_requests(), [])
+        self.assertIsNone(f.take_seek_back())
+
+    def test_the_lead_is_taken_back_with_the_hold_too(self):
+        self.f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=15)
+        self.ctl.plays = True
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("play", "1")
+            self.requests()
+            self.f.on_mpd_state("pause", "1")
+            self.f.tick()
+        self.requests()
+        self.f.on_mpd_state("play", "1")
+        self.clock.now += 100
+        self.ctl.heard = 98
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1")
+        self.resumed()
+        self.assertEqual(self.requests(), [ra.SEEK_BACK])  # pause 0 once the speaker plays
+        self.assertEqual(self.f.take_seek_back(), 1.5)
 
 
 if __name__ == "__main__":

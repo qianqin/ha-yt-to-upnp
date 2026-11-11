@@ -1166,5 +1166,29 @@ class RendererVolumeTest(unittest.TestCase):
         self.assertEqual(self.rf.requests, [])
 
 
+
+class RendererPositionTest(unittest.TestCase):
+    def setUp(self):
+        self.rf = FakeRaumfeld()
+        self.addCleanup(self.rf.close)
+        config = ra.Config.from_env({"RAUMFELD_ROOM_UDN": ROOM_UDN,
+                                     "RAUMFELD_SPEAKER_UDN": SPEAKER_UDN,
+                                     "STREAM_URL": STREAM_URL})
+        self.ctl = ra.Controller(config, ra.SsdpLocator(FakeDiscovery(self.rf), SPEAKER_UDN),
+                                 api_port=self.rf.port, sleep=lambda s: None)
+
+    def test_position_is_the_renderers_reltime(self):
+        self.rf.power, self.rf.current_uri, self.rf.transport_state = "ACTIVE", STREAM_URL, "PLAYING"
+        self.ctl.check()
+        self.rf.rel_time = "0:03:20"
+        self.assertEqual(self.ctl.position(), 200)
+        self.rf.rel_time = "NOT_IMPLEMENTED"
+        self.assertIsNone(self.ctl.position())
+
+    def test_position_without_a_checked_zone_raises(self):
+        with self.assertRaises(ra.RaumfeldError):
+            self.ctl.position()
+
+
 if __name__ == "__main__":
     unittest.main()

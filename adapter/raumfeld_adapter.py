@@ -291,6 +291,18 @@ def phone_volume(speaker, max_volume):
     return max(0, min(100, (200 * speaker + max_volume) // (2 * max_volume)))
 
 
+_RELTIME = re.compile(r"([0-9]{1,4}):([0-5][0-9]):([0-5][0-9])(\.[0-9]{1,6})?")
+
+
+def reltime_seconds(text):
+    """GetPositionInfo's RelTime (H:MM:SS, optional fraction) in seconds, or None."""
+    m = _RELTIME.fullmatch(text)
+    if not m:
+        return None
+    h, mi, sec, frac = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + int(sec) + (float(frac) if frac else 0)
+
+
 def build_didl(stream_url, mime):
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -866,6 +878,12 @@ class Controller:
         soap_call(control, "Play", [("Speed", "1")])
         log.info("zone %r restarted (Stop, Play)", self._zone)
 
+    def position(self):
+        """Seconds the zone renderer has played of its current connection (RelTime), or None
+        if it doesn't say."""
+        info = soap_call(self._known_control(), "GetPositionInfo", [])
+        return reltime_seconds(info.get("RelTime", "")[:MAX_STATE_LEN])
+
     def pause_renderer(self):
         """Pause on the zone renderer of the last takeover or look: a user pause in MPD,
         which the speaker would otherwise only hear once its buffer has run out."""
@@ -1115,6 +1133,18 @@ class MpdClient:
             raise MpdError("status with invalid volume %r" % volume[:40])
         return None if volume == "-1" else int(volume)
 
+    def seek_back(self, seconds):
+        """`seekcur -<seconds>`, relative, while MPD is held paused (it stays paused). Bounded
+        to SEEK_TIMEOUT_S: a stream that can't seek yet may keep MPD busy; a timeout leaves the
+        connection unusable and is raised like a lost one."""
+        if type(seconds) not in (int, float) or not 0 < seconds <= MAX_LEAD_S:
+            raise ValueError("refusing seek back %r" % (seconds,))
+        self.sock.settimeout(SEEK_TIMEOUT_S)
+        try:
+            self._command("seekcur -%.3f" % seconds)
+        finally:
+            self.sock.settimeout(self.timeout)
+
     def set_volume(self, volume):
         if type(volume) is not int or not 0 <= volume <= 100:
             raise ValueError("refusing MPD volume %r" % (volume,))
@@ -1254,11 +1284,22 @@ GATE_MAX_RETAKES = 2
 # the phone can't pause a song it hasn't played yet so soon after the hand-over.
 AFTER_GATE_HANDOVER_S = 5
 HANDOVER_ELAPSED_S = 1.0
+# Resume compensation. When a user pause is followed to the speaker, it has some of the stream
+# buffered that it never plays (Play reconnects it): MPD is that far ahead of what was heard.
+# Measured at the pause as the time since our Play connected the speaker less its RelTime,
+# less half RelTime's 1 s resolution; anything outside MIN_LEAD_S..MAX_LEAD_S, or unknown,
+# counts as DEFAULT_LEAD_S (measured live: 0.8-1.0 s). At the resume of the same song MPD is
+# set back by it (seekcur) while the resume gate holds it, at most SEEK_TIMEOUT_S.
+DEFAULT_LEAD_S = 1.0
+MIN_LEAD_S = 0.1
+MAX_LEAD_S = 3.0
+SEEK_TIMEOUT_S = 2
 
 # What the Follower asks run() to do on the MPD connection.
 PAUSE_PLAYER = "pause"
 RESUME_PLAYER = "resume"
 RELEASE_CAST = "release_cast"
+SEEK_BACK = "seek_back"  # seekcur -take_seek_back(), before the resume's pause 0
 
 _PLAY = "ensure_playing"
 _POLL = "check"
@@ -1273,6 +1314,8 @@ _RESUMING = "resuming"
 
 class _Gate:
     def __init__(self, song, started, seconds, resume=False):
+        self.lead = None  # resume: how far to set MPD back before it is released ...
+        self.lead_song = song  # ... as long as it holds the song that was paused
         self.phase = _PAUSING
         # A user resume of a renderer we paused: Play instead of a takeover, and no pre-roll.
         self.resume = resume
@@ -1403,6 +1446,9 @@ class Follower:
         self.stopped_polls = 0
         # We paused the renderer on our stream (a user pause in MPD); its resume is ours.
         self.speaker_paused = False
+        self._connected_at = None  # when our Play last connected the renderer to the stream
+        self._lead = None  # what the speaker had buffered when we paused it
+        self._seek_back = None  # what SEEK_BACK is to take back
         self._requests = []
 
     def on_mpd_connected(self):
@@ -1495,6 +1541,29 @@ class Follower:
         log.info("volume %d %% from the phone: speaker volume %d (of max %d)", volume, target,
                  self.max_volume)
 
+    def take_seek_back(self):
+        """The seconds for SEEK_BACK, or None; handed out once."""
+        seconds, self._seek_back = self._seek_back, None
+        return seconds
+
+    def _connected(self):
+        self._connected_at = self.clock()
+
+    def _measure_lead(self):
+        """(seconds, how) the speaker has received of the stream but not played."""
+        if self._connected_at is not None:
+            try:
+                heard = self.controller.position()
+            except _ERRORS as e:
+                log.debug("position of the renderer failed: %r", e)
+                heard = None
+            if heard is not None:
+                lead = self.clock() - self._connected_at - heard - 0.5
+                if MIN_LEAD_S <= lead <= MAX_LEAD_S:
+                    return lead, "measured"
+                log.debug("odd lead %.1f s (RelTime %.1f s)", lead, heard)
+        return DEFAULT_LEAD_S, "default"
+
     def take_mpd_volume(self):
         """The volume run() is to give MPD now (setvol), or None; handed out once."""
         volume, self._mpd_volume = self._mpd_volume, None
@@ -1552,18 +1621,21 @@ class Follower:
             if seen != "PLAYING":
                 log.debug("MPD paused; speaker not paused (renderer %r)", seen)
                 return
+            lead, how = self._measure_lead()
             self.controller.pause_renderer()
         except _ERRORS as e:
             log.warning("MPD paused; pausing the speaker failed: %r", e)
             return
-        self.speaker_paused = True
-        log.info("MPD paused by the user; speaker paused too (AVTransport Pause)")
+        self.speaker_paused, self._lead = True, lead
+        log.info("MPD paused by the user; speaker paused too (AVTransport Pause), %.1f s "
+                 "behind MPD (%s)", lead, how)
 
     def _resume_speaker(self, song):
         """A user resume of a renderer we paused. Still paused on our stream: Play, behind the
         gate (the renderer reconnects to the stream). Playing another source: chosen during
         the pause, so it is not taken back. Anything else: a play as without the pause."""
         self.speaker_paused = False
+        lead, self._lead = self._lead, None
         try:
             seen = self.controller.renderer_state()
         except _ERRORS as e:
@@ -1579,13 +1651,16 @@ class Follower:
             self.wake = True
             return self._attempt(_PLAY)
         if self.start_gate_seconds > 0:
-            return self._start_gate(song, resume=True)
+            self._start_gate(song, resume=True)
+            self._gate.lead = lead
+            return
         try:
             self.controller.play_renderer()
         except _ERRORS as e:
             log.warning("MPD resumed; resuming the speaker failed (%r); taking it over", e)
             self.wake = True
             return self._attempt(_PLAY)
+        self._connected()
         log.info("MPD resumed by the user; speaker resumed (AVTransport Play)")
         self._schedule(_POLL)
 
@@ -1739,10 +1814,17 @@ class Follower:
         if seen != "PAUSED_PLAYBACK":
             return self._gate_fallback("speaker no longer paused on our stream (renderer %r)"
                                        % seen)
+        if gate.lead and gate.song == gate.lead_song:
+            # Still held: set MPD back to where the speaker was heard before pause 0.
+            self._seek_back, gate.lead = gate.lead, None
+            self._requests.append(SEEK_BACK)
         try:
             self.controller.play_renderer()
         except _ERRORS as e:
+            self._seek_back = None
+            self._requests = [r for r in self._requests if r != SEEK_BACK]
             return self._gate_fallback("AVTransport Play failed: %r" % e)
+        self._connected()
         log.info("resume: AVTransport Play sent at +%.1f s", self.clock() - gate.started)
         self._gate_connected()
 
@@ -1821,6 +1903,8 @@ class Follower:
             # A failed retake counts and gets its time too; its error propagates up to the
             # _attempt that runs this gate check, which logs it.
             self._give_time()
+        if decision == TAKE_OVER:
+            self._connected()
         if decision in TAKEN_AWAY:
             self._gate_yield("someone started another source during the takeover")
 
@@ -1831,6 +1915,7 @@ class Follower:
                  "restarting it (Stop, Play)", gate.label, now - gate.taken)
         try:
             self.controller.restart_renderer()
+            self._connected()
         finally:
             self._give_time()
 
@@ -1892,6 +1977,8 @@ class Follower:
             self._yield(decision)
         else:
             newly_owned, self.owned = not self.owned, True
+            if decision == TAKE_OVER:
+                self._connected()
             self._schedule(_POLL)
             if newly_owned:
                 self._speaker_volume = None  # whatever it was, the phone is shown it
@@ -1950,6 +2037,7 @@ class Follower:
                     now - since, restarts, STUCK_MAX_RESTARTS)
         self.stopped_polls = 0
         self.controller.restart_renderer()
+        self._connected()
 
     def _take_over_unstarted(self):
         log.info("zone renderer has never played since the start gate gave up; taking over "
@@ -1960,6 +2048,8 @@ class Follower:
         # poll, which logs it; polling must go on.
         self._schedule(_POLL)
         decision = self.controller.ensure_playing(wake=True, retake=True)
+        if decision == TAKE_OVER:
+            self._connected()
         if decision in TAKEN_AWAY:
             self.pending = None
             self._yield(decision)
@@ -1992,7 +2082,9 @@ def _serve_requests(follower, mpd):
             return _serve_volume(follower, mpd)
         for i, request in enumerate(requests):
             try:
-                if request in (PAUSE_PLAYER, RESUME_PLAYER):
+                if request == SEEK_BACK:
+                    _seek_back(follower, mpd)
+                elif request in (PAUSE_PLAYER, RESUME_PLAYER):
                     if request == PAUSE_PLAYER:
                         mpd.pause()
                     else:
@@ -2004,9 +2096,25 @@ def _serve_requests(follower, mpd):
                 else:
                     _send_release(mpd)
             except BaseException:
-                # The connection is gone; what is left must still go out after the reconnect.
-                follower.requeue_mpd_requests(requests[i:])
+                # The connection is gone; what is left must still go out after the reconnect,
+                # but not a seek that may have hung it: the resume goes on without it.
+                follower.requeue_mpd_requests(requests[i + 1:] if request == SEEK_BACK
+                                              else requests[i:])
                 raise
+
+
+def _seek_back(follower, mpd):
+    seconds = follower.take_seek_back()
+    if seconds is None:
+        return
+    try:
+        mpd.seek_back(seconds)
+    except MpdError as e:
+        # e.g. a song that can't be sought yet: resume where MPD is.
+        log.warning("resume: MPD refused to go back %.1f s (%s); resuming without it",
+                    seconds, e)
+        return
+    log.info("resume: MPD set back %.1f s, to where the speaker was heard", seconds)
 
 
 def _serve_volume(follower, mpd):

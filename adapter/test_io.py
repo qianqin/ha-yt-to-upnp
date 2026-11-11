@@ -843,5 +843,87 @@ class RunLoopVolumeTest(unittest.TestCase):
         self.assertEqual(ctl.volume_calls, ["get_volume"])  # no SetVolume for our own setvol
 
 
+
+class SeekBackTest(unittest.TestCase):
+    """seekcur while MPD is held: bounded, and a refusal never stops the resume."""
+
+    def client(self, mpd):
+        self.addCleanup(mpd.close)
+        client = ra.MpdClient("127.0.0.1", mpd.port)
+        self.addCleanup(client.close)
+        return client
+
+    def test_seek_back_is_a_relative_seekcur(self):
+        mpd = FakeMpd([["pause"]])
+        self.client(mpd).seek_back(1.5)
+        self.assertEqual(mpd.commands, ["seekcur -1.500"])
+
+    def test_seek_back_refuses_what_is_no_lead(self):
+        mpd = FakeMpd([["pause"]])
+        client = self.client(mpd)
+        for bad in (0, -1, ra.MAX_LEAD_S + 0.1, "1", True, float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                client.seek_back(bad)
+        self.assertEqual(mpd.commands, [])
+
+    def test_a_seek_that_hangs_is_bounded(self):
+        mpd = FakeMpd([["pause"]])
+        mpd.seek = "hang"
+        client = self.client(mpd)
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            client.seek_back(1.0)
+        self.assertLess(time.monotonic() - started, ra.SEEK_TIMEOUT_S + 1)
+
+    def serve(self, mpd, seek_back):
+        class Follower:
+            requests = [ra.SEEK_BACK, ra.RESUME_PLAYER]
+            requeued = []
+
+            def take_mpd_requests(self):
+                out, self.requests = self.requests, []
+                return out
+
+            def take_seek_back(self):
+                return seek_back
+
+            def take_mpd_volume(self):
+                return None
+
+            def on_mpd_state(self, *args):
+                pass
+
+            def requeue_mpd_requests(self, requests):
+                self.requeued = list(requests)
+
+        follower = Follower()
+        client = self.client(mpd)
+        return follower, client
+
+    def test_the_seek_goes_out_before_pause_0(self):
+        mpd = FakeMpd([["pause"]])
+        follower, client = self.serve(mpd, 1.5)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            ra._serve_requests(follower, client)
+        cmds = [c for c in mpd.commands if c != "status"]
+        self.assertEqual(cmds, ["seekcur -1.500", "pause 0"])
+
+    def test_a_refused_seek_is_logged_and_mpd_still_resumes(self):
+        mpd = FakeMpd([["pause"]])
+        mpd.seek = "ack"
+        follower, client = self.serve(mpd, 1.5)
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            ra._serve_requests(follower, client)
+        self.assertIn("pause 0", mpd.commands)
+
+    def test_a_seek_that_hangs_is_not_sent_again_after_the_reconnect(self):
+        mpd = FakeMpd([["pause"]])
+        mpd.seek = "hang"
+        follower, client = self.serve(mpd, 1.5)
+        with self.assertRaises(OSError):
+            ra._serve_requests(follower, client)
+        self.assertEqual(follower.requeued, [ra.RESUME_PLAYER])
+
+
 if __name__ == "__main__":
     unittest.main()
