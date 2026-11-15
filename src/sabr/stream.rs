@@ -1085,8 +1085,7 @@ fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), Sa
     state.ustreamer_config = player.ustreamer_config.clone();
     if let Some(po_token) = &player.po_token {
         state.po_token = Some(po_token.clone());
-    }
-    let cookie_audio = state
+    }    let cookie_audio = state
         .playback_cookie
         .as_deref()
         .and_then(|bytes| vs::PlaybackCookie::decode(bytes).ok())
@@ -2341,6 +2340,15 @@ impl HttpReloader {
         player_request(&self.http, &self.video_id, target, None, None, token)
     }
 
+    /// The PoToken a reload brings: a fresh one after a stall, none (keep the
+    /// old one) for a server-requested reload.
+    async fn reload_po_token(&self, reason: ReloadReason<'_>) -> Option<Vec<u8>> {
+        match reason {
+            ReloadReason::Stalled => self.fresh_po_token().await,
+            ReloadReason::Requested { .. } => None,
+        }
+    }
+
     /// A fresh PoToken for this song from bgutil-pot; `None` keeps the old one.
     async fn fresh_po_token(&self) -> Option<Vec<u8>> {
         let fresh = fetch_pot_token(&self.http, Some(&self.video_id)).await;
@@ -2365,10 +2373,7 @@ impl PlayerReloader for HttpReloader {
                 ReloadClient::Anonymous(_) => player.server_abr_streaming_url,
             };
             check_streaming_url(&server_url)?;
-            let po_token = match reason {
-                ReloadReason::Stalled => self.fresh_po_token().await,
-                ReloadReason::Requested { .. } => None,
-            };
+            let po_token = self.reload_po_token(reason).await;
             Ok(ReloadedPlayer {
                 server_url,
                 ustreamer_config: player.ustreamer_config,
@@ -4345,6 +4350,11 @@ mod tests {
         let (mut state, tx, _rx) = stalled_stream();
         state.audio_max_segment = 6;
         state.audio_initialized = true;
+        // A video format id distinct from the audio one, so the audio entries
+        // below can only be the audio's.
+        let video_id = misc::FormatId { itag: Some(278), last_modified: Some(7), xtags: None };
+        state.video_format_id = video_id.clone();
+        assert_ne!(state.audio_format_id, video_id);
         let mut cycle = RecordingCycle {
             sent: Vec::new(),
             inner: StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() },
@@ -4356,9 +4366,11 @@ mod tests {
         let after = cycle.sent.last().unwrap();
         assert_eq!(after.streamer_context.as_ref().unwrap().po_token.as_deref(), Some(FRESH_POTOKEN));
         let audio_id = state.audio_format_id.clone();
-        let audio_range = after.buffered_ranges.iter().find(|r| r.format_id == audio_id).expect("audio range");
-        assert_eq!((audio_range.end_segment_index, audio_range.duration_ms), (6, STALL_MS));
-        assert!(after.selected_format_ids.contains(&audio_id), "{:?}", after.selected_format_ids);
+        assert_ne!(audio_id, video_id);
+        let audio_ranges: Vec<_> = after.buffered_ranges.iter().filter(|r| r.format_id == audio_id).collect();
+        assert_eq!(audio_ranges.len(), 1, "{:?}", after.buffered_ranges);
+        assert_eq!((audio_ranges[0].end_segment_index, audio_ranges[0].duration_ms), (6, STALL_MS));
+        assert_eq!(after.selected_format_ids, vec![video_id, audio_id]);
         assert_eq!(after.client_abr_state.as_ref().unwrap().player_time_ms, Some(STALL_MS - 10_000));
     }
 
@@ -4420,7 +4432,9 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(r.fresh_po_token().await, Some(vec![1, 2, 3]));
+        // A server-requested reload keeps the old token and asks nobody.
+        assert_eq!(r.reload_po_token(ReloadReason::Requested { token: Some("tok") }).await, None);
+        assert_eq!(r.reload_po_token(ReloadReason::Stalled).await, Some(vec![1, 2, 3]));
         let request = server.await.unwrap();
         assert!(request.contains("/get_pot"), "{request}");
         assert!(request.contains(r#""content_binding":"dQw4w9WgXcQ""#), "{request}");

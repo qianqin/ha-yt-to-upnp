@@ -144,6 +144,13 @@ const NEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// A /next answer is some 100-500 KB; anything past this is not one.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// The /next answer as JSON, read up to `MAX_RESPONSE_BYTES`.
+async fn read_next_json(resp: reqwest::Response) -> Result<serde_json::Value> {
+    use futures_util::TryStreamExt;
+    let body = read_capped(resp.bytes_stream().map_err(|e| e.without_url()), MAX_RESPONSE_BYTES).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
 /// Read a response body, failing once it grows past `max` bytes.
 async fn read_capped<S, E>(mut body: S, max: usize) -> Result<Vec<u8>>
 where
@@ -223,9 +230,7 @@ pub async fn fetch_next(
     if !resp.status().is_success() {
         return Err(format!("/next HTTP {}", resp.status()).into());
     }
-    use futures_util::TryStreamExt;
-    let body = read_capped(resp.bytes_stream().map_err(|e| e.without_url()), MAX_RESPONSE_BYTES).await?;
-    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let json = read_next_json(resp).await?;
     if std::env::var_os(DEBUG_ENV).is_some() {
         let set = &json["contents"]["singleColumnWatchNextResults"]["autoplay"];
         tracing::info!("[next] response keys: {}", json_shape(&json, 2));
@@ -315,6 +320,24 @@ mod tests {
         assert_eq!(read_capped(chunks(3), 30).await.unwrap().len(), 30);
         let err = read_capped(chunks(4), 30).await.unwrap_err();
         assert!(err.to_string().contains("larger than 30 bytes"), "{err}");
+    }
+
+    fn http_response(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::new(reqwest::Body::from(body)))
+    }
+
+    #[tokio::test]
+    async fn the_next_answer_is_capped_at_four_megabytes() {
+        assert_eq!(MAX_RESPONSE_BYTES, 4 * 1024 * 1024);
+        // Valid JSON of exactly the cap: `{}` padded with spaces.
+        let mut fits = b"{}".to_vec();
+        fits.resize(MAX_RESPONSE_BYTES, b' ');
+        assert_eq!(read_next_json(http_response(fits)).await.unwrap(), serde_json::json!({}));
+
+        let mut too_big = b"{}".to_vec();
+        too_big.resize(MAX_RESPONSE_BYTES + 1, b' ');
+        let err = read_next_json(http_response(too_big)).await.unwrap_err();
+        assert!(err.to_string().contains("larger than 4194304 bytes"), "{err}");
     }
 
     #[test]
