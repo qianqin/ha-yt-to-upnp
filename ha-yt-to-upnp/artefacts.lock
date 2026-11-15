@@ -2,4 +2,4 @@
 # the url and checks the sha256 unless artefacts/ is in the build context.
 version: 0.4.2
 url: https://github.com/qianqin/ha-yt-to-upnp/releases/download/v0.4.2/ha-yt-to-upnp-artefacts-0.4.2-amd64.tar.gz
-sha256: 653ac2b862e4e433ca17c1e394bddec65c686e1631dfed16f111f9633ecf688f
+sha256: 9fb1996d0f5567e90163b954003d07813d2dbbca7283fc2311640924ad596613
