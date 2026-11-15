@@ -9,15 +9,25 @@ The run script is run with bash on a copy whose helper path points to a temporar
 bashio's log functions and s6-setuidgid are stubbed (the stub records the command it would
 run, nothing is started).
 
-Runs on the host with bash 4.3 or later (as in the image; not macOS's 3.2),
-no Docker: python3 -I scripts/ha_potoken_run_test.py
+EntryFileSetsTheUserAgent runs the entry file under Deno with the run script's restrictions,
+bgutil's src/main.ts replaced by a stub that makes one request through bgutil's axios to a
+local listener (no internet). It needs deno and bgutil's node_modules: by default Homebrew's
+deno and the assembled folder's dist/ha-yt-to-upnp/artefacts/bgutil (skipped without them);
+scripts/smoke-ha-app.sh also runs it in the image, against the installed /opt/bgutil as the
+potoken user (YTCAST_TEST_BGUTIL_DIR, YTCAST_TEST_ENTRY, YTCAST_TEST_DENO,
+YTCAST_TEST_DENO_USER).
+
+Runs on the host, no Docker: python3 -I scripts/ha_potoken_run_test.py
 """
+import http.server
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,8 +51,9 @@ DENO_FLAGS = [
 ]
 
 
-def run_script(tz):
-    """(argv given to s6-setuidgid, log lines) of the run script, TZ set to tz (None: unset)."""
+def run_script(tz, date_output=None):
+    """(argv given to s6-setuidgid, log lines) of the run script, TZ set to tz (None: unset).
+    With date_output, a date stub on PATH prints it instead of the real offset."""
     with tempfile.TemporaryDirectory() as tmp:
         app = os.path.join(tmp, "bgutil")
         os.mkdir(app)
@@ -57,6 +68,10 @@ def run_script(tz):
         with open(os.path.join(bin_dir, "s6-setuidgid"), "w") as f:
             f.write(STUB)
         os.chmod(os.path.join(bin_dir, "s6-setuidgid"), 0o755)
+        if date_output is not None:
+            with open(os.path.join(bin_dir, "date"), "w") as f:
+                f.write("#!/bin/sh\necho '%s'\n" % date_output)
+            os.chmod(os.path.join(bin_dir, "date"), 0o755)
         argv_out = os.path.join(tmp, "argv.json")
         env = {"PATH": bin_dir + ":/usr/bin:/bin", "ARGV_OUT": argv_out}
         if tz is not None:
@@ -129,6 +144,39 @@ class TimeZoneIsLogged(unittest.TestCase):
                 self.assertIn("UTC offset", warnings[0])
                 self.assertTrue([l for l in log if l.startswith("INFO ") and "UTC+0000" in l], log)
 
+    def test_negative_zero_offset_warns(self):
+        _, log = run_script("Europe/Berlin", date_output="-0000")
+        self.assertTrue([l for l in log if l.startswith("INFO ") and "UTC-0000" in l], log)
+        warnings = [l for l in log if l.startswith("WARNING ")]
+        self.assertEqual(len(warnings), 1, log)
+        self.assertIn("YouTube may reject PoTokens", warnings[0])
+
+
+class InvalidTimeZoneIsIgnored(unittest.TestCase):
+    """A TZ that is not a plain zone name (a POSIX rule, a :path, a ../ walk, more than one
+    line) is not passed on: the helper gets an empty TZ, as without one, and the warning."""
+
+    BAD = ["Europe/Berlin\nUTC", ":/etc/localtime", ":Europe/Berlin", "../x", "Europe/../../x",
+           "/etc/localtime", "Europe//Berlin", "Europe/Berlin/", "CET-1CEST,M3.5.0,M10.5.0/3",
+           "Europe/Berlin x", "$(id)"]
+    GOOD = ["Europe/Berlin", "America/Argentina/Buenos_Aires", "Etc/GMT+5", "Etc/GMT-14", "UTC",
+            "America/Port-au-Prince"]
+
+    def test_invalid_tz_is_passed_empty_with_the_warning(self):
+        for tz in self.BAD:
+            with self.subTest(tz=tz):
+                argv, log = run_script(tz)
+                self.assertEqual(helper_env(argv).get("TZ"), "")
+                self.assertTrue([l for l in log if l.startswith("INFO ") and "not set" in l], log)
+                self.assertEqual(len([l for l in log if l.startswith("WARNING ")]), 1, log)
+                # The value itself stays out of the log.
+                self.assertFalse([l for l in log if tz.split("\n")[0] in l], log)
+
+    def test_zone_names_are_passed(self):
+        for tz in self.GOOD:
+            with self.subTest(tz=tz):
+                self.assertEqual(helper_env(run_script(tz)[0]).get("TZ"), tz)
+
 
 class DenoRunsTheEntryFile(unittest.TestCase):
     def test_entry_file_instead_of_bgutil_main(self):
@@ -148,6 +196,9 @@ class DenoRunsTheEntryFile(unittest.TestCase):
 
 
 class EntryFile(unittest.TestCase):
+    """Static guards on the entry file's text; its behaviour is tested by
+    EntryFileSetsTheUserAgent and by the full smoke test's 120-character token."""
+
     def setUp(self):
         with open(ENTRY) as f:
             self.text = f.read()
@@ -170,11 +221,91 @@ class EntryFile(unittest.TestCase):
             self.assertNotIn(word, self.text)
 
 
+BGUTIL_DIR = os.environ.get("YTCAST_TEST_BGUTIL_DIR",
+                            os.path.join(ROOT, "dist", "ha-yt-to-upnp", "artefacts", "bgutil"))
+TEST_ENTRY = os.environ.get("YTCAST_TEST_ENTRY", ENTRY)
+DENO = os.environ.get("YTCAST_TEST_DENO") or shutil.which("deno")
+DENO_USER = os.environ.get("YTCAST_TEST_DENO_USER")
+
+# Stands in for bgutil's src/main.ts: one GET through bgutil's axios (the bare import
+# resolves to the same instance the entry file configured) to the listener on Deno.args[0].
+MAIN_STUB = """import axios from "axios";
+await axios.get(`http://127.0.0.1:${Deno.args[0]}/`, { headers: { "x-platform": navigator.platform } });
+"""
+
+
+class _Listener(http.server.BaseHTTPRequestHandler):
+    seen = []
+
+    def do_GET(self):
+        self.seen.append((self.headers.get("user-agent"), self.headers.get("x-platform")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *args):
+        pass
+
+
+@unittest.skipUnless(DENO and os.path.isdir(os.path.join(BGUTIL_DIR, "node_modules", "axios")),
+                     "needs deno and bgutil's node_modules (scripts/build-ha-app.sh)")
+class EntryFileSetsTheUserAgent(unittest.TestCase):
+    def test_requests_carry_the_platform_user_agent(self):
+        _Listener.seen = []
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Listener)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        tmp = tempfile.mkdtemp()
+        try:
+            os.chmod(tmp, 0o755)
+            os.mkdir(os.path.join(tmp, "src"))
+            for name in ("package.json", "deno.json", "deno.lock"):
+                shutil.copy(os.path.join(BGUTIL_DIR, name), tmp)
+            os.symlink(os.path.join(BGUTIL_DIR, "node_modules"), os.path.join(tmp, "node_modules"))
+            shutil.copy(TEST_ENTRY, os.path.join(tmp, "ytcast-entry.ts"))
+            with open(os.path.join(tmp, "src", "main.ts"), "w") as f:
+                f.write(MAIN_STUB)
+            for root, dirs, files in os.walk(tmp):
+                for name in files:
+                    os.chmod(os.path.join(root, name), 0o644)
+                for name in dirs:
+                    os.chmod(os.path.join(root, name), 0o755)
+            deno_dir = os.path.join(tmp, ".deno")
+            os.mkdir(deno_dir)
+            os.chmod(deno_dir, 0o777)
+            # The run script's environment and restrictions; only --allow-net names the listener.
+            cmd = ["env", "-i", "DENO_DIR=" + deno_dir, "DENO_NO_UPDATE_CHECK=1", "NO_COLOR=1",
+                   "HOME=/nonexistent", "PATH=/usr/bin:/bin", "TZ=Europe/Berlin",
+                   DENO, "run", "--no-prompt", "--frozen", "--cached-only",
+                   "--allow-net=127.0.0.1:%d" % port,
+                   "--allow-read=%s/node_modules,%s/node_modules" % (tmp, BGUTIL_DIR),
+                   "--allow-env", "--deny-write", "--deny-run", "--deny-ffi", "--deny-sys",
+                   "--deny-import", "ytcast-entry.ts", str(port)]
+            if DENO_USER:
+                cmd = ["/command/s6-setuidgid", DENO_USER] + cmd
+            r = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=120)
+        finally:
+            server.shutdown()
+            server.server_close()
+            shutil.rmtree(tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(_Listener.seen), 1, r.stderr)
+        user_agent, platform = _Listener.seen[0]
+        self.assertTrue(platform, "the stub reports navigator.platform")
+        self.assertEqual(user_agent,
+                         "Mozilla/5.0 (X11; %s) AppleWebKit/537.36(KHTML, like Gecko)" % platform)
+
+
 class ImageInstallsTheEntryFile(unittest.TestCase):
     def test_read_only_for_the_helper(self):
         with open(DOCKERFILE) as f:
             text = f.read()
         self.assertRegex(text, r"chmod 0644 /opt/bgutil/ytcast-entry\.ts")
+        # rootfs/ is copied after bgutil: the folder's mode is set again with it.
+        self.assertRegex(text, r"chmod a\+rX,go-w /opt/bgutil[ \n]")
+        boundary = text.index("# smoke-quick-cache-boundary")
+        self.assertNotIn("ytcast-entry", text[:boundary])
 
 
 if __name__ == "__main__":

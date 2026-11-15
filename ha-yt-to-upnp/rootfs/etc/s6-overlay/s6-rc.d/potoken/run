@@ -10,8 +10,14 @@ readonly app=/opt/bgutil
 
 # The token reflects the local time zone, and YouTube rejects tokens minted with
 # a zero UTC offset (the image's own /etc/localtime is UTC). The Supervisor
-# passes Home Assistant's time zone as TZ; it goes to the helper unchanged.
+# passes Home Assistant's time zone as TZ; it goes to the helper unchanged if it
+# is a plain zone name. Anything else (a POSIX rule, a :path, a ../ walk, more
+# than one line) is dropped and handled as no time zone, and kept out of the log.
 tz="${TZ:-}"
+zone_name='^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$'
+if ! [[ "${tz}" =~ ${zone_name} ]] || [[ "${tz}" == *..* ]]; then
+    tz=""
+fi
 offset="$(TZ="${tz}" date +%z)"
 bashio::log.info "PoToken helper time zone: ${tz:-not set} (UTC${offset})"
 if [ -z "${tz}" ] || [ "${offset}" = "+0000" ] || [ "${offset}" = "-0000" ]; then
