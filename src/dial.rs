@@ -36,9 +36,10 @@ pub struct DialState {
     pub local_ip: std::net::Ipv4Addr,
     /// Port this DIAL server listens on.
     pub port: u16,
-    /// Credential transfer token from the casting session: the receiver's
-    /// only authentication, sent per video with WEB_REMIX /player.
-    pub ctt: std::sync::RwLock<Option<String>>,
+    /// The playing video and its own credential transfer token: the
+    /// receiver's only authentication, sent with WEB_REMIX /player for that
+    /// video only (a ctt is valid for one video).
+    pub ctt: std::sync::RwLock<Option<(String, String)>>,
     /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
@@ -57,6 +58,17 @@ impl DialState {
     fn note_stream_result(&self, video_id: &str, result: std::result::Result<(), String>) {
         *self.stream_failure.lock().unwrap() =
             result.err().map(|reason| (video_id.to_owned(), reason));
+    }
+
+    /// `video_id`'s own ctt: none for any other video than the one it was
+    /// set for.
+    pub fn ctt_for(&self, video_id: &str) -> Option<String> {
+        self.ctt
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(vid, _)| vid == video_id)
+            .map(|(_, ctt)| ctt.clone())
     }
 
     /// Takes the recorded failure; returns its reason if it was for `video_id`.
@@ -453,7 +465,7 @@ where
     F: FnOnce(String, Option<String>, Option<Arc<crate::music_session::YtMusicSession>>, u64) -> Fut,
     Fut: std::future::Future<Output = StreamResult>,
 {
-    let ctt = state.ctt.read().unwrap().clone();
+    let ctt = state.ctt_for(video_id);
     let yt_session = state.yt_session.clone();
     let start = range_start(request_headers);
     match open(video_id.to_owned(), ctt, yt_session, start).await {
@@ -862,6 +874,21 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(state.stream_failure.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stream_gets_only_its_own_videos_ctt() {
+        let state = test_state();
+        *state.ctt.write().unwrap() = Some(("dQw4w9WgXcQ".to_owned(), "ctt-first".to_owned()));
+        let seen = std::sync::Mutex::new(Vec::new());
+        for video_id in ["dQw4w9WgXcQ", "bbbbbbbbbbb"] {
+            serve_stream(&state, video_id, &HeaderMap::new(), |_, ctt, _, _| {
+                seen.lock().unwrap().push(ctt);
+                async { Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("x".into()) }
+            })
+            .await;
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![Some("ctt-first".to_owned()), None]);
     }
 
     #[tokio::test]

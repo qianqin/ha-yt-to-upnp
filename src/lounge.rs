@@ -109,7 +109,8 @@ pub enum PlayerCommand {
     Stop,
     Previous,
     Next,
-    RemoteConnected { theme: String },
+    /// `device_ids`: the senders' Lounge device ids, for /next's MDX context.
+    RemoteConnected { theme: String, device_ids: Vec<String> },
     RemoteDisconnected { theme: String },
     UpdatePlaylist {
         video_ids: Vec<String>,
@@ -597,7 +598,8 @@ fn dispatch_messages(
             "remoteConnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
                 tracing::info!("[lounge:{}] remote connected: {name}", session.theme);
-                send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone() });
+                let device_ids = msg.args.get("id").filter(|id| !id.is_empty()).cloned().into_iter().collect();
+                send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids });
                 // Tell the phone we're ready — matches yt-cast-receiver handleSenderConnected:
                 // 1. onHasPreviousNextChanged
                 // 2. nowPlaying (empty = nothing playing)
@@ -635,7 +637,8 @@ fn dispatch_messages(
                     .unwrap_or(false);
                 if has_senders {
                     tracing::info!("[lounge:{}] loungeStatus has remote senders, sending readiness", session.theme);
-                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone() });
+                    let device_ids = msg.args.get("devices").map(|d| remote_device_ids(d)).unwrap_or_default();
+                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids });
                     responses.push(
                         OutgoingMessage::new("onHasPreviousNextChanged")
                             .with_arg("hasPrevious", "false")
@@ -716,6 +719,19 @@ fn dispatch_messages(
 /// Shows what the phone sends with each cast (keys only, see `arg_keys`).
 fn log_cast_keys(theme: &str, command: &str, args: &HashMap<String, String>) {
     tracing::info!("[lounge:{}] {} keys={:?}", theme, command, arg_keys(args));
+}
+
+/// The ids of the REMOTE_CONTROL senders in a loungeStatus `devices` list
+/// (a JSON array); none if it does not parse.
+fn remote_device_ids(devices: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(devices)) = serde_json::from_str(devices) else {
+        return Vec::new();
+    };
+    devices
+        .iter()
+        .filter(|d| d["type"] == "REMOTE_CONTROL")
+        .filter_map(|d| d["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+        .collect()
 }
 
 /// Command args can carry credentials (e.g. `ctt`), so logs get keys only.
@@ -1146,6 +1162,44 @@ mod tests {
             command: command.to_owned(),
             args: args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
+    }
+
+    #[test]
+    fn connected_senders_hand_over_their_device_ids() {
+        let mut session = LoungeSession::new(
+            reqwest::Client::new(),
+            "Test Screen".to_owned(),
+            "uuid".to_owned(),
+            "screen".to_owned(),
+            "m".to_owned(),
+        );
+        let (player_tx, mut player_rx) = mpsc::channel(8);
+        let devices = r#"[{"app":"lb-v4","id":"screen-self","type":"LOUNGE_SCREEN"},
+                          {"app":"android-ytm","id":"sender-device-1","name":"Phone","type":"REMOTE_CONTROL"}]"#;
+        let messages = [
+            incoming("remoteConnected", &[("id", "sender-device-2"), ("name", "Phone")]),
+            incoming("loungeStatus", &[("devices", devices)]),
+            incoming("remoteConnected", &[("name", "Phone")]),
+        ];
+
+        dispatch_messages(&mut session, &messages, &player_tx);
+
+        let mut ids = Vec::new();
+        while let Ok(cmd) = player_rx.try_recv() {
+            if let PlayerCommand::RemoteConnected { device_ids, .. } = cmd {
+                ids.push(device_ids);
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![vec!["sender-device-2".to_owned()], vec!["sender-device-1".to_owned()], vec![]]
+        );
+    }
+
+    #[test]
+    fn lounge_status_devices_that_do_not_parse_give_no_ids() {
+        assert!(remote_device_ids("REMOTE_CONTROL").is_empty());
+        assert!(remote_device_ids(r#"{"type":"REMOTE_CONTROL"}"#).is_empty());
     }
 
     #[test]
