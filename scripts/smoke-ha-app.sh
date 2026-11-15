@@ -7,7 +7,9 @@
 # should, get the options as environment and cannot read the Supervisor token;
 # that the receiver's /silence answers on loopback only; that MPD's stream on
 # port 8000 is FLAC 48 kHz 16-bit or MP3 320 kbit/s as stream_format says, under
-# a URL that names it; that the PoToken helper mints a token; that the adapter
+# a URL that names it; that the PoToken helper gets the Supervisor's TZ, logs
+# the time zone (or warns about a zero UTC offset without TZ) and mints a token
+# of the length YouTube accepts (120 characters, TZ Europe/Berlin); that the adapter
 # keeps running whether it looks for the Raumfeld host by SSDP or is given an
 # unreachable raumfeld_host; and that invalid options stop the app with one
 # clear error.
@@ -16,7 +18,8 @@
 # run (which reviews need). One container with the default stream_format
 # (flac): the four services up as their users, MPD answers, port 8000 serves
 # FLAC while MPD plays, the DIAL description has the cast name, the PoToken
-# helper answers /ping (it mints no token), the adapter gets its options; plus,
+# helper answers /ping (it mints no token) and logs its time zone, the adapter
+# gets its options; plus,
 # in parallel, one invalid option that must stop the app. No stability wait.
 # The image is built with the classic builder (no BuildKit cache is left) on a
 # cached base image: the Dockerfile up to its "# smoke-quick-cache-boundary"
@@ -161,8 +164,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-step "option validator matches config.yaml's schema, MPD's configuration, the artefacts stage (host)"
+step "option validator matches config.yaml's schema, MPD's configuration, the PoToken run script, the artefacts stage (host)"
 python3 -I "$root/scripts/ha_options_test.py"
+python3 -I "$root/scripts/ha_potoken_run_test.py"
 python3 -I "$root/scripts/ha_mpd_conf_test.py"
 python3 -I "$root/scripts/fetch_artefacts_test.py"
 
@@ -309,9 +313,12 @@ docker network create "$network" >/dev/null
 
 # Starts a container with the given options.json (copied in before the start,
 # as the Supervisor provides /data/options.json). An optional third argument
-# names an entry under /data to put there as a symbolic link to /tmp.
+# names an entry under /data to put there as a symbolic link to /tmp. The
+# Supervisor also passes Home Assistant's time zone as TZ: $SMOKE_TZ unless a
+# fourth argument is given (empty: no TZ, as on a Home Assistant without one).
+readonly SMOKE_TZ=Europe/Berlin
 start_app() {
-  local name="$1" options="$2" link="${3:-}"
+  local name="$1" options="$2" link="${3:-}" tz="${4-$SMOKE_TZ}"
   containers="$containers $name"
   mkdir -p "$tmp/$name/data"
   printf '%s\n' "$options" > "$tmp/$name/data/options.json"
@@ -319,7 +326,7 @@ start_app() {
   # The Supervisor puts its token into every app's environment; the services
   # must not get it.
   docker create --name "$name" --platform "$PLATFORM" --network "$network" \
-    -e SUPERVISOR_TOKEN=smoke-test-dummy-token "$image" >/dev/null
+    -e SUPERVISOR_TOKEN=smoke-test-dummy-token ${tz:+-e "TZ=$tz"} "$image" >/dev/null
   docker cp "$tmp/$name/data" "$name:/data"
   docker start "$name" >/dev/null
 }
@@ -339,9 +346,14 @@ def check(ok, what):
         failed.append(what)
 
 # Mints a PoToken for a placeholder content binding: the helper fetches BotGuard
-# from YouTube/Google within its --allow-net list. The token is not printed.
+# from YouTube/Google within its --allow-net list. The token is not printed. With
+# a non-zero UTC offset and a user agent that matches the platform, the helper
+# mints tokens of the 120 characters YouTube accepts (124 or 128 are rejected:
+# stream_protection_status=2, throttled after about 60 s). The length also
+# depends on the binding's: the placeholder has a video ID's 11 characters, as
+# the receiver binds tokens to the video ID.
 if mode == "pot":
-    binding = "smoke-test-placeholder"
+    binding = "smoketest00"
     request = urllib.request.Request("http://127.0.0.1:4416/get_pot",
                                      data=json.dumps({"content_binding": binding}).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -353,8 +365,8 @@ if mode == "pot":
     except Exception as e:
         status, body = repr(e), {}
     token = body.get("poToken") or ""
-    check(status == 200 and len(token) > 20 and body.get("contentBinding") == binding,
-          "PoToken helper mints a token on POST /get_pot (HTTP %s, %d chars%s)"
+    check(status == 200 and len(token) == 120 and body.get("contentBinding") == binding,
+          "PoToken helper mints a 120-character token on POST /get_pot (HTTP %s, %d chars%s)"
           % (status, len(token), ", error %r" % body["error"][:200] if "error" in body else ""))
     sys.exit(1 if failed else 0)
 
@@ -579,8 +591,11 @@ if "receiver" in pids:
         check(env.get(key) == value, "receiver env %s=%r (got %r)" % (key, value, env.get(key)))
 if "potoken" in pids:
     env = ps[pids["potoken"]][2]
-    allowed = {"DENO_DIR", "DENO_NO_UPDATE_CHECK", "NO_COLOR", "HOME", "PATH"}
+    allowed = {"DENO_DIR", "DENO_NO_UPDATE_CHECK", "NO_COLOR", "HOME", "PATH", "TZ"}
     check(set(env) <= allowed, "PoToken helper environment is only %s (got %s)" % (sorted(allowed), sorted(env)))
+    if "potoken_tz" in expect:
+        check(env.get("TZ") == expect["potoken_tz"],
+              "PoToken helper env TZ=%r (got %r)" % (expect["potoken_tz"], env.get("TZ")))
 if "adapter" in pids:
     env = ps[pids["adapter"]][2]
     for key, value in expect.get("adapter_env", {}).items():
@@ -635,6 +650,17 @@ expect_stopped() {
   echo "PASS no service started"
 }
 
+# The PoToken helper logs $SMOKE_TZ with its (non-zero) UTC offset and no
+# warning about a zero offset.
+expect_tz_logged() {
+  local logs
+  logs="$(docker logs "$1" 2>&1)"
+  grep -qE "PoToken helper time zone: $SMOKE_TZ \(UTC\+0[12]00\)" <<<"$logs" \
+    || die "the PoToken helper's time zone $SMOKE_TZ was not logged"
+  if grep -F "zero UTC offset" <<<"$logs"; then die "zero UTC offset warning with TZ=$SMOKE_TZ"; fi
+  echo "PASS the PoToken helper logged time zone $SMOKE_TZ and no zero-offset warning"
+}
+
 if [ "$mode" != full ]; then
   step "quick run: default options (flac), raumfeld_host given; an invalid stream_format in parallel"
   started=$SECONDS
@@ -650,8 +676,9 @@ if [ "$mode" != full ]; then
     "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "STREAM_MIME": "audio/flac",
                     "STREAM_URL": "http://{ip}:8000/stream.flac",
                     "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001"},
-    "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"]}'
+    "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"], "potoken_tz": "Europe/Berlin"}'
   echo "services up and checked $((SECONDS - started))s after the start"
+  expect_tz_logged "$run_id-quick"
   expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of flac, mp3"
   if [ "$mode" = release ]; then
     step "release path: the image's programs are the tarball's"
@@ -689,11 +716,12 @@ expect_main='{"cast_name": "Smoke Test",
                   "MPD_PORT": "6600", "START_GATE_SECONDS": "7", "STUCK_SECONDS": "20",
                   "MAX_VOLUME": "40",
                   "LOG_LEVEL": "DEBUG", "ADAPTER_STATE_DIR": "/data/adapter"},
-  "adapter_env_absent": ["RAUMFELD_HOST"]}'
+  "adapter_env_absent": ["RAUMFELD_HOST"], "potoken_tz": "Europe/Berlin"}'
 wait_for_checks "$main" full "$expect_main"
 first_pids="$(pids_of "$main")"
+expect_tz_logged "$main"
 
-step "run 1: PoToken helper mints a token (needs internet from the container)"
+step "run 1: PoToken helper mints a 120-character token with TZ=$SMOKE_TZ (needs internet from the container)"
 docker exec "$main" python3 -I /tmp/check.py pot '{}' || {
   echo "--- container log ($main)"; docker logs "$main" 2>&1 | tail -40
   die "the PoToken helper did not mint a token"
@@ -722,12 +750,12 @@ wait_for_log() {
   done
 }
 
-step "run 2: raumfeld_host (unreachable) without speaker UDN, explicit stream_host, optional timings unset, MP3 stream"
+step "run 2: raumfeld_host (unreachable) without speaker UDN, explicit stream_host, optional timings unset, MP3 stream, no TZ"
 second="$run_id-host"
 start_app "$second" '{"cast_name": "Smoke Test 2",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_host": "192.0.2.20",
-  "stream_host": "192.0.2.10", "stream_format": "mp3", "log_level": "warning"}'
+  "stream_host": "192.0.2.10", "stream_format": "mp3", "log_level": "warning"}' "" ""
 expect_host='{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
   "stream": {"path": "/stream.mp3", "mime": "audio/mpeg",
              "params": {"codec": "mp3", "kbit": 320, "rate": 48000, "channels": 2}},
@@ -735,7 +763,8 @@ expect_host='{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"
                   "RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001",
                   "STREAM_URL": "http://192.0.2.10:8000/stream.mp3", "STREAM_MIME": "audio/mpeg",
                   "LOG_LEVEL": "WARNING"},
-  "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN", "START_GATE_SECONDS", "STUCK_SECONDS"]}'
+  "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN", "START_GATE_SECONDS", "STUCK_SECONDS"],
+  "potoken_tz": ""}'
 wait_for_checks "$second" env "$expect_host"
 host_pids="$(pids_of "$second")"
 # The adapter's start-up look for the room fails (no answer from 192.0.2.20);
@@ -752,6 +781,9 @@ echo "PASS adapter start logged with the Raumfeld host"
 echo "PASS adapter logged the unreachable host and kept running:"
 grep "Raumfeld room not found yet" <<<"$host_logs" | cut -c1-240
 if grep -E "exited with code|exited \(code|Traceback|configuration error" <<<"$host_logs"; then die "a service failed (see above)"; fi
+grep -F "YouTube may reject PoTokens with a zero UTC offset" <<<"$host_logs" | grep -q WARNING \
+  || die "no warning about the PoToken helper's zero UTC offset without TZ"
+echo "PASS without TZ the PoToken helper's zero UTC offset is logged as a warning"
 echo "PASS no service exit, configuration error or traceback in the log"
 
 # Starts the app with invalid options; it must stop (no restart loop) with one

@@ -4,15 +4,27 @@
 # an empty environment and the narrowest Deno permissions that still work; the
 # Deno cache was filled at build time, so nothing is fetched or written here.
 # Its stdout carries the generated tokens, so it is discarded.
+# ytcast-entry.ts sets an HTTP user agent that names the real platform, then
+# starts bgutil's src/main.ts.
 readonly app=/opt/bgutil
+
+# The token reflects the local time zone, and YouTube rejects tokens minted with
+# a zero UTC offset (the image's own /etc/localtime is UTC). The Supervisor
+# passes Home Assistant's time zone as TZ; it goes to the helper unchanged.
+tz="${TZ:-}"
+offset="$(TZ="${tz}" date +%z)"
+bashio::log.info "PoToken helper time zone: ${tz:-not set} (UTC${offset})"
+if [ -z "${tz}" ] || [ "${offset}" = "+0000" ] || [ "${offset}" = "-0000" ]; then
+    bashio::log.warning "PoToken helper runs with UTC offset 0: YouTube may reject PoTokens with a zero UTC offset (streams then stop after about a minute); set Home Assistant's time zone (Settings > System > General) and restart the app"
+fi
 
 bashio::log.info "Starting PoToken helper on 127.0.0.1:4416"
 cd "${app}" || bashio::exit.nok "missing ${app}"
 exec s6-setuidgid potoken env -i \
     DENO_DIR="${app}/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 \
-    HOME=/nonexistent PATH=/usr/bin:/bin \
+    HOME=/nonexistent PATH=/usr/bin:/bin TZ="${tz}" \
     /usr/local/bin/deno run --no-prompt --frozen --cached-only \
     --allow-net=127.0.0.1:4416,www.youtube.com:443,www.google.com:443,jnn-pa.googleapis.com:443 \
     --allow-read="${app}/node_modules" --allow-env \
     --deny-write --deny-run --deny-ffi --deny-sys --deny-import \
-    src/main.ts --host 127.0.0.1 --port 4416 >/dev/null
+    ytcast-entry.ts --host 127.0.0.1 --port 4416 >/dev/null
