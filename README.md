@@ -223,7 +223,11 @@ The parts also run on any Linux host (or a Mac for testing,
    on Deno, listening on `127.0.0.1:4416` (the receiver asks it there).
    Without it, streams are throttled after about a minute. For the restricted
    Deno permissions the app uses, see its
-   [run script](ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/potoken/run).
+   [run script](ha-yt-to-upnp/rootfs/etc/s6-overlay/s6-rc.d/potoken/run). On
+   Linux, start it through the app's
+   [entry file](ha-yt-to-upnp/rootfs/opt/bgutil/ytcast-entry.ts) (a user
+   agent that matches the platform) with a time zone that has a non-zero UTC
+   offset, or YouTube rejects its tokens.
 3. **Receiver** (`cargo build --release --locked`, binary `ytcast-lite`):
 
    | Variable | Default | Meaning |
@@ -255,6 +259,10 @@ Keep MPD's control port and the PoToken helper on loopback, as the app does.
   server-side YouTube issue reported since early 2026), not only on this one.
 - amd64 only; one Raumfeld room per app instance.
 - MPD's control port has no password (see above).
+- **PoTokens need a non-zero UTC offset:** YouTube rejects the helper's
+  tokens when its time zone has offset 0, so with Home Assistant set to UTC
+  (or e.g. Europe/London in winter) streams are throttled after about a
+  minute and resumed up to 3 times per song. The app logs a warning then.
 
 ## License and credits
 

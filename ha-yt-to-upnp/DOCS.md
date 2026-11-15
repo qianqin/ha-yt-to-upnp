@@ -193,7 +193,18 @@ which one and with which exit code.
   `getZones` there lists `raumfeld_room_udn`; or clear `raumfeld_host` to
   search by `raumfeld_speaker_udn`.
 - **Stream stops after about a minute:** the PoToken helper is not running;
-  look for its exit in the log.
+  look for its exit in the log. If it runs, YouTube may be rejecting its
+  tokens (the receiver then resumes the song up to 3 times, each time after
+  about a minute): see the next item.
+- **PoToken rejected / time zone:** the helper's tokens reflect the local
+  time zone, and YouTube rejects tokens minted with a UTC offset of 0. The
+  helper takes Home Assistant's time zone (Settings > System > General >
+  Time zone), which the Supervisor passes to the app as `TZ`. At start the log
+  shows it, e.g. `PoToken helper time zone: Europe/Berlin (UTC+0100)`. A
+  warning `YouTube may reject PoTokens with a zero UTC offset` means no time
+  zone reached the app or it has offset 0 (UTC, or e.g. Europe/London in
+  winter): set Home Assistant's time zone and restart the app. Nothing is
+  faked: the helper reports the host's real platform and time zone.
 - **App stops right after starting:** an option is missing or invalid; the
   log names it.
 

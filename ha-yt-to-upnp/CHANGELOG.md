@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.3
+
+- PoTokens YouTube accepts: the PoToken helper minted tokens YouTube
+  rejected (SABR `stream_protection_status=2`, throttled after about 60 s),
+  for two reasons. It ran without the Supervisor's `TZ`, so with the image's
+  UTC time zone (offset 0); and bgutils-js fetched BotGuard with a fixed
+  macOS user agent while the challenge saw the real platform
+  (`Linux x86_64`). The helper now gets Home Assistant's time zone as `TZ`
+  and starts through `/opt/bgutil/ytcast-entry.ts`, which sends a user agent
+  in bgutils-js's format naming the real platform; neither the platform nor
+  the time zone is faked, and Deno's permissions are unchanged. With
+  Europe/Berlin it mints 120-character tokens, the kind YouTube accepts
+  (124 before). At start the log shows the helper's time zone and UTC offset,
+  with a warning when there is no time zone or its offset is 0.
+
 ## 0.4.2
 
 - Premium audio for the whole queue: a cast token (ctt) is valid for one
