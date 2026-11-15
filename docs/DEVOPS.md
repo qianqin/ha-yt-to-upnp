@@ -287,10 +287,14 @@ It first runs `scripts/ha_options_test.py` on the host: the option check the
 app runs at each start (`rootfs/usr/lib/ytcast/check_options.py`) uses
 exactly the schema in `config.yaml` and accepts and rejects the right values;
 `scripts/ha_potoken_run_test.py`: the PoToken helper's run script passes the
-Supervisor's `TZ` (empty if unset) and nothing else beyond its fixed
-environment, logs the time zone with its UTC offset and warns about offset 0,
-runs `ytcast-entry.ts` with every Deno restriction, and the entry file sets a
-user agent naming the real platform (no spoofing);
+Supervisor's `TZ` if it is a plain zone name (empty if unset or anything else:
+a POSIX rule, a `:path`, `..`, several lines) and nothing else beyond its
+fixed environment, logs the time zone with its UTC offset and warns about
+offset 0 (`+0000` or `-0000`), and runs `ytcast-entry.ts` with every Deno
+restriction; the entry file, run under Deno with those restrictions and a stub
+in place of bgutil's `src/main.ts`, sends the user agent naming the real
+platform with its request to a local listener (no internet; skipped without
+`deno` or the assembled folder's `artefacts/bgutil`);
 `scripts/ha_mpd_conf_test.py`: MPD's configuration gets the encoder in place
 of the template's one `@STREAM_ENCODER@` (none or two stop the app), every
 `stream_format` in the schema has an encoder and a MIME type in `common.sh`,
@@ -318,13 +322,16 @@ samples, fetched with `curl` in the container) but answers `403` to the same
 request on the container's address; `/data/adapter`, `/data/ytcast`,
 `/data/mpd`, `/data/mpd/music` and `/data/mpd/playlists` are directories
 with mode `0700`, owned by their service's user; the
-PoToken helper answers `/ping` on `127.0.0.1:4416` only, gets `TZ` (the
+PoToken helper answers `/ping` on `127.0.0.1:4416` only, cannot write
+`/opt/bgutil` or its entry file, gets `TZ` (the
 containers are started with `TZ=Europe/Berlin`, as the Supervisor passes Home
 Assistant's time zone), logs that time zone with its non-zero UTC offset and
 mints a 120-character token (the length YouTube accepts) on
 `POST /get_pot` for a placeholder content binding of a video ID's 11 characters
 (the token's length depends on it; this fetches BotGuard from
-YouTube/Google through the helper's restricted Deno permissions); every
+YouTube/Google through the helper's restricted Deno permissions); the user
+agent test above passes in the image too (the installed entry file, Deno and
+bgutil, as the `potoken` user); every
 service runs as its own non-root user, does not get the (dummy)
 `SUPERVISOR_TOKEN` the container is started with and cannot read it from
 `/run/s6/container_environment`; the options arrive as the expected
@@ -333,9 +340,10 @@ no `RAUMFELD_HOST`); the adapter logs that it finds no speaker
 (`DeviceNotFound`) and keeps running; no service restarts within 20 s. Run 2
 sets `raumfeld_host` to the unreachable `192.0.2.20` without
 `raumfeld_speaker_udn`, an explicit `stream_host`, no optional timings and
-`stream_format` `mp3`, and no `TZ`: the PoToken helper gets an empty `TZ` and
-logs a warning about the zero UTC offset; the stream is `/stream.mp3`, `audio/mpeg`, its first
-frame MPEG-1 Layer III at 320 kbit/s, 48 kHz, stereo; the adapter gets
+`stream_format` `mp3`, and no `TZ`: the PoToken helper gets an empty `TZ`
+and logs a warning about the zero UTC offset; the stream is `/stream.mp3`,
+`audio/mpeg`, its first frame MPEG-1 Layer III at 320 kbit/s, 48 kHz,
+stereo; the adapter gets
 `RAUMFELD_HOST`, `STREAM_MIME=audio/mpeg` and no `RAUMFELD_SPEAKER_UDN`, logs
 `Raumfeld room not found yet` and keeps running with no service restart within
 20 s.
@@ -355,11 +363,11 @@ buildkit image if it pulled it.
 with `stream_format` `flac` and `raumfeld_host` `192.0.2.20` (all four
 services up as their own users without `SUPERVISOR_TOKEN`, MPD answers, the
 FLAC stream as in run 1, the DIAL description has the cast name, the PoToken
-helper answers `/ping` (no token is minted) and logs its time zone, the
-adapter's environment) and,
-in parallel, run 7. It polls every 0.5 s and has no stability wait. It builds
-with the classic builder (`DOCKER_BUILDKIT=0`, which leaves no build cache)
-on a cached base image: the `Dockerfile` up to its
+helper answers `/ping` (no token is minted), logs its time zone, cannot
+write its folder and passes the user agent test, the adapter's environment)
+and, in parallel, run 7. It polls every 0.5 s and has no stability wait. It
+builds with the classic builder (`DOCKER_BUILDKIT=0`, which leaves no build
+cache) on a cached base image: the `Dockerfile` up to its
 `# smoke-quick-cache-boundary` line (base image, Debian packages, Deno and
 bgutil), tagged `ytcast-ha-smoke-base:<hash>` (hash of that part of the
 `Dockerfile` and the files it copies, labelled `io.github.ytcast.smoke-base`).

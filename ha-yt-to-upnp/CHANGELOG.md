@@ -13,7 +13,8 @@
   the time zone is faked, and Deno's permissions are unchanged. With
   Europe/Berlin it mints 120-character tokens, the kind YouTube accepts
   (124 before). At start the log shows the helper's time zone and UTC offset,
-  with a warning when there is no time zone or its offset is 0.
+  with a warning when there is no time zone or its offset is 0. A `TZ` that
+  is not a plain zone name (e.g. a POSIX rule or a `:path`) is not passed on.
 
 ## 0.4.2
 

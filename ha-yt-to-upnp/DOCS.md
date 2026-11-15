@@ -202,8 +202,9 @@ which one and with which exit code.
   Time zone), which the Supervisor passes to the app as `TZ`. At start the log
   shows it, e.g. `PoToken helper time zone: Europe/Berlin (UTC+0100)`. A
   warning `YouTube may reject PoTokens with a zero UTC offset` means no time
-  zone reached the app or it has offset 0 (UTC, or e.g. Europe/London in
-  winter): set Home Assistant's time zone and restart the app. Nothing is
+  zone reached the app (a `TZ` that is not a zone name such as
+  `Europe/Berlin` is ignored) or it has offset 0 (UTC, or e.g. Europe/London
+  in winter): set Home Assistant's time zone and restart the app. Nothing is
   faked: the helper reports the host's real platform and time zone.
 - **App stops right after starting:** an option is missing or invalid; the
   log names it.
