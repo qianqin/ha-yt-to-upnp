@@ -392,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         has_remote = true;
                         let active = active_theme.read().unwrap().clone();
                         update_sender_ids(&mut sender_ids, &active, theme, device_ids);
+                        forget_tokens_on_theme_change(&mut playlist, &dial_state, &active, theme);
                         *active_theme.write().unwrap() = theme.clone();
                         continue;
                     }
@@ -1013,6 +1014,21 @@ fn resolve_ctt(playlist: &PlaylistState, video_id: &str) -> Option<String> {
 fn update_sender_ids(sender_ids: &mut Vec<String>, active: &str, theme: &str, device_ids: &[String]) {
     if theme != active || !device_ids.is_empty() {
         *sender_ids = device_ids.to_vec();
+    }
+}
+
+/// A sender on the other Lounge theme is another cast: the earlier cast's
+/// per-video tokens must not reach it in nowPlaying before its own
+/// setPlaylist, and a /next answer still on its way is dropped.
+fn forget_tokens_on_theme_change(
+    playlist: &mut PlaylistState,
+    dial_state: &dial::DialState,
+    active: &str,
+    theme: &str,
+) {
+    if theme != active {
+        playlist.tokens.clear();
+        set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
     }
 }
 
@@ -2111,6 +2127,23 @@ mod preroll_wiring_tests {
         assert!(prefetch_job(&mut pre_rolling, true).is_none());
         pre_rolling.preroll = preroll::PreRoll::default();
         assert!(prefetch_job(&mut pre_rolling, true).is_some(), "asked once the pre-roll is over");
+    }
+
+    #[test]
+    fn a_sender_on_the_other_theme_gets_none_of_the_earlier_casts_tokens() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        let answer = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b"));
+
+        forget_tokens_on_theme_change(&mut playlist, &dial_state, "m", "m");
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"), "same theme keeps the cast");
+
+        forget_tokens_on_theme_change(&mut playlist, &dial_state, "m", "cl");
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale);
     }
 
     #[test]

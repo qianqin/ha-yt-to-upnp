@@ -13,10 +13,11 @@
   token, fails, or names another song than the queue's next, that song plays
   without a token (251 via SABR); another song's token is never used. Next
   and previous from the phone use the same per-song tokens. Tokens stay in
-  memory only, go only to YouTube, and are forgotten with a new cast, a stop
-  from the phone, a disconnect or a release by the speaker; a `/next` answer
-  that arrives after that is dropped. `/next` gives up after 10 s. `YTCAST_DEBUG_NEXT=1` logs the key
-  structure (no values) of each `/next` answer.
+  memory only, go only to YouTube, and are forgotten with a new cast, a
+  sender connecting on the other YouTube theme, a stop from the phone, a
+  disconnect or a release by the speaker; a `/next` answer that arrives
+  after that is dropped. `/next` gives up after 10 s. `YTCAST_DEBUG_NEXT=1`
+  logs the key structure (no values) of each `/next` answer.
 - A SABR stream that stalls (YouTube stops sending audio after about 60 s
   when it does not accept the PoToken, `stream_protection_status=2`) no
   longer ends the song there: the receiver fetches a fresh `/player`
