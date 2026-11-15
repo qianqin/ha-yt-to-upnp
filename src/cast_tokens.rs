@@ -111,7 +111,10 @@ mod tests {
             tokens.remember(id, auth(&format!("ctt-{i}")));
         }
         assert_eq!(tokens.auth_for("aaaaaaaaaaa"), VideoAuth::default());
-        assert_eq!(tokens.auth_for("v4"), auth("ctt-3"));
+        // Four are kept: current, next and two for "previous".
+        for (i, id) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
+            assert_eq!(tokens.auth_for(id), auth(&format!("ctt-{i}")), "{id}");
+        }
         tokens.remember("v4", VideoAuth::default());
         assert_eq!(tokens.auth_for("v4"), VideoAuth::default());
     }

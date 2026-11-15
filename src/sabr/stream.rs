@@ -2319,35 +2319,54 @@ struct HttpReloader {
     client: ReloadClient,
 }
 
+impl HttpReloader {
+    /// The /player request for `reason`. A server-requested reload needs
+    /// WEB_REMIX, as before; a stall resume also repeats the anonymous
+    /// client's call, so a song without ctt can resume too.
+    fn player_request(&self, reason: ReloadReason<'_>) -> Result<reqwest::Request, SabrError> {
+        let (target, token) = match (&self.client, reason) {
+            (ReloadClient::WebRemix { ctt, session }, reason) => {
+                let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
+                let token = match reason {
+                    ReloadReason::Requested { token } => token,
+                    ReloadReason::Stalled => None,
+                };
+                (PlayerTarget::WebRemix(auth), token)
+            }
+            (ReloadClient::Anonymous(_), ReloadReason::Requested { .. }) => {
+                return Err("player reload needs WEB_REMIX (cast ctt and YouTube Music session)".into());
+            }
+            (ReloadClient::Anonymous(client), ReloadReason::Stalled) => (PlayerTarget::Anonymous(client), None),
+        };
+        player_request(&self.http, &self.video_id, target, None, None, token)
+    }
+
+    /// A fresh PoToken for this song from bgutil-pot; `None` keeps the old one.
+    async fn fresh_po_token(&self) -> Option<Vec<u8>> {
+        let fresh = fetch_pot_token(&self.http, Some(&self.video_id)).await;
+        if fresh.is_none() {
+            tracing::warn!("[sabr] no fresh PoToken from bgutil-pot; keeping the old one");
+        }
+        fresh.and_then(|g| decode_po_token(&g.po_token))
+    }
+}
+
 impl PlayerReloader for HttpReloader {
     fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
         Box::pin(async move {
-            let token = match reason {
-                ReloadReason::Requested { token } => token,
-                ReloadReason::Stalled => None,
-            };
-            let (target, session) = match &self.client {
-                ReloadClient::WebRemix { ctt, session } => {
-                    let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
-                    (PlayerTarget::WebRemix(auth), Some(session.as_ref()))
-                }
-                ReloadClient::Anonymous(client) => (PlayerTarget::Anonymous(client), None),
-            };
-            let player = innertube_player(&self.http, &self.video_id, target, None, None, token).await?;
+            let req = self.player_request(reason)?;
+            let resp = self.http.execute(req).await.map_err(|e| e.without_url())?;
+            let player = parse_player_data(&self.video_id, resp).await?;
             tracing::info!("[sabr] reloaded /player lists itags {:?}", listed_itags(&player.formats));
-            let server_url = match session {
-                Some(session) => solve_nsig(player.server_abr_streaming_url, Some(session)).await?,
-                None => player.server_abr_streaming_url,
+            let server_url = match &self.client {
+                ReloadClient::WebRemix { session, .. } => {
+                    solve_nsig(player.server_abr_streaming_url, Some(session)).await?
+                }
+                ReloadClient::Anonymous(_) => player.server_abr_streaming_url,
             };
             check_streaming_url(&server_url)?;
             let po_token = match reason {
-                ReloadReason::Stalled => {
-                    let fresh = fetch_pot_token(&self.http, Some(&self.video_id)).await;
-                    if fresh.is_none() {
-                        tracing::warn!("[sabr] no fresh PoToken from bgutil-pot; keeping the old one");
-                    }
-                    fresh.and_then(|g| decode_po_token(&g.po_token))
-                }
+                ReloadReason::Stalled => self.fresh_po_token().await,
                 ReloadReason::Requested { .. } => None,
             };
             Ok(ReloadedPlayer {
@@ -4319,5 +4338,92 @@ mod tests {
         assert_eq!(state.po_token.as_deref(), Some(SECRET_POTOKEN));
         let text = logs.text();
         assert!(text.contains("stall resume failed: no /player; giving up"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_stall_resume_goes_on_from_the_reached_segment() {
+        let (mut state, tx, _rx) = stalled_stream();
+        state.audio_max_segment = 6;
+        state.audio_initialized = true;
+        let mut cycle = RecordingCycle {
+            sent: Vec::new(),
+            inner: StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() },
+        };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        let after = cycle.sent.last().unwrap();
+        assert_eq!(after.streamer_context.as_ref().unwrap().po_token.as_deref(), Some(FRESH_POTOKEN));
+        let audio_id = state.audio_format_id.clone();
+        let audio_range = after.buffered_ranges.iter().find(|r| r.format_id == audio_id).expect("audio range");
+        assert_eq!((audio_range.end_segment_index, audio_range.duration_ms), (6, STALL_MS));
+        assert!(after.selected_format_ids.contains(&audio_id), "{:?}", after.selected_format_ids);
+        assert_eq!(after.client_abr_state.as_ref().unwrap().player_time_ms, Some(STALL_MS - 10_000));
+    }
+
+    fn reloader(client: ReloadClient) -> HttpReloader {
+        HttpReloader { http: reqwest::Client::new(), video_id: "dQw4w9WgXcQ".into(), client }
+    }
+
+    fn web_remix_reloader() -> HttpReloader {
+        let session = Arc::new(crate::music_session::test_fixtures::session());
+        reloader(ReloadClient::WebRemix { ctt: "song-ctt".into(), session })
+    }
+
+    #[test]
+    fn reloads_repeat_the_songs_web_remix_call_with_its_ctt() {
+        let r = web_remix_reloader();
+        for (reason, token) in [
+            (ReloadReason::Requested { token: Some("tok") }, Some("tok")),
+            (ReloadReason::Stalled, None),
+        ] {
+            let req = r.player_request(reason).unwrap();
+            assert_eq!(req.url().host_str(), Some("music.youtube.com"), "{reason:?}");
+            let body = body_json(&req);
+            assert_eq!(body["context"]["user"]["credentialTransferTokens"][0]["token"], "song-ctt");
+            let sent = body["playbackContext"]["reloadPlaybackContext"]["reloadPlaybackParams"]["token"].as_str();
+            assert_eq!(sent, token, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn without_web_remix_only_a_stall_resume_reloads() {
+        let r = reloader(ReloadClient::Anonymous(&IOS_CLIENT));
+        let err = r.player_request(ReloadReason::Requested { token: Some("tok") }).unwrap_err();
+        assert!(err.to_string().contains("needs WEB_REMIX"), "{err}");
+
+        let req = r.player_request(ReloadReason::Stalled).unwrap();
+        assert_eq!(req.url().host_str(), Some("www.youtube.com"));
+        let body = body_json(&req);
+        assert_eq!(body["context"]["client"]["clientName"], "IOS");
+        assert!(body["context"].get("user").is_none(), "no ctt for the anonymous client");
+    }
+
+    #[tokio::test]
+    async fn a_stall_resume_asks_bgutil_for_a_fresh_po_token_for_the_song() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let json = r#"{"poToken":"AQID"}"#;
+        let server = tokio::spawn(serve_one(
+            proxy,
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{json}",
+                json.len()
+            ),
+        ));
+        let mut r = web_remix_reloader();
+        // bgutil-pot lives at a fixed localhost URL; route it to the fake server.
+        r.http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(r.fresh_po_token().await, Some(vec![1, 2, 3]));
+        let request = server.await.unwrap();
+        assert!(request.contains("/get_pot"), "{request}");
+        assert!(request.contains(r#""content_binding":"dQw4w9WgXcQ""#), "{request}");
+        assert!(!request.contains("song-ctt"), "the ctt never goes to bgutil: {request}");
     }
 }

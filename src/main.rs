@@ -390,9 +390,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             theme, device_ids.len()
                         );
                         has_remote = true;
-                        if *theme != *active_theme.read().unwrap() || !device_ids.is_empty() {
-                            sender_ids = device_ids.clone();
-                        }
+                        let active = active_theme.read().unwrap().clone();
+                        update_sender_ids(&mut sender_ids, &active, theme, device_ids);
                         *active_theme.write().unwrap() = theme.clone();
                         continue;
                     }
@@ -474,6 +473,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     tracing::info!("[player] released by speaker (adapter) — ending cast session");
                     has_remote = false;
+                    // loungeScreenDisconnected drops the senders.
+                    sender_ids.clear();
                     end_released_cast(&mut mpd_client, &mut playlist, &mut play_started, &dial_state, &state_tx).await;
                     continue;
                 }
@@ -747,6 +748,9 @@ async fn handle_command(
         PlayerCommand::Stop => {
             tracing::info!("[player] Stop");
             *play_started = false;
+            // The queue is gone, and with it every song's ctt.
+            set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
+            playlist.tokens.clear();
             end_preroll(&mut playlist.preroll, "stop from the phone");
             mpd.stop().await?;
             mpd.clear().await?;
@@ -985,7 +989,7 @@ fn video_ctt(video_id: &str, ctt: Option<String>) -> Option<(String, String)> {
 fn adopt_index(playlist: &mut PlaylistState, dial_state: &dial::DialState, index: usize, why: &str) -> String {
     playlist.current_index = index;
     let video_id = playlist.video_ids[index].clone();
-    let ctt = playlist.tokens.auth_for(&video_id).ctt;
+    let ctt = resolve_ctt(playlist, &video_id);
     tracing::info!(
         "[player] {why} to index {index} ({video_id}): {}",
         if ctt.is_some() { "own ctt" } else { "no ctt for this video" }
@@ -994,6 +998,22 @@ fn adopt_index(playlist: &mut PlaylistState, dial_state: &dial::DialState, index
     // Track change — ensure NowPlaying is sent
     playlist.last_state = messages::PlayerState::Idle;
     video_id
+}
+
+/// The ctt `video_id` resolves (and streams) with: its own, never another
+/// video's.
+fn resolve_ctt(playlist: &PlaylistState, video_id: &str) -> Option<String> {
+    playlist.tokens.auth_for(video_id).ctt
+}
+
+/// A sender connected on `theme` (`active` is the theme before it): its ids
+/// replace the known ones. A connect without ids (a loungeStatus that
+/// listed none) keeps them, unless the theme changed: another session's
+/// senders are not this one's.
+fn update_sender_ids(sender_ids: &mut Vec<String>, active: &str, theme: &str, device_ids: &[String]) {
+    if theme != active || !device_ids.is_empty() {
+        *sender_ids = device_ids.to_vec();
+    }
 }
 
 /// A /next request for the song now playing.
@@ -1144,7 +1164,11 @@ fn apply_prefetch(playlist: &mut PlaylistState, result: PrefetchResult) -> Prefe
 /// yt-cast-receiver's player reset does.
 fn release_cast(playlist: &mut PlaylistState, play_started: &mut bool) -> Vec<messages::OutgoingMessage> {
     *play_started = false;
-    *playlist = PlaylistState::default();
+    // The token generation carries on: a /next answer still on its way
+    // belongs to the released cast and must not match the next one.
+    let mut tokens = std::mem::take(&mut playlist.tokens);
+    tokens.clear();
+    *playlist = PlaylistState { tokens, ..PlaylistState::default() };
     vec![
         messages::OutgoingMessage::new("nowPlaying"),
         messages::OutgoingMessage::new("loungeScreenDisconnected"),
@@ -1325,7 +1349,7 @@ async fn play_video(
 
     let stream = innertube::resolve_stream(
         video_id,
-        playlist.tokens.auth_for(video_id).ctt.as_deref(),
+        resolve_ctt(playlist, video_id).as_deref(),
         if playlist.list_id.is_empty() {
             None
         } else {
@@ -1683,14 +1707,25 @@ mod preroll_wiring_tests {
         play_started: &mut bool,
         script: Vec<(&'static str, &'static str)>,
     ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        command_on(&dial_state, cmd, playlist, play_started, script).await
+    }
+
+    /// `command` with the receiver's shared state given.
+    async fn command_on(
+        dial_state: &Arc<dial::DialState>,
+        cmd: lounge::PlayerCommand,
+        playlist: &mut PlaylistState,
+        play_started: &mut bool,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
         // Commands such as RemoteDisconnected clear the real pin store.
         let _lock = sabr::stream::test_support::global_pins_lock();
         let (port, server) = fake_mpd(script).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(16);
-        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
-        let dial_state = dial::DialState::for_tests(preroll_tx);
-        handle_command(cmd, &mut mpd, &state_tx, playlist, play_started, &dial_state, None)
+        handle_command(cmd, &mut mpd, &state_tx, playlist, play_started, dial_state, None)
             .await
             .unwrap();
         drop(mpd);
@@ -2011,6 +2046,83 @@ mod preroll_wiring_tests {
         assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
         assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
         assert_eq!(dial_state.ctt_for("ccccccccccc").as_deref(), Some("ctt-c"));
+    }
+
+    #[test]
+    fn a_late_next_answer_from_a_released_cast_is_dropped() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        let answer = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b"));
+
+        release_cast(&mut playlist, &mut true);
+        let ids = vec!["aaaaaaaaaaa".to_owned(), "bbbbbbbbbbb".to_owned()];
+        adopt_playlist(&mut playlist, &dial_state, "aaaaaaaaaaa", ids, 0, String::new(), auth("ctt-other"));
+
+        assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale);
+        assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
+    }
+
+    #[tokio::test]
+    async fn stop_from_the_phone_forgets_the_chain() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = {
+            let _lock = global_pins_lock();
+            let mut playlist = cast_queue(&dial_state);
+            store_next_ctt(&mut playlist);
+            playlist
+        };
+        let answer = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b2"));
+        let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS_STOP)];
+        let (seen, _) = command_on(&dial_state, lounge::PlayerCommand::Stop, &mut playlist, &mut true, script).await;
+        assert_eq!(seen, vec!["stop", "clear", "status"]);
+
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
+        assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
+        assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale);
+    }
+
+    #[test]
+    fn a_song_resolves_with_its_own_ctt() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        store_next_ctt(&mut playlist);
+        assert_eq!(resolve_ctt(&playlist, "aaaaaaaaaaa").as_deref(), Some("ctt-a"));
+        assert_eq!(resolve_ctt(&playlist, "bbbbbbbbbbb").as_deref(), Some("ctt-b"));
+        assert_eq!(resolve_ctt(&playlist, "ccccccccccc"), None);
+    }
+
+    #[test]
+    fn next_is_not_asked_when_the_next_ctt_is_known_or_during_the_pre_roll() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut known = cast_queue(&dial_state);
+        store_next_ctt(&mut known);
+        assert!(prefetch_job(&mut known, true).is_none(), "the next video's ctt is already known");
+
+        let mut pre_rolling = cast_queue(&dial_state);
+        pre_rolling.preroll = preroll::PreRoll::running();
+        assert!(prefetch_job(&mut pre_rolling, true).is_none());
+        pre_rolling.preroll = preroll::PreRoll::default();
+        assert!(prefetch_job(&mut pre_rolling, true).is_some(), "asked once the pre-roll is over");
+    }
+
+    #[test]
+    fn sender_ids_follow_the_active_theme_and_its_newest_sender() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut senders = ids(&["phone-1"]);
+        update_sender_ids(&mut senders, "m", "m", &[]);
+        assert_eq!(senders, ids(&["phone-1"]), "a status without ids keeps the known sender");
+        update_sender_ids(&mut senders, "m", "m", &ids(&["phone-2"]));
+        assert_eq!(senders, ids(&["phone-2"]));
+        update_sender_ids(&mut senders, "m", "cl", &[]);
+        assert!(senders.is_empty(), "another theme's sender is not this one");
     }
 
     #[tokio::test]

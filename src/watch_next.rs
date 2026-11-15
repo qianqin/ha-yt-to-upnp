@@ -135,7 +135,31 @@ pub fn next_request(
     if let Some(vd) = session.visitor_data() {
         req = req.header("X-Goog-Visitor-Id", vd);
     }
-    Ok(req.json(&body).build().map_err(|e| e.without_url())?)
+    Ok(req.json(&body).timeout(NEXT_TIMEOUT).build().map_err(|e| e.without_url())?)
+}
+
+/// As for bgutil-pot: a hanging /next must not hold the chain back forever.
+const NEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A /next answer is some 100-500 KB; anything past this is not one.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a response body, failing once it grows past `max` bytes.
+async fn read_capped<S, E>(mut body: S, max: usize) -> Result<Vec<u8>>
+where
+    S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    use futures_util::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(Into::into)?;
+        if out.len() + chunk.len() > max {
+            return Err(format!("/next answer larger than {max} bytes").into());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// The next item of a /next response: the queue's next video, else the
@@ -199,7 +223,9 @@ pub async fn fetch_next(
     if !resp.status().is_success() {
         return Err(format!("/next HTTP {}", resp.status()).into());
     }
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
+    use futures_util::TryStreamExt;
+    let body = read_capped(resp.bytes_stream().map_err(|e| e.without_url()), MAX_RESPONSE_BYTES).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
     if std::env::var_os(DEBUG_ENV).is_some() {
         let set = &json["contents"]["singleColumnWatchNextResults"]["autoplay"];
         tracing::info!("[next] response keys: {}", json_shape(&json, 2));
@@ -270,6 +296,25 @@ mod tests {
         assert_eq!(client["gl"], "DE");
         // Nothing of the WEB_REMIX page client beyond those.
         assert!(client.get("platform").is_none() && client.get("configInfo").is_none(), "{client}");
+    }
+
+    #[test]
+    fn next_request_times_out_after_ten_seconds() {
+        let session = crate::music_session::test_fixtures::session();
+        let req = next_request(&reqwest::Client::new(), &target(&[]), &session).unwrap();
+        assert_eq!(req.timeout(), Some(&std::time::Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_read_only_up_to_the_cap() {
+        let chunks = |n: usize| {
+            futures_util::stream::iter(
+                (0..n).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"0123456789"))),
+            )
+        };
+        assert_eq!(read_capped(chunks(3), 30).await.unwrap().len(), 30);
+        let err = read_capped(chunks(4), 30).await.unwrap_err();
+        assert!(err.to_string().contains("larger than 30 bytes"), "{err}");
     }
 
     #[test]
