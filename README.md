@@ -32,10 +32,15 @@ solving with the vendored yt-dlp/ejs solver in QuickJS.
   locked-down Deno permissions (network to three Google hosts, no write, run,
   FFI or sys access), so streams aren't throttled after a minute.
 - **SABR reload handling:** `RELOAD_PLAYER_RESPONSE` is answered with a fresh
-  `/player` call (same ctt), capped per song.
+  `/player` call (same ctt), capped per song. A stream that stalls (the
+  throttle when the PoToken is not accepted) resumes in place with a fresh
+  `/player` call and PoToken, at most 3 times per song.
 - **Premium audio:** itag 774 (Opus ~256 kbit/s), then 141 (AAC 256 kbit/s),
   fetched through the deciphered format URL with byte ranges, falling back to
-  251 via SABR. Seeks stay on the same format.
+  251 via SABR. Seeks stay on the same format. A ctt is valid for one song:
+  for the songs the receiver advances to by itself, it gets each song's own
+  ctt from InnerTube `/next` (as yt-cast-receiver does), so queue songs play
+  in Premium too.
 - **Fast start:** silence pre-roll from the phone's DIAL launch, so the
   speaker wakes while the song is still loading; the song is handed over held
   at its start until the speaker plays.
@@ -240,7 +245,9 @@ Keep MPD's control port and the PoToken helper on loopback, as the app does.
 
 - **Premium audio depends on YouTube** keeping the format URLs of 774/141 in
   the WEB_REMIX `/player` answer for cast tokens. If that changes, songs fall
-  back to 251 via SABR.
+  back to 251 via SABR. Songs the receiver advances to need their own ctt
+  from `/next`; when `/next` gives none (or names another song than the
+  queue's next), that song plays as 251 via SABR.
 - **No 24-bit FLAC:** a Raumfeld connects to a 24-bit FLAC stream but never
   plays it, so the stream is 16-bit.
 - **AAC (141) is resampled** from 44.1 kHz to 48 kHz.

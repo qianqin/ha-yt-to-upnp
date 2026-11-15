@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.2
+
+- Premium audio for the whole queue: a cast token (ctt) is valid for one
+  song only, and the phone sends one only for the song it starts. When the
+  receiver advanced to the next song by itself it reused the first song's
+  token, YouTube then offered no Premium formats and the song played as 251
+  via SABR. While a song plays, the receiver now asks InnerTube `/next` (as a
+  TV, with the connected phone's device id, as yt-cast-receiver does) for the
+  next queue song and its own token, at most one song ahead, and plays and
+  reports each song with its own token and params. If `/next` gives no
+  token, fails, or names another song than the queue's next, that song plays
+  without a token (251 via SABR); another song's token is never used. Next
+  and previous from the phone use the same per-song tokens. Tokens stay in
+  memory only, go only to YouTube, and are forgotten with a new cast, a
+  disconnect or a release by the speaker. `YTCAST_DEBUG_NEXT=1` logs the key
+  structure (no values) of each `/next` answer.
+- A SABR stream that stalls (YouTube stops sending audio after about 60 s
+  when it does not accept the PoToken, `stream_protection_status=2`) no
+  longer ends the song there: the receiver fetches a fresh `/player`
+  response and a fresh PoToken and continues from the reached position in
+  the same stream to MPD, at most 3 times per song, then gives up as before.
+  The `/player` reload also works for songs streamed via the anonymous IOS
+  client now.
+
 ## 0.4.1
 
 - Pause from the phone is heard at once: the adapter follows a user pause to
