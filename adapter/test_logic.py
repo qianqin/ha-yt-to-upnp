@@ -2865,6 +2865,34 @@ class LeadPinsTest(unittest.TestCase):
         self.assertNotIn(ra.SEEK_BACK, self.requests())
         self.assertIsNone(self.f.take_seek_back())
 
+    def resume(self, paused_at, resumed_at):
+        self.ctl.plays, self.ctl.verdict = True, ra.OURS
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            self.f.on_mpd_state("pause", "1", paused_at)
+            self.f.on_mpd_state("play", "1", resumed_at)
+            self.requests()
+            self.f.on_mpd_state("pause", "1", resumed_at)
+        self.requests()
+        return self.f.take_seek_back()
+
+    def test_a_resume_point_further_off_than_the_lead_drops_it(self):
+        connected = self.started()
+        self.clock.now = connected + 100
+        self.ctl.heard = 98  # a lead of 1.5 s
+        self.assertIsNone(self.resume(100.0, 98.4))  # 1.6 s off
+
+    def test_a_resume_point_exactly_the_lead_off_keeps_it(self):
+        connected = self.started()
+        self.clock.now = connected + 100
+        self.ctl.heard = 98
+        self.assertEqual(self.resume(100.0, 98.5), 1.5)  # 1.5 s off
+
+    def test_the_lead_is_kept_to_the_millisecond(self):
+        connected = self.started()
+        self.clock.now = connected + 100
+        self.ctl.heard = 98.123
+        self.assertEqual(self.resume(None, None), 1.377)
+
     def test_the_lead_is_kept_when_the_resume_point_is_the_pause_point(self):
         connected = self.started()
         self.clock.now = connected + 100
@@ -2972,6 +3000,76 @@ class VolumeReadLogTest(unittest.TestCase):
         with self.assertLogs("raumfeld_adapter", "WARNING"):
             clock.now += 5
             f.tick()  # ... so a new failure is a warning again
+
+
+
+class ResumePinsTest(unittest.TestCase):
+    """More rules of the resume pinned by value (QA re-review)."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.ctl = RecordingController()
+        self.ctl.clock = self.clock
+
+    def paused(self, gate_s):
+        """A FLAC cast, connected at its takeover, paused by the user (speaker paused)."""
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=gate_s,
+                        hold_until_playing=False)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("play", "1")
+            if gate_s:
+                f.take_mpd_requests()
+                f.on_mpd_state("pause", "1")
+                f.take_mpd_requests()
+                f.on_mpd_state("play", "1")
+            f.on_mpd_state("pause", "1")
+        self.assertTrue(f.speaker_paused)
+        self.ctl.calls.clear()
+        return f
+
+    def test_a_failed_room_look_before_an_ungated_play_sends_no_play(self):
+        f = self.paused(0)
+        self.ctl.fail = OSError("timeout")  # check() fails; the renderer is still paused
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            f.on_mpd_state("play", "1")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "check"])
+        self.assertEqual(f.seconds_until_deadline(), 5)  # the polls decide
+        self.ctl.fail = None
+        self.ctl.verdict = ra.NOT_PLAYING
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            for _ in range(ra.STOPPED_GRACE_POLLS + 1):
+                self.clock.now += 5
+                f.tick()
+        self.assertIn("ensure_playing(retake)", self.ctl.calls)  # the guarded one
+        self.assertNotIn("play_renderer", self.ctl.calls)
+        self.assertNotIn("ensure_playing", self.ctl.calls)
+
+    def test_a_failed_room_look_before_a_gated_play_releases_mpd_without_a_seek(self):
+        f = self.paused(15)
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("play", "1")
+        self.assertEqual(f.take_mpd_requests(), [ra.PAUSE_PLAYER])
+        self.ctl.fail = OSError("timeout")
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            f.on_mpd_state("pause", "1")  # our pause 1: the room look fails
+        self.assertEqual(f.take_mpd_requests(), [ra.RESUME_PLAYER])
+        self.assertIsNone(f.take_seek_back())
+        self.assertNotIn("play_renderer", self.ctl.calls)
+        self.assertNotIn("ensure_playing", self.ctl.calls)
+
+    def test_a_resume_fallback_wakes_the_room(self):
+        f = ra.Follower(self.ctl, poll_seconds=5, clock=self.clock, start_gate_seconds=0)
+        f.on_mpd_state("play", "1")
+        f.on_mpd_state("stop", None)
+        f.on_mpd_state("play", "2")  # a song change: no wake for it
+        self.assertEqual(self.ctl.calls[-1], "ensure_playing(no wake)")
+        with self.assertLogs("raumfeld_adapter", "INFO"):
+            f.on_mpd_state("pause", "2")
+        self.ctl.calls.clear()
+        self.ctl.renderer = "STOPPED"  # left the pause
+        with self.assertLogs("raumfeld_adapter", "WARNING"):
+            f.on_mpd_state("play", "2")
+        self.assertEqual(self.ctl.calls, ["renderer_state", "check", "ensure_playing"])
 
 
 if __name__ == "__main__":
