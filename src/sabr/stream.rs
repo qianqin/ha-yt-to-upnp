@@ -895,6 +895,8 @@ struct StreamStats {
     /// STREAM_PROTECTION_STATUS values in arrival order, repeats collapsed.
     protection_statuses: Vec<i32>,
     reloads: u32,
+    /// Resumes after a stall (see `resume_after_stall`).
+    stall_resumes: u32,
 }
 
 impl SabrState {
@@ -1073,13 +1075,17 @@ fn format_id(format: &AdaptiveFormat) -> misc::FormatId {
 /// Point the stream at a reloaded /player response, as googlevideo does:
 /// new streaming URL and ustreamer config, SABR contexts cleared, format ids
 /// refreshed when the new response still lists the itag; progress, PoToken
-/// and playback cookie carry over. Only a cookie that names another audio
+/// (unless the reload brings a fresh one) and playback cookie carry over.
+/// Only a cookie that names another audio
 /// format (`audio_fmt`) than the one streaming is dropped, so the new
 /// session is not told a different format was selected.
 fn apply_reload(state: &mut SabrState, player: &ReloadedPlayer) -> Result<(), SabrError> {
     check_streaming_url(&player.server_url)?;
     state.server_url = player.server_url.clone();
     state.ustreamer_config = player.ustreamer_config.clone();
+    if let Some(po_token) = &player.po_token {
+        state.po_token = Some(po_token.clone());
+    }
     let cookie_audio = state
         .playback_cookie
         .as_deref()
@@ -1705,13 +1711,13 @@ async fn stream_audio_in(
     let http = client.clone();
     let ustreamer_config = player.ustreamer_config;
     let session_version = sabr_client_version(client_config, yt_session.as_deref());
-    let reload_auth = match (ctt, yt_session) {
+    let reload_client = match (ctt, yt_session) {
         (Some(ctt), Some(session)) if client_config.client_name == "WEB_REMIX" => {
-            Some((ctt.to_owned(), session))
+            ReloadClient::WebRemix { ctt: ctt.to_owned(), session }
         }
-        _ => None,
+        _ => ReloadClient::Anonymous(client_config),
     };
-    let mut reloader = HttpReloader { http: http.clone(), video_id: video_id.to_owned(), auth: reload_auth };
+    let mut reloader = HttpReloader { http: http.clone(), video_id: video_id.to_owned(), client: reload_client };
 
     let video_fmt_clone = video_fmt.clone();
     tokio::spawn(async move {
@@ -2224,26 +2230,30 @@ async fn sabr_loop(
     .with_client_version(session_version);
     state.started = started;
 
-    // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
-    // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
-    if let Some(ref token) = po_token {
-        use base64::Engine;
-        use base64::engine::{GeneralPurpose, GeneralPurposeConfig, DecodePaddingMode};
-        const URL_SAFE_LENIENT: GeneralPurpose = GeneralPurpose::new(
-            &base64::alphabet::URL_SAFE,
-            GeneralPurposeConfig::new()
-                .with_decode_padding_mode(DecodePaddingMode::Indifferent),
-        );
-        match URL_SAFE_LENIENT.decode(token) {
-            Ok(bytes) => {
-                tracing::info!("[sabr] PoToken set ({} bytes)", bytes.len());
-                state.po_token = Some(bytes);
-            }
-            Err(e) => tracing::warn!("[sabr] failed to decode PoToken: {}", e),
+    state.po_token = po_token.as_deref().and_then(decode_po_token);
+    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }, reloader).await
+}
+
+/// The PoToken bytes for the SABR StreamerContext. bgutil-pot returns
+/// URL-safe base64 (uses `-` and `_`) with optional padding.
+fn decode_po_token(token: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    use base64::engine::{GeneralPurpose, GeneralPurposeConfig, DecodePaddingMode};
+    const URL_SAFE_LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    match URL_SAFE_LENIENT.decode(token) {
+        Ok(bytes) => {
+            tracing::info!("[sabr] PoToken set ({} bytes)", bytes.len());
+            Some(bytes)
+        }
+        Err(e) => {
+            tracing::warn!("[sabr] failed to decode PoToken: {}", e);
+            None
         }
     }
-
-    drive_loop(&mut state, tx, &mut HttpCycle { http, tx }, reloader).await
 }
 
 /// One SABR request/response round trip, boxed so `drive_loop` stays `Send`.
@@ -2272,44 +2282,79 @@ struct ReloadedPlayer {
     server_url: String,
     ustreamer_config: Vec<u8>,
     formats: Vec<AdaptiveFormat>,
+    /// A new PoToken (decoded) to send from now on; `None` keeps the old one.
+    po_token: Option<Vec<u8>>,
 }
 
 type ReloadFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReloadedPlayer, SabrError>> + Send + 'a>>;
 
-/// Fetches a fresh /player response, with the server's reload token if any.
-trait PlayerReloader {
-    fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a>;
+/// Why the stream fetches a fresh /player response.
+#[derive(Debug, Clone, Copy)]
+enum ReloadReason<'a> {
+    /// The server sent RELOAD_PLAYER_RESPONSE, with this token if any.
+    Requested { token: Option<&'a str> },
+    /// Media stopped coming (the throttle after ~60 s when the PoToken is
+    /// not accepted): fresh session data and a fresh PoToken.
+    Stalled,
 }
 
-/// Reloads via WEB_REMIX with the same ctt and page session as the first
-/// /player call. The ctt lives here, in memory, only for this song's stream.
+/// Fetches a fresh /player response for the streaming song.
+trait PlayerReloader {
+    fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a>;
+}
+
+/// The client the song's first /player call used, which a reload repeats.
+enum ReloadClient {
+    /// WEB_REMIX with the song's own ctt and the page session. The ctt lives
+    /// here, in memory, only for this song's stream.
+    WebRemix { ctt: String, session: std::sync::Arc<crate::music_session::YtMusicSession> },
+    /// An anonymous fallback client (IOS).
+    Anonymous(&'static InnerTubeClient),
+}
+
 struct HttpReloader {
     http: reqwest::Client,
     video_id: String,
-    /// `None` when the song did not stream via WEB_REMIX: no reload possible.
-    auth: Option<(String, std::sync::Arc<crate::music_session::YtMusicSession>)>,
+    client: ReloadClient,
 }
 
 impl PlayerReloader for HttpReloader {
-    fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a> {
+    fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
         Box::pin(async move {
-            let (ctt, session) = self
-                .auth
-                .as_ref()
-                .ok_or("player reload needs WEB_REMIX (cast ctt and YouTube Music session)")?;
-            let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
-            let player = innertube_player(
-                &self.http, &self.video_id, PlayerTarget::WebRemix(auth), None, None, token,
-            )
-            .await?;
+            let token = match reason {
+                ReloadReason::Requested { token } => token,
+                ReloadReason::Stalled => None,
+            };
+            let (target, session) = match &self.client {
+                ReloadClient::WebRemix { ctt, session } => {
+                    let auth = crate::music_session::web_remix_auth(Some(ctt), Some(session))?;
+                    (PlayerTarget::WebRemix(auth), Some(session.as_ref()))
+                }
+                ReloadClient::Anonymous(client) => (PlayerTarget::Anonymous(client), None),
+            };
+            let player = innertube_player(&self.http, &self.video_id, target, None, None, token).await?;
             tracing::info!("[sabr] reloaded /player lists itags {:?}", listed_itags(&player.formats));
-            let server_url = solve_nsig(player.server_abr_streaming_url, Some(session)).await?;
+            let server_url = match session {
+                Some(session) => solve_nsig(player.server_abr_streaming_url, Some(session)).await?,
+                None => player.server_abr_streaming_url,
+            };
             check_streaming_url(&server_url)?;
+            let po_token = match reason {
+                ReloadReason::Stalled => {
+                    let fresh = fetch_pot_token(&self.http, Some(&self.video_id)).await;
+                    if fresh.is_none() {
+                        tracing::warn!("[sabr] no fresh PoToken from bgutil-pot; keeping the old one");
+                    }
+                    fresh.and_then(|g| decode_po_token(&g.po_token))
+                }
+                ReloadReason::Requested { .. } => None,
+            };
             Ok(ReloadedPlayer {
                 server_url,
                 ustreamer_config: player.ustreamer_config,
                 formats: player.formats,
+                po_token,
             })
         })
     }
@@ -2338,8 +2383,52 @@ async fn handle_reload(
         "[sabr] reloading player response ({}/{})",
         state.stats.reloads, MAX_RELOADS_PER_SONG,
     );
-    let player = reloader.fetch(reload.token.as_deref()).await?;
+    let player = reloader.fetch(ReloadReason::Requested { token: reload.token.as_deref() }).await?;
     apply_reload(state, &player)
+}
+
+/// A stall is taken as SABR's throttle point: after this many round trips
+/// without new media, the stream resumes (or gives up).
+const MAX_STALLED_REQUESTS: u32 = 30;
+
+/// Resumes per song after a stall; each costs a /player call and a PoToken.
+const MAX_STALL_RESUMES_PER_SONG: u32 = 3;
+
+/// Answer a stall: point the stream at a fresh /player response with a
+/// fresh PoToken and go on from the reached position (buffered ranges,
+/// playback cookie and the consumer channel carry over, so MPD's HTTP body
+/// simply continues). False when the cap is reached or the reload fails:
+/// the song then ends there, as before.
+async fn resume_after_stall(
+    state: &mut SabrState,
+    reloader: &mut impl PlayerReloader,
+    stalled_requests: u32,
+) -> bool {
+    let reached = state.audio_downloaded_ms;
+    if state.stats.stall_resumes >= MAX_STALL_RESUMES_PER_SONG {
+        tracing::warn!(
+            "[sabr] stalled at {}ms for {} requests after {} resumes, giving up",
+            reached, stalled_requests, state.stats.stall_resumes,
+        );
+        return false;
+    }
+    state.stats.stall_resumes += 1;
+    tracing::warn!(
+        "[sabr] stalled at {}ms for {} requests (stream_protection_status {:?}); resuming with a fresh /player and PoToken ({}/{})",
+        reached, stalled_requests, state.stats.protection_statuses,
+        state.stats.stall_resumes, MAX_STALL_RESUMES_PER_SONG,
+    );
+    let applied = match reloader.fetch(ReloadReason::Stalled).await {
+        Ok(player) => apply_reload(state, &player),
+        Err(e) => Err(e),
+    };
+    match applied {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("[sabr] stall resume failed: {}; giving up at {}ms", e, reached);
+            false
+        }
+    }
 }
 
 /// Repeat SABR request cycles until the stream is done, the consumer is
@@ -2399,12 +2488,12 @@ async fn drive_loop(
         // new segments, stop after too many fruitless requests.
         if state.audio_downloaded_ms == prev_progress && prev_progress > 0 {
             stall_count += 1;
-            if stall_count > 30 {
-                tracing::warn!(
-                    "[sabr] stalled at {}ms for {} requests, giving up",
-                    state.audio_downloaded_ms, stall_count,
-                );
-                break;
+            if stall_count > MAX_STALLED_REQUESTS {
+                if !resume_after_stall(state, reloader, stall_count).await {
+                    break;
+                }
+                stall_count = 0;
+                continue;
             }
         } else {
             stall_count = 0;
@@ -3611,7 +3700,12 @@ mod tests {
         drc.last_modified = 7;
         let mut plain = variant(140, None, false, None);
         plain.last_modified = 8;
-        let player = ReloadedPlayer { server_url: RELOADED_URL.to_owned(), ustreamer_config: vec![], formats: vec![drc, plain] };
+        let player = ReloadedPlayer {
+            server_url: RELOADED_URL.to_owned(),
+            ustreamer_config: vec![],
+            formats: vec![drc, plain],
+            po_token: None,
+        };
 
         apply_reload(&mut state, &player).unwrap();
 
@@ -3857,12 +3951,16 @@ mod tests {
     }
 
     impl PlayerReloader for FakeReloader {
-        fn fetch<'a>(&'a mut self, token: Option<&'a str>) -> ReloadFuture<'a> {
+        fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
+            let ReloadReason::Requested { token } = reason else {
+                panic!("only server-requested reloads expected, got {reason:?}");
+            };
             self.tokens.push(token.map(str::to_owned));
             let player = ReloadedPlayer {
                 server_url: RELOADED_URL.to_owned(),
                 ustreamer_config: vec![9, 9],
                 formats: self.formats.clone(),
+                po_token: None,
             };
             Box::pin(async move { Ok(player) })
         }
@@ -3967,7 +4065,12 @@ mod tests {
 
     #[test]
     fn reload_drops_only_a_cookie_for_another_audio_format() {
-        let player = ReloadedPlayer { server_url: RELOADED_URL.to_owned(), ustreamer_config: vec![], formats: vec![] };
+        let player = ReloadedPlayer {
+            server_url: RELOADED_URL.to_owned(),
+            ustreamer_config: vec![],
+            formats: vec![],
+            po_token: None,
+        };
         let mut state = sabr_251_state();
         state.playback_cookie = Some(cookie_for(774));
         apply_reload(&mut state, &player).unwrap();
@@ -4057,7 +4160,7 @@ mod tests {
     async fn reload_fetch_failure_ends_the_stream() {
         struct FailingReloader;
         impl PlayerReloader for FailingReloader {
-            fn fetch<'a>(&'a mut self, _token: Option<&'a str>) -> ReloadFuture<'a> {
+            fn fetch<'a>(&'a mut self, _reason: ReloadReason<'a>) -> ReloadFuture<'a> {
                 Box::pin(async { Err("reload needs WEB_REMIX".into()) })
             }
         }
@@ -4071,4 +4174,150 @@ mod tests {
         assert_eq!(cycle.requests, 1);
     }
 
+    // -- stall resume ------------------------------------------------------------
+
+    const STALL_MS: i64 = 60_001;
+    const FRESH_POTOKEN: &[u8] = b"fresh-potoken-bytes";
+
+    /// Reaches `STALL_MS` on its first round trip and sends one audio chunk,
+    /// then makes no progress (the throttle) until `resumed_while` lets it
+    /// finish: one more chunk, then the end.
+    struct StallingCycle {
+        requests: u32,
+        resumed: fn(&SabrState) -> bool,
+        tx: mpsc::Sender<Bytes>,
+    }
+
+    impl SabrCycle for StallingCycle {
+        fn run<'a>(&'a mut self, state: &'a mut SabrState) -> CycleFuture<'a> {
+            self.requests += 1;
+            let first = self.requests == 1;
+            Box::pin(async move {
+                if first {
+                    state.audio_downloaded_ms = STALL_MS;
+                    self.tx.send(Bytes::from_static(b"before")).await.unwrap();
+                    return Ok(true);
+                }
+                if (self.resumed)(state) {
+                    state.audio_downloaded_ms = 200_000;
+                    self.tx.send(Bytes::from_static(b"after")).await.unwrap();
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+        }
+    }
+
+    /// Like `FakeReloader`, but with a fresh PoToken when the stream stalled.
+    struct StallReloader {
+        reasons: Vec<String>,
+        fail: bool,
+    }
+
+    impl PlayerReloader for StallReloader {
+        fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
+            self.reasons.push(format!("{reason:?}"));
+            let fail = self.fail;
+            let po_token = matches!(reason, ReloadReason::Stalled).then(|| FRESH_POTOKEN.to_vec());
+            Box::pin(async move {
+                if fail {
+                    return Err("no /player".into());
+                }
+                Ok(ReloadedPlayer {
+                    server_url: RELOADED_URL.to_owned(),
+                    ustreamer_config: vec![9, 9],
+                    formats: reload_formats(),
+                    po_token,
+                })
+            })
+        }
+    }
+
+    fn stalled_stream() -> (SabrState, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+        let mut state = sabr_251_state();
+        state.po_token = Some(SECRET_POTOKEN.to_vec());
+        state.playback_cookie = Some(cookie_for(251));
+        let (tx, rx) = mpsc::channel(8);
+        (state, tx, rx)
+    }
+
+    fn chunks(rx: &mut mpsc::Receiver<Bytes>) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            out.push(chunk);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_stall_resumes_in_place_with_a_fresh_player_and_po_token() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let (mut state, tx, mut rx) = stalled_stream();
+        let mut cycle = StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(reloader.reasons, vec!["Stalled"]);
+        assert_eq!(state.stats.stall_resumes, 1);
+        assert_eq!(state.po_token.as_deref(), Some(FRESH_POTOKEN));
+        assert_eq!(state.server_url, RELOADED_URL);
+        // Progress and cookie carry over: SABR continues where it stalled,
+        // on the same channel, so MPD's HTTP body goes on.
+        assert_eq!(state.playback_cookie, Some(cookie_for(251)));
+        assert_eq!(chunks(&mut rx), vec![Bytes::from_static(b"before"), Bytes::from_static(b"after")]);
+        let text = logs.text();
+        assert!(text.contains("stalled at 60001ms"), "{text}");
+        assert!(text.contains("resuming with a fresh /player and PoToken (1/3)"), "{text}");
+        assert!(!text.contains("giving up"), "{text}");
+        assert!(!text.contains("secret") && !text.contains("fresh-potoken"), "{text}");
+    }
+
+    #[test]
+    fn a_requested_reload_keeps_the_po_token() {
+        let player = ReloadedPlayer {
+            server_url: RELOADED_URL.to_owned(),
+            ustreamer_config: vec![],
+            formats: vec![],
+            po_token: None,
+        };
+        let mut state = sabr_251_state();
+        state.po_token = Some(SECRET_POTOKEN.to_vec());
+        apply_reload(&mut state, &player).unwrap();
+        assert_eq!(state.po_token.as_deref(), Some(SECRET_POTOKEN));
+    }
+
+    #[tokio::test]
+    async fn stall_resumes_are_capped_at_three_per_song() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let (mut state, tx, _rx) = stalled_stream();
+        let mut cycle = StallingCycle { requests: 0, resumed: |_| false, tx: tx.clone() };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(reloader.reasons.len(), MAX_STALL_RESUMES_PER_SONG as usize);
+        assert_eq!(state.stats.stall_resumes, MAX_STALL_RESUMES_PER_SONG);
+        // Each resume waits out a whole stall again: 1 + 4 x 31 round trips.
+        assert_eq!(cycle.requests, 1 + (MAX_STALL_RESUMES_PER_SONG + 1) * (MAX_STALLED_REQUESTS + 1));
+        let text = logs.text();
+        assert!(text.contains("resuming with a fresh /player and PoToken (3/3)"), "{text}");
+        assert!(text.contains("stalled at 60001ms for 31 requests after 3 resumes, giving up"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_stall_resume_ends_the_song_as_before() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        let (mut state, tx, _rx) = stalled_stream();
+        let mut cycle = StallingCycle { requests: 0, resumed: |_| false, tx: tx.clone() };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: true };
+
+        drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+        assert_eq!(reloader.reasons, vec!["Stalled"]);
+        assert_eq!(cycle.requests, 1 + MAX_STALLED_REQUESTS + 1);
+        assert_eq!(state.po_token.as_deref(), Some(SECRET_POTOKEN));
+        let text = logs.text();
+        assert!(text.contains("stall resume failed: no /player; giving up"), "{text}");
+    }
 }
