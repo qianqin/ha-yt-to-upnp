@@ -18,8 +18,9 @@
 # run (which reviews need). One container with the default stream_format
 # (flac): the four services up as their users, MPD answers, port 8000 serves
 # FLAC while MPD plays, the DIAL description has the cast name, the PoToken
-# helper answers /ping (it mints no token) and logs its time zone, the adapter
-# gets its options; plus,
+# helper answers /ping (it mints no token), logs its time zone, cannot write its
+# folder and its entry file sends the platform's user agent (to a stub, no
+# internet), the adapter gets its options; plus,
 # in parallel, one invalid option that must stop the app. No stability wait.
 # The image is built with the classic builder (no BuildKit cache is left) on a
 # cached base image: the Dockerfile up to its "# smoke-quick-cache-boundary"
@@ -532,6 +533,13 @@ if mode in ("full", "quick"):
         pong = repr(e)
     check('"server_uptime"' in pong, "PoToken helper answers on 127.0.0.1:4416 (%s)" % pong[:80])
 
+    # The helper's folder and its entry file come from the image, read-only for it.
+    for what, script in (("create a file in /opt/bgutil", ": > /opt/bgutil/.smoke-write-probe"),
+                         ("write /opt/bgutil/ytcast-entry.ts", ": >> /opt/bgutil/ytcast-entry.ts")):
+        r = subprocess.run(["/command/s6-setuidgid", "potoken", "/bin/sh", "-c", script],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        check(r.returncode != 0, "potoken cannot %s (exit %d)" % (what, r.returncode))
+
 if mode == "full":
     check(not can_connect(ip, 6600), "MPD control is not reachable on %s:6600" % ip)
     check(not can_connect(ip, 4416), "PoToken helper is not reachable on %s:4416" % ip)
@@ -650,6 +658,22 @@ expect_stopped() {
   echo "PASS no service started"
 }
 
+# The image's entry file, run under the installed Deno and bgutil as the potoken
+# user with the run script's restrictions, sends the user agent that names the
+# real platform: scripts/ha_potoken_run_test.py's EntryFileSetsTheUserAgent, its
+# src/main.ts a stub that asks a listener in the container (no internet).
+expect_entry_user_agent() {
+  local out
+  docker cp "$root/scripts/ha_potoken_run_test.py" "$1:/tmp/ha_potoken_run_test.py" >/dev/null
+  out="$(docker exec "$1" env YTCAST_TEST_BGUTIL_DIR=/opt/bgutil \
+    YTCAST_TEST_ENTRY=/opt/bgutil/ytcast-entry.ts YTCAST_TEST_DENO=/usr/local/bin/deno \
+    YTCAST_TEST_DENO_USER=potoken \
+    python3 -I /tmp/ha_potoken_run_test.py EntryFileSetsTheUserAgent 2>&1)" || {
+    echo "$out"; die "the image's ytcast-entry.ts does not set the platform's user agent"; }
+  grep -qx OK <<<"$out" || { echo "$out"; die "the user agent test did not run (skipped?)"; }
+  echo "PASS the image's ytcast-entry.ts sends the user agent that names the platform"
+}
+
 # The PoToken helper logs $SMOKE_TZ with its (non-zero) UTC offset and no
 # warning about a zero offset.
 expect_tz_logged() {
@@ -679,6 +703,7 @@ if [ "$mode" != full ]; then
     "adapter_env_absent": ["RAUMFELD_SPEAKER_UDN"], "potoken_tz": "Europe/Berlin"}'
   echo "services up and checked $((SECONDS - started))s after the start"
   expect_tz_logged "$run_id-quick"
+  expect_entry_user_agent "$run_id-quick"
   expect_stopped "$run_id-badformat" "option 'stream_format' is invalid: must be one of flac, mp3"
   if [ "$mode" = release ]; then
     step "release path: the image's programs are the tarball's"
@@ -720,6 +745,7 @@ expect_main='{"cast_name": "Smoke Test",
 wait_for_checks "$main" full "$expect_main"
 first_pids="$(pids_of "$main")"
 expect_tz_logged "$main"
+expect_entry_user_agent "$main"
 
 step "run 1: PoToken helper mints a 120-character token with TZ=$SMOKE_TZ (needs internet from the container)"
 docker exec "$main" python3 -I /tmp/check.py pot '{}' || {

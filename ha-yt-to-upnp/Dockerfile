@@ -33,8 +33,7 @@ RUN apt-get update \
 # hence the chmods. The PoToken helper (Deno, bgutil) changes least, so it comes
 # first: scripts/smoke-ha-app.sh --quick keeps everything above the boundary
 # line below as a cached image (it builds this stage alone, copying from
-# artefacts/ in the build context). The helper's entry file
-# (/opt/bgutil/ytcast-entry.ts) comes with rootfs/.
+# artefacts/ in the build context).
 COPY --from=artefacts /artefacts/deno /usr/local/bin/
 COPY --from=artefacts /artefacts/bgutil/ /opt/bgutil/
 RUN chmod 0755 /usr/local/bin/deno && chmod -R a+rX,go-w /opt/bgutil
@@ -42,8 +41,10 @@ RUN chmod 0755 /usr/local/bin/deno && chmod -R a+rX,go-w /opt/bgutil
 COPY --from=artefacts /artefacts/ytcast-lite /usr/local/bin/
 COPY --from=artefacts /artefacts/adapter/ /opt/ytcast-adapter/
 COPY --from=artefacts /artefacts/BUILD-INFO /opt/BUILD-INFO
+# rootfs/ brings the PoToken helper's entry file, /opt/bgutil/ytcast-entry.ts,
+# into the helper's folder: both stay read-only for the potoken user.
 COPY rootfs/ /
 RUN chmod 0755 /usr/local/bin/ytcast-lite /etc/s6-overlay/scripts/*.sh \
         /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish \
     && chmod -R a+rX,go-w /opt/ytcast-adapter /usr/lib/ytcast /etc/ytcast \
-    && chmod 0644 /opt/bgutil/ytcast-entry.ts
+    && chmod a+rX,go-w /opt/bgutil && chmod 0644 /opt/bgutil/ytcast-entry.ts

@@ -157,7 +157,10 @@ until (exec 3<>/dev/tcp/127.0.0.1/6600) 2>/dev/null; do
 done
 
 # As in the app: from the helper's directory (Deno reads deno.json and the lock
-# file there), with the Deno cache filled at build time.
+# file there), with the Deno cache filled at build time. Unlike the app it runs
+# bgutil's src/main.ts, not rootfs/opt/bgutil/ytcast-entry.ts: on macOS
+# navigator.platform is "MacIntel", which bgutils-js's own macOS user agent
+# already matches (the entry file would send "X11; MacIntel").
 bgutil="$app/artefacts/bgutil"
 start potoken "$bgutil" DENO_DIR="$bgutil/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 HOME=/nonexistent \
   "$(command -v deno)" run --no-prompt --frozen --cached-only \
