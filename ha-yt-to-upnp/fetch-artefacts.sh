@@ -72,8 +72,12 @@ if [ -n "${ARTEFACTS_URL:-}" ]; then
 fi
 
 printf 'fetch-artefacts: %s\n' "$url"
-tarball="$(mktemp)"
-curl_status="$(mktemp)"
+# One work folder in TMPDIR, removed on every exit (die included). An explicit
+# template: macOS mktemp without one ignores TMPDIR.
+work="$(mktemp -d "${TMPDIR:-/tmp}/fetch-artefacts.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+tarball="$work/release.tar.gz"
+curl_status="$work/curl-status"
 # -q first: no .curlrc. --max-filesize refuses a Content-Length over the cap
 # at once, but curl 7.88 does not count a transfer without one; head cuts any
 # transfer one byte past the cap, so a tarball that size is refused below.
@@ -86,11 +90,11 @@ actual="$(sha256sum "$tarball" | cut -d' ' -f1)"
 [ "$actual" = "$sha256" ] || die "sha256 mismatch for $url: expected $sha256, got $actual"
 echo "fetch-artefacts: sha256 $actual matches artefacts.lock"
 
-unpack="$(mktemp -d)"
+unpack="$work/unpack"
+mkdir "$unpack"
 tar -xzf "$tarball" --no-same-owner --no-same-permissions -C "$unpack"
 for entry in $ENTRIES; do
   [ -e "$unpack/artefacts/$entry" ] || die "artefacts/$entry missing from the release tarball"
   mv "$unpack/artefacts/$entry" "$out/"
 done
-rm -rf "$tarball" "$curl_status" "$unpack"
 strip_special_bits

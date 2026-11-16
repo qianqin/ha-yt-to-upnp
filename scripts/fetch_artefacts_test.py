@@ -37,6 +37,19 @@ exit 7
 """
 
 
+def system_temp_dir():
+    """Where mktemp puts files when it ignores TMPDIR: on macOS the per-user
+    folder from confstr (getconf DARWIN_USER_TEMP_DIR), elsewhere /tmp."""
+    try:
+        out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        if out and os.path.isdir(out):
+            return out
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return "/tmp"
+
+
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
     """Files from the served folder; /nolength/<n>: n zero bytes without a
     Content-Length (the end is where the connection closes)."""
@@ -287,6 +300,39 @@ class FetchArtefactsTest(unittest.TestCase):
         self.write_lock("0" * 64)
         result = self.run_fetch(self.url("limit.tar.gz"))
         self.assertFails(result, "sha256 mismatch")
+
+    # -- temporary files stay in TMPDIR and are removed --------------------
+
+    def assertLeavesNoTemporaryFiles(self, run):
+        """run() fails the fetch; afterwards neither the fetch's own TMPDIR nor
+        the system's temporary folder holds anything new. macOS mktemp without
+        a template ignores TMPDIR, so leaked 512 MiB downloads filled the disk."""
+        own = os.path.join(self.tmp, "own-tmp")
+        os.makedirs(own)
+        system = system_temp_dir()
+        before = set(os.listdir(system))
+        run(own)
+        self.assertEqual(os.listdir(own), [])
+        leaked = sorted(n for n in set(os.listdir(system)) - before if n.startswith("tmp."))
+        self.assertEqual(leaked, [], "fetch-artefacts.sh left files in %s" % system)
+
+    def test_a_sha256_mismatch_leaves_no_temporary_files(self):
+        url = self.serve("other.tar.gz", b"x" * 4096)
+        self.write_lock("0" * 64)
+        self.assertLeavesNoTemporaryFiles(
+            lambda tmpdir: self.assertFails(self.run_fetch(url, tmpdir=tmpdir), "sha256 mismatch"))
+
+    def test_a_tarball_missing_an_entry_leaves_no_temporary_files(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo("artefacts/BUILD-INFO")
+            info.size = 1
+            tar.addfile(info, io.BytesIO(b"x"))
+        data = buf.getvalue()
+        url = self.serve("partial.tar.gz", data)
+        self.write_lock(hashlib.sha256(data).hexdigest())
+        self.assertLeavesNoTemporaryFiles(
+            lambda tmpdir: self.assertFails(self.run_fetch(url, tmpdir=tmpdir), "artefacts/ytcast-lite missing from the release tarball"))
 
     # -- no setuid or setgid bit survives -----------------------------------
 
