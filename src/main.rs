@@ -569,6 +569,13 @@ async fn on_command<R, Fut>(
         PlayerCommand::SendersListed { theme, device_ids, unidentified } => senders_listed(
             senders, playlist, dial_state, active_theme, theme, device_ids, *unidentified, *play_started,
         ),
+        PlayerCommand::SendersForgotten { theme } => {
+            if *active_theme.read().unwrap() == *theme {
+                tracing::info!("[player] The Lounge's rebind lists no sender; who is connected is unknown until they speak");
+                senders.replace_connected(&[], 0);
+            }
+            return;
+        }
         _ => true,
     };
     // A sender left or was not listed, but another is still connected.
@@ -799,8 +806,8 @@ where
             }
         }
 
-        PlayerCommand::RemoteConnected { .. } => {
-            // Handled in the main select! loop (on_remote_connected)
+        PlayerCommand::RemoteConnected { .. } | PlayerCommand::SendersForgotten { .. } => {
+            // Handled in on_command
         }
 
         // A sender leaves when the phone sleeps: like a Chromecast, the
@@ -1256,10 +1263,12 @@ fn forget_cast_tokens(playlist: &mut PlaylistState, dial_state: &dial::DialState
 
 /// The Lounge listed `theme`'s senders (`device_ids`, and `unidentified`
 /// ones without a readable id). The list is authoritative: a sender whose
-/// remoteDisconnected was missed is gone. Someone listed while nobody was
-/// connected is checked as a connecting sender (`remote_connected`), in case
-/// its remoteConnected was lost. True when the list left nobody connected;
-/// the caller then plays on or stops, as for a last sender.
+/// remoteDisconnected was missed is gone. A list comes right after its
+/// readiness RemoteConnected, which already applied the newcomer rule; if
+/// that command was dropped (the player channel full), someone listed while
+/// nobody is connected gets the same rule here. True when the list left
+/// nobody connected; the caller then plays on or stops, as for a last
+/// sender.
 #[allow(clippy::too_many_arguments)]
 fn senders_listed(
     senders: &mut senders::Senders,
@@ -3016,16 +3025,29 @@ mod preroll_wiring_tests {
         senders: &mut senders::Senders,
         script: Vec<(&'static str, &'static str)>,
     ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
+        let active = std::sync::RwLock::new("m".to_owned());
+        on_command_on(&active, dial_state, cmd, playlist, play_started, senders, script).await
+    }
+
+    /// `on_command_with` with the active theme given.
+    async fn on_command_on(
+        active: &std::sync::RwLock<String>,
+        dial_state: &Arc<dial::DialState>,
+        cmd: lounge::PlayerCommand,
+        playlist: &mut PlaylistState,
+        play_started: &mut bool,
+        senders: &mut senders::Senders,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
         let _lock = global_pins_lock();
         let (port, server) = fake_mpd(script).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(32);
-        let active = std::sync::RwLock::new("m".to_owned());
         let resolve = |vid: String, _, _| {
             let result = no_stream(&vid);
             async move { result }
         };
-        on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, &active, &resolve).await;
+        on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve).await;
         drop(mpd);
         let mut sent = Vec::new();
         while let Ok(msg) = state_rx.try_recv() {
@@ -3096,9 +3118,13 @@ mod preroll_wiring_tests {
         playlist = queue_at(&dial_state, 0);
         play_started = true;
         for _ in 0..3 {
+            on_command_with(&dial_state, connect(&[]), &mut playlist, &mut play_started, &mut senders, vec![]).await;
             on_command_with(&dial_state, listed_on("m", &[], 1), &mut playlist, &mut play_started, &mut senders, vec![])
                 .await;
         }
+        // Alice, connected throughout, is no newcomer: her cast keeps its tokens.
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
+        assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").as_deref(), Some("ctt-a"));
         // Alice leaves; the song plays on unattended.
         on_command_with(&dial_state, disconnect("alice"), &mut playlist, &mut play_started, &mut senders, vec![]).await;
         assert!(!senders.any_connected(), "no ghost keeps the cast attended");
@@ -3131,6 +3157,82 @@ mod preroll_wiring_tests {
             let expected = if keeps { auth("ctt-a") } else { cast_tokens::VideoAuth::default() };
             assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), expected, "{ids:?} {unidentified}");
             assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").is_some(), keeps, "{ids:?} {unidentified}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_id_less_lounge_status_on_another_theme_makes_it_the_active_one() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        // After a restart the receiver starts on "cl"; the phone is on "m".
+        let active = std::sync::RwLock::new("cl".to_owned());
+        let mut senders = senders::Senders::default();
+        let mut playlist = PlaylistState::default();
+        let connect_m = lounge::PlayerCommand::RemoteConnected { theme: "m".into(), device_ids: vec![], name: None };
+        on_command_on(&active, &dial_state, connect_m, &mut playlist, &mut false, &mut senders, vec![]).await;
+        on_command_on(&active, &dial_state, listed_on("m", &[], 1), &mut playlist, &mut false, &mut senders, vec![])
+            .await;
+        assert_eq!(*active.read().unwrap(), "m");
+        assert!(senders.any_connected());
+        let set_video = lounge::PlayerCommand::SetVideo { video_id: "aaaaaaaaaaa".into(), ctt: None, current_time: 0.0 };
+        assert!(!is_stale_command(senders.any_connected(), &set_video), "the phone's setVideo plays");
+    }
+
+    #[tokio::test]
+    async fn a_rebind_listing_nobody_forgets_the_connected_senders_quietly() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let forgotten = || lounge::PlayerCommand::SendersForgotten { theme: "m".into() };
+        for (who, keeps) in [("bob", false), ("alice", true)] {
+            let mut playlist = queue_at(&dial_state, 0);
+            for play_started in [true, false] {
+                let mut started = play_started;
+                let mut senders = connected(&["alice"]);
+                let (seen, sent) =
+                    on_command_with(&dial_state, forgotten(), &mut playlist, &mut started, &mut senders, vec![]).await;
+                assert!(seen.is_empty(), "no stop: {seen:?}");
+                assert!(sent.is_empty());
+                assert_eq!(started, play_started);
+                assert!(!senders.any_connected(), "Alice's leave may have been lost in the rebind");
+                assert_eq!(senders.cast_ids(), strings(&["alice"]).as_slice(), "her ids stay for a return");
+                assert_eq!(playlist.video_ids.len(), 3);
+                assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
+                assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").as_deref(), Some("ctt-a"));
+            }
+            // Another theme's bind changes nothing here.
+            let mut senders = connected(&["alice"]);
+            let other = lounge::PlayerCommand::SendersForgotten { theme: "cl".into() };
+            on_command_with(&dial_state, other, &mut playlist, &mut false, &mut senders, vec![]).await;
+            assert!(senders.any_connected());
+
+            let mut senders = connected(&["alice"]);
+            on_command_with(&dial_state, forgotten(), &mut playlist, &mut false, &mut senders, vec![]).await;
+            on_command_with(&dial_state, connect(&[who]), &mut playlist, &mut false, &mut senders, vec![]).await;
+            let expected = if keeps { auth("ctt-a") } else { cast_tokens::VideoAuth::default() };
+            assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), expected, "{who}");
+            assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").is_some(), keeps, "{who}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_sender_log_says_how_it_went() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        type Gone = fn() -> lounge::PlayerCommand;
+        let cases: [(Gone, &str); 2] = [
+            (|| listed_on("m", &[], 0), "The Lounge lists no sender any more"),
+            (|| disconnect("phone"), "Remote disconnected"),
+        ];
+        for (gone, says) in cases {
+            for (play_started, then) in [(true, "playback continues without a sender"), (false, "stopping playback")] {
+                let mut playlist = queue_at(&dial_state, 0);
+                let mut started = play_started;
+                let script = if play_started { vec![] } else { vec![("stop", "OK\n"), ("clear", "OK\n")] };
+                let logs = crate::storage::test_util::LogCapture::start();
+                on_command_with(&dial_state, gone(), &mut playlist, &mut started, &mut connected(&["phone"]), script).await;
+                let text = logs.text();
+                assert!(text.contains(&format!("{says}, {then}")), "{says} / {then}:\n{text}");
+            }
         }
     }
 

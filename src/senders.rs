@@ -43,12 +43,13 @@ impl Senders {
 
     /// The Lounge's list of who is connected now: `ids`, and `unidentified`
     /// senders without a readable id. It replaces the known senders, so one
-    /// whose leave was missed is gone. An unidentified one keeps a known
-    /// sender without an id (by its name), else counts as such.
+    /// whose leave was missed is gone. The listed senders without an id are
+    /// the known ones without an id (named or not), first-connected first,
+    /// padded with unidentified ones.
     pub fn replace_connected(&mut self, ids: &[String], unidentified: usize) {
         let mut without_id: Vec<Sender> =
             self.connected.drain(..).filter(|sender| !matches!(sender, Sender::Id(_))).collect();
-        // Kept in their order, cut or padded to the listed number.
+        // In connect order, cut or padded to the listed number.
         without_id.resize_with(unidentified, || Sender::Unidentified);
         self.connected = ids.iter().cloned().map(Sender::Id).chain(without_id).collect();
         self.note_ids(ids);
@@ -224,6 +225,19 @@ mod tests {
         senders.replace_connected(&[], 1);
         senders.disconnect(None, Some("Phone"));
         assert!(!senders.any_connected());
+    }
+
+    #[test]
+    fn a_shorter_list_keeps_the_first_connected_senders_without_an_id() {
+        let mut senders = Senders::default();
+        for name in ["Phone", "iPad", "TV"] {
+            senders.connect(&[], Some(name));
+        }
+        senders.replace_connected(&[], 2);
+        senders.disconnect(None, Some("Phone"));
+        assert!(senders.any_connected(), "the iPad is still known by name");
+        senders.disconnect(None, Some("iPad"));
+        assert!(!senders.any_connected(), "the TV, connected last, was dropped");
     }
 
     #[test]

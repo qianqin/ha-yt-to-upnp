@@ -116,6 +116,10 @@ pub enum PlayerCommand {
     /// A loungeStatus: the senders connected now, `device_ids` for those with
     /// a readable id and `unidentified` for the others. Replaces the known ones.
     SendersListed { theme: String, device_ids: Vec<String>, unidentified: usize },
+    /// The receiver's own (re)bind listed nobody: a sender whose leave was
+    /// lost meanwhile is no longer counted, but a phone that is still there
+    /// may just not be listed yet, so this ends nothing.
+    SendersForgotten { theme: String },
     UpdatePlaylist {
         video_ids: Vec<String>,
         list_id: String,
@@ -578,9 +582,6 @@ fn send_cmd(player_tx: &mpsc::Sender<PlayerCommand>, cmd: PlayerCommand) {
     }
 }
 
-/// Process a batch of incoming messages, dispatching player commands and
-/// updating session state. Returns any outgoing messages that should be
-/// sent back to YouTube in response.
 /// Where incoming messages came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Delivery {
@@ -591,6 +592,18 @@ enum Delivery {
     Poll,
 }
 
+/// A bind or rebind response's messages (see `Delivery::Bind`).
+fn dispatch_bind_response(
+    session: &mut LoungeSession,
+    messages: &[IncomingMessage],
+    player_tx: &mpsc::Sender<PlayerCommand>,
+) -> Vec<OutgoingMessage> {
+    dispatch_messages(session, messages, player_tx, Delivery::Bind)
+}
+
+/// Process a batch of incoming messages, dispatching player commands and
+/// updating session state. Returns any outgoing messages that should be
+/// sent back to YouTube in response.
 fn dispatch_messages(
     session: &mut LoungeSession,
     messages: &[IncomingMessage],
@@ -659,12 +672,12 @@ fn dispatch_messages(
                     msg.args.get("devices").map(|d| remote_senders(d)).unwrap_or_default();
                 if !device_ids.is_empty() || unidentified > 0 {
                     tracing::info!("[lounge:{}] loungeStatus has remote senders, sending readiness", session.theme);
-                    // A list is no connect: only readable ids are connects
-                    // (each listed sender is counted by SendersListed below).
-                    if !device_ids.is_empty() {
-                        let device_ids = device_ids.clone();
-                        send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name: None });
-                    }
+                    // Readiness: the theme becomes the active one and a playing
+                    // song is reported. The connect adds at most an
+                    // unidentified sender; SendersListed below sets who is
+                    // connected, so repeated lists leave no ghosts.
+                    let device_ids = device_ids.clone();
+                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name: None });
                     responses.push(
                         OutgoingMessage::new("onHasPreviousNextChanged")
                             .with_arg("hasPrevious", "false")
@@ -680,13 +693,16 @@ fn dispatch_messages(
                 }
                 // The list is who is connected now: a sender whose
                 // remoteDisconnected was missed is gone. No list, no news;
-                // nobody in a (re)bind's list is no news either.
+                // nobody in a (re)bind's list only forgets the count.
                 let nobody = device_ids.is_empty() && unidentified == 0;
-                if msg.args.contains_key("devices") && !(nobody && delivery == Delivery::Bind) {
-                    send_cmd(
-                        player_tx,
-                        PlayerCommand::SendersListed { theme: session.theme.clone(), device_ids, unidentified },
-                    );
+                let theme = session.theme.clone();
+                if msg.args.contains_key("devices") {
+                    let cmd = if nobody && delivery == Delivery::Bind {
+                        PlayerCommand::SendersForgotten { theme }
+                    } else {
+                        PlayerCommand::SendersListed { theme, device_ids, unidentified }
+                    };
+                    send_cmd(player_tx, cmd);
                 }
             }
 
@@ -974,7 +990,7 @@ pub async fn run_lounge(
         };
 
         // Dispatch any commands from the initial bind response
-        let responses = dispatch_messages(&mut session, &initial_messages, &player_cmd_tx, Delivery::Bind);
+        let responses = dispatch_bind_response(&mut session, &initial_messages, &player_cmd_tx);
         if !responses.is_empty() {
             if let Err(e) = session.send_messages(&responses).await {
                 tracing::error!("failed to send initial responses: {e}");
@@ -1046,7 +1062,7 @@ pub async fn run_lounge(
                                 tracing::warn!("unknown SID on send, reconnecting");
                                 match session.reconnect_bind().await {
                                     Ok(msgs) => {
-                                        let resps = dispatch_messages(&mut session, &msgs, &player_cmd_tx, Delivery::Bind);
+                                        let resps = dispatch_bind_response(&mut session, &msgs, &player_cmd_tx);
                                         if !resps.is_empty() {
                                             let _ = session.send_messages(&resps).await;
                                         }
@@ -1090,7 +1106,7 @@ pub async fn run_lounge(
                     tracing::warn!("unknown SID on poll, reconnecting");
                     match session.reconnect_bind().await {
                         Ok(msgs) => {
-                            let resps = dispatch_messages(&mut session, &msgs, &player_cmd_tx, Delivery::Bind);
+                            let resps = dispatch_bind_response(&mut session, &msgs, &player_cmd_tx);
                             if !resps.is_empty() {
                                 let _ = session.send_messages(&resps).await;
                             }
@@ -1337,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bind_response_listing_nobody_is_no_news_but_one_naming_senders_is() {
+    fn a_bind_response_listing_nobody_forgets_the_connected_senders_quietly() {
         let phone = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"},{"id":"phone","type":"REMOTE_CONTROL"}]"#;
         let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
         let listed = |commands: Vec<PlayerCommand>| -> Vec<(Vec<String>, usize)> {
@@ -1350,14 +1366,34 @@ mod tests {
                 .collect()
         };
         let status = |devices| [incoming("loungeStatus", &[("devices", devices)])];
-        // The receiver's own (re)bind may not list a phone that is still there.
-        assert!(listed(commands_for(&status(nobody), Delivery::Bind)).is_empty());
-        assert_eq!(listed(commands_for(&status(nobody), Delivery::Poll)), vec![(vec![], 0)]);
-        assert_eq!(listed(commands_for(&status(phone), Delivery::Bind)), vec![(vec!["phone".to_owned()], 0)]);
+        let forgotten = |commands: &[PlayerCommand]| {
+            commands.iter().filter(|c| matches!(c, PlayerCommand::SendersForgotten { theme } if theme == "m")).count()
+        };
+        // The receiver's own (re)bind may not list a phone that is still
+        // there: no last sender gone, only the connected set forgotten.
+        let bind = commands_for(&status(nobody), Delivery::Bind);
+        assert_eq!(forgotten(&bind), 1);
+        assert!(listed(bind).is_empty());
+        let poll = commands_for(&status(nobody), Delivery::Poll);
+        assert_eq!(forgotten(&poll), 0);
+        assert_eq!(listed(poll), vec![(vec![], 0)]);
+        let named = commands_for(&status(phone), Delivery::Bind);
+        assert_eq!(forgotten(&named), 0);
+        assert_eq!(listed(named), vec![(vec!["phone".to_owned()], 0)]);
     }
 
     #[test]
-    fn a_lounge_status_counts_senders_without_a_readable_id_and_connects_none() {
+    fn a_bind_response_is_dispatched_as_a_bind() {
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let (player_tx, mut player_rx) = mpsc::channel(16);
+        dispatch_bind_response(&mut test_session(), &[incoming("loungeStatus", &[("devices", nobody)])], &player_tx);
+        let cmd = player_rx.try_recv().expect("a command");
+        assert!(matches!(cmd, PlayerCommand::SendersForgotten { .. }), "{cmd:?}");
+        assert!(player_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_lounge_status_counts_senders_without_a_readable_id_and_connects_all_it_lists() {
         let mixed = r#"[{"id":"phone","type":"REMOTE_CONTROL"},{"name":"iPad","type":"REMOTE_CONTROL"},
                         {"id":"","type":"REMOTE_CONTROL"},{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
         let commands = commands_for(&[incoming("loungeStatus", &[("devices", mixed)])], Delivery::Poll);
@@ -1368,14 +1404,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(connects, vec![vec!["phone".to_owned()]]);
+        assert_eq!(connects, vec![vec!["phone".to_owned()]], "one connect for the list, with its readable ids");
         assert!(commands.iter().any(|c| matches!(c,
             PlayerCommand::SendersListed { device_ids, unidentified: 2, .. } if device_ids == &["phone".to_owned()])));
 
-        // No readable id at all: a list, no connect.
+        // No readable id at all: still a connect (theme switch, the playing
+        // song reported), without ids; the list right after counts them.
         for devices in [r#"[{"type":"REMOTE_CONTROL"}]"#, "REMOTE_CONTROL"] {
             let commands = commands_for(&[incoming("loungeStatus", &[("devices", devices)])], Delivery::Poll);
-            assert!(!commands.iter().any(|c| matches!(c, PlayerCommand::RemoteConnected { .. })), "{devices}");
+            assert!(matches!(&commands[0],
+                PlayerCommand::RemoteConnected { device_ids, name: None, .. } if device_ids.is_empty()), "{devices}");
             assert!(commands.iter().any(|c| matches!(c,
                 PlayerCommand::SendersListed { device_ids, unidentified: 1, .. } if device_ids.is_empty())), "{devices}");
         }
@@ -1386,6 +1424,7 @@ mod tests {
         assert_eq!(remote_senders("REMOTE_CONTROL"), (vec![], 1));
         assert_eq!(remote_senders(r#"{"type":"REMOTE_CONTROL"}"#), (vec![], 1));
         assert_eq!(remote_senders("[]"), (vec![], 0));
+        assert_eq!(remote_senders("garbage"), (vec![], 0));
     }
 
     #[test]
