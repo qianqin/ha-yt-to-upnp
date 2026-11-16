@@ -1,5 +1,10 @@
 //! The active Lounge theme's senders: who is connected now, and which
 //! device ids took part in the running cast. Ids are never logged.
+//!
+//! Known residual: an id-less newcomer joining while a ghost (a sender whose
+//! remoteDisconnected was lost, with no rebind or list since) still counts
+//! as connected is taken as co-present and sees the cast's tokens; without
+//! an id there is nothing to tell the two apart.
 
 /// One connected sender: its device id, else its name, else neither (a
 /// sender the Lounge did not identify).
@@ -96,8 +101,10 @@ impl Senders {
         ids.iter().any(|id| self.cast_ids.contains(id))
     }
 
-    /// The cast ended: the departed senders' ids go, the connected stay.
+    /// The cast ended: the departed senders' ids go, the connected stay, and
+    /// an unlisted sender is no longer awaited.
     pub fn end_cast(&mut self) {
+        self.unlisted = false;
         let connected = &self.connected;
         self.cast_ids.retain(|id| {
             connected.contains(&Sender::Id(id.clone()))
@@ -310,11 +317,12 @@ mod tests {
         assert!(senders.unlisted_since_rebind());
         assert_eq!(senders.cast_ids(), ids(&["phone"]).as_slice());
         type Event = fn(&mut Senders);
-        let events: [Event; 4] = [
+        let events: [Event; 5] = [
             |s| s.connect(&[], None),
             |s| s.replace_connected(&[], 0),
             |s| s.disconnect(None, None),
             |s| s.clear(),
+            |s| s.end_cast(),
         ];
         for event in events {
             let mut senders = Senders::default();

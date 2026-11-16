@@ -89,11 +89,16 @@ pub enum PlayerCommand {
         list_id: String,
         ctt: Option<String>,
         params: Option<String>,
+        /// Replayed in the receiver's own bind or rebind response: no proof
+        /// that a sender is connected now.
+        from_bind: bool,
     },
     SetVideo {
         video_id: String,
         ctt: Option<String>,
         current_time: f64,
+        /// See `SetPlaylist::from_bind`.
+        from_bind: bool,
     },
     Play,
     Pause,
@@ -611,6 +616,10 @@ fn dispatch_messages(
     delivery: Delivery,
 ) -> Vec<OutgoingMessage> {
     let mut responses: Vec<OutgoingMessage> = Vec::new();
+    let from_bind = delivery == Delivery::Bind;
+    // Sent after the response's other commands: forgetting the senders must
+    // not let a cast replayed in the same response pass as a sender's.
+    let mut forgotten = None;
 
     for msg in messages {
         session.handle_session_command(msg);
@@ -697,23 +706,22 @@ fn dispatch_messages(
                 let nobody = device_ids.is_empty() && unidentified == 0;
                 let theme = session.theme.clone();
                 if msg.args.contains_key("devices") {
-                    let cmd = if nobody && delivery == Delivery::Bind {
-                        PlayerCommand::SendersForgotten { theme }
+                    if nobody && from_bind {
+                        forgotten = Some(PlayerCommand::SendersForgotten { theme });
                     } else {
-                        PlayerCommand::SendersListed { theme, device_ids, unidentified }
-                    };
-                    send_cmd(player_tx, cmd);
+                        send_cmd(player_tx, PlayerCommand::SendersListed { theme, device_ids, unidentified });
+                    }
                 }
             }
 
             // -- Playback commands --
             "setPlaylist" => {
                 log_cast_keys(&session.theme, "setPlaylist", &msg.args);
-                dispatch_set_playlist(&msg.args, player_tx);
+                dispatch_set_playlist(&msg.args, player_tx, from_bind);
             }
             "setVideo" => {
                 log_cast_keys(&session.theme, "setVideo", &msg.args);
-                dispatch_set_video(&msg.args, player_tx);
+                dispatch_set_video(&msg.args, player_tx, from_bind);
             }
             "play" => {
                 send_cmd(player_tx, PlayerCommand::Play);
@@ -765,6 +773,9 @@ fn dispatch_messages(
         }
     }
 
+    if let Some(cmd) = forgotten {
+        send_cmd(player_tx, cmd);
+    }
     responses
 }
 
@@ -801,7 +812,7 @@ fn arg_keys(args: &HashMap<String, String>) -> Vec<&str> {
     keys
 }
 
-fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sender<PlayerCommand>) {
+fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sender<PlayerCommand>, from_bind: bool) {
     let video_ids: Vec<String> = args
         .get("videoIds")
         .or_else(|| args.get("videoId"))
@@ -841,10 +852,11 @@ fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sende
         list_id,
         ctt,
         params,
+        from_bind,
     });
 }
 
-fn dispatch_set_video(args: &HashMap<String, String>, player_tx: &mpsc::Sender<PlayerCommand>) {
+fn dispatch_set_video(args: &HashMap<String, String>, player_tx: &mpsc::Sender<PlayerCommand>, from_bind: bool) {
     let video_id = match args.get("videoId") {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
@@ -864,6 +876,7 @@ fn dispatch_set_video(args: &HashMap<String, String>, player_tx: &mpsc::Sender<P
         video_id,
         ctt,
         current_time,
+        from_bind,
     });
 }
 
@@ -1390,6 +1403,31 @@ mod tests {
         let cmd = player_rx.try_recv().expect("a command");
         assert!(matches!(cmd, PlayerCommand::SendersForgotten { .. }), "{cmd:?}");
         assert!(player_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_bind_response_tags_its_casts_and_forgets_the_senders_last() {
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let replayed = [
+            incoming("loungeStatus", &[("devices", nobody)]),
+            incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "old")]),
+            incoming("setVideo", &[("videoId", "ddddddddddd"), ("ctt", "old")]),
+        ];
+        let (player_tx, mut player_rx) = mpsc::channel(16);
+        dispatch_bind_response(&mut test_session(), &replayed, &player_tx);
+        let mut commands = Vec::new();
+        while let Ok(cmd) = player_rx.try_recv() {
+            commands.push(cmd);
+        }
+        assert!(matches!(commands.as_slice(), [
+            PlayerCommand::SetPlaylist { from_bind: true, .. },
+            PlayerCommand::SetVideo { from_bind: true, .. },
+            PlayerCommand::SendersForgotten { .. },
+        ]), "{commands:?}");
+
+        let polled = commands_for(&replayed, Delivery::Poll);
+        assert!(polled.iter().any(|c| matches!(c, PlayerCommand::SetPlaylist { from_bind: false, .. })));
+        assert!(polled.iter().any(|c| matches!(c, PlayerCommand::SetVideo { from_bind: false, .. })));
     }
 
     #[test]

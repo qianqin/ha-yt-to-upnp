@@ -582,10 +582,11 @@ async fn on_command<R, Fut>(
     if !last_left {
         return;
     }
-    // After a rebind listed nobody, a cast is a sender speaking: accept it
-    // and count that sender. Its setPlaylist/setVideo bring its own tokens
-    // (adopt_cast_auth replaces the cast's before any nowPlaying is built).
-    if senders.unlisted_since_rebind() && is_stale_command(false, &cmd) {
+    // After a rebind listed nobody, a cast from a later poll is a sender
+    // speaking: accept it and count that sender. Its setPlaylist/setVideo
+    // bring their own tokens (adopt_cast_auth replaces the cast's before any
+    // nowPlaying is built). A cast replayed by a bind proves nothing.
+    if senders.unlisted_since_rebind() && is_stale_command(false, &cmd) && !replayed_by_bind(&cmd) {
         tracing::info!("[player] A sender casts after the rebind: it is connected");
         senders.connect(&[], None);
     }
@@ -627,6 +628,7 @@ where
             ctt,
             params,
             current_time,
+            ..
         } => {
             tracing::info!(
                 "[player] SetPlaylist: {} videos, starting at index {} ({})",
@@ -646,6 +648,7 @@ where
             video_id,
             ctt,
             current_time,
+            ..
         } => {
             tracing::info!("[player] SetVideo: {}", video_id);
 
@@ -1203,6 +1206,14 @@ fn resolve_ctt(playlist: &PlaylistState, video_id: &str) -> Option<String> {
 fn is_stale_command(any_connected: bool, cmd: &lounge::PlayerCommand) -> bool {
     !any_connected
         && matches!(cmd, lounge::PlayerCommand::SetPlaylist { .. } | lounge::PlayerCommand::SetVideo { .. })
+}
+
+/// A setPlaylist / setVideo replayed in the receiver's own bind response.
+fn replayed_by_bind(cmd: &lounge::PlayerCommand) -> bool {
+    matches!(
+        cmd,
+        lounge::PlayerCommand::SetPlaylist { from_bind: true, .. } | lounge::PlayerCommand::SetVideo { from_bind: true, .. }
+    )
 }
 
 /// A sender connected on `theme`: note it, forget the running cast's tokens
@@ -2930,6 +2941,7 @@ mod preroll_wiring_tests {
             ctt: None,
             params: None,
             current_time: 0.0,
+            from_bind: false,
         };
         assert!(!is_stale_command(senders.any_connected(), &set_playlist));
         assert!(is_stale_command(false, &set_playlist));
@@ -3196,7 +3208,12 @@ mod preroll_wiring_tests {
             .await;
         assert_eq!(*active.read().unwrap(), "m");
         assert!(senders.any_connected());
-        let set_video = lounge::PlayerCommand::SetVideo { video_id: "aaaaaaaaaaa".into(), ctt: None, current_time: 0.0 };
+        let set_video = lounge::PlayerCommand::SetVideo {
+            video_id: "aaaaaaaaaaa".into(),
+            ctt: None,
+            current_time: 0.0,
+            from_bind: false,
+        };
         assert!(!is_stale_command(senders.any_connected(), &set_video), "the phone's setVideo plays");
     }
 
@@ -3267,11 +3284,17 @@ mod preroll_wiring_tests {
             ctt: Some(ctt.into()),
             params: Some(format!("{ctt}-params")),
             current_time: 0.0,
+            from_bind: false,
         }
     }
 
     fn set_video_d(ctt: &str) -> lounge::PlayerCommand {
-        lounge::PlayerCommand::SetVideo { video_id: "ddddddddddd".into(), ctt: Some(ctt.into()), current_time: 0.0 }
+        lounge::PlayerCommand::SetVideo {
+            video_id: "ddddddddddd".into(),
+            ctt: Some(ctt.into()),
+            current_time: 0.0,
+            from_bind: false,
+        }
     }
 
     #[tokio::test]
@@ -3310,6 +3333,83 @@ mod preroll_wiring_tests {
                 assert!(arg(np, "params").is_none_or(|p| p == "ctt-new-params"), "{name}");
             }
         }
+    }
+
+    /// `cast` as replayed in a bind or rebind response.
+    fn bind_delivered(cast: lounge::PlayerCommand) -> lounge::PlayerCommand {
+        match cast {
+            lounge::PlayerCommand::SetPlaylist { video_id, video_ids, index, current_time, list_id, ctt, params, .. } => {
+                lounge::PlayerCommand::SetPlaylist {
+                    video_id, video_ids, index, current_time, list_id, ctt, params, from_bind: true,
+                }
+            }
+            lounge::PlayerCommand::SetVideo { video_id, ctt, current_time, .. } => {
+                lounge::PlayerCommand::SetVideo { video_id, ctt, current_time, from_bind: true }
+            }
+            other => panic!("not a cast: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cast_replayed_by_the_bind_that_listed_nobody_stays_stale() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 0.0\nOK\n";
+        type Cast = fn(&str) -> lounge::PlayerCommand;
+        for (name, cast) in [("setPlaylist", set_playlist_d as Cast), ("setVideo", set_video_d as Cast)] {
+            let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+            let dial_state = dial::DialState::for_tests(preroll_tx);
+            // Startup: nobody ever connected; the bind lists nobody and replays a cast.
+            let active = std::sync::RwLock::new("m".to_owned());
+            let mut senders = senders::Senders::default();
+            let mut playlist = PlaylistState::default();
+            let mut play_started = false;
+            let forgotten = lounge::PlayerCommand::SendersForgotten { theme: "m".into() };
+            on_command_on(&active, &dial_state, forgotten, &mut playlist, &mut play_started, &mut senders, vec![]).await;
+            let (seen, sent) = on_command_resolving(
+                &active, &dial_state, bind_delivered(cast("ctt-old")), &mut playlist, &mut play_started, &mut senders,
+                playable, vec![],
+            )
+            .await;
+            assert!(seen.is_empty() && sent.is_empty(), "{name}: nothing plays");
+            assert!(!play_started, "{name}");
+            assert!(!senders.any_connected(), "{name}: no sender counted");
+            assert_eq!(playlist.tokens.auth_for("ddddddddddd"), cast_tokens::VideoAuth::default(), "{name}");
+            assert_eq!(*dial_state.ctt.read().unwrap(), None, "{name}");
+
+            // A cast a later poll delivers is a sender speaking.
+            let script =
+                vec![("status", STATUS), ("clear", "OK\n"), ("add", "OK\n"), ("play", "OK\n"), ("status", STATUS)];
+            let (seen, _) = on_command_resolving(
+                &active, &dial_state, cast("ctt-new"), &mut playlist, &mut play_started, &mut senders, playable, script,
+            )
+            .await;
+            assert_eq!(seen.len(), 5, "{name}: {seen:?}");
+            assert!(play_started, "{name}");
+            assert!(senders.any_connected(), "{name}");
+            assert_eq!(playlist.tokens.auth_for("ddddddddddd").ctt.as_deref(), Some("ctt-new"), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_cast_ends_the_wait_for_an_unlisted_sender() {
+        const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        // Stop from a phone that cast after the rebind.
+        let mut senders = senders::Senders::default();
+        senders.forget_connected();
+        let mut playlist = queue_at(&dial_state, 0);
+        let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
+        on_command_with(&dial_state, lounge::PlayerCommand::Stop, &mut playlist, &mut true, &mut senders, script).await;
+        assert!(!senders.unlisted_since_rebind(), "Stop");
+
+        // The queue ends unattended.
+        let mut senders = senders::Senders::default();
+        senders.forget_connected();
+        let mut playlist = queue_at(&dial_state, 2);
+        let script = vec![("stop", "OK\n"), ("clear", "OK\n")];
+        let (seen, _, _) = song_end(&dial_state, &mut playlist, &mut true, &mut senders, playable, script).await;
+        assert_eq!(seen, ["stop", "clear"]);
+        assert!(!senders.unlisted_since_rebind(), "queue end");
     }
 
     #[tokio::test]
@@ -3410,6 +3510,7 @@ mod preroll_wiring_tests {
             video_id: "ddddddddddd".into(),
             ctt: None,
             current_time: 0.0,
+            from_bind: false,
         }));
 
         // A status listing nobody is the last sender leaving.
