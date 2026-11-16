@@ -623,6 +623,9 @@ fn dispatch_messages(
     if from_bind && messages.iter().any(lists_nobody) {
         send_cmd(player_tx, PlayerCommand::SendersForgotten { theme: session.theme.clone() });
     }
+    // A sender counted since then in this response: a later list of nobody
+    // must forget it again.
+    let mut sender_event_seen = false;
 
     for msg in messages {
         session.handle_session_command(msg);
@@ -641,6 +644,7 @@ fn dispatch_messages(
                 let device_ids = sender_id(&msg.args).into_iter().collect();
                 let name = msg.args.get("name").cloned();
                 send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name });
+                sender_event_seen = true;
                 // Tell the phone we're ready — matches yt-cast-receiver handleSenderConnected:
                 // 1. onHasPreviousNextChanged
                 // 2. nowPlaying (empty = nothing playing)
@@ -705,9 +709,16 @@ fn dispatch_messages(
                 }
                 // The list is who is connected now: a sender whose
                 // remoteDisconnected was missed is gone. No list, no news;
-                // nobody in a (re)bind's list was sent first, as SendersForgotten.
-                if msg.args.contains_key("devices") && !(from_bind && lists_nobody(msg)) {
-                    let theme = session.theme.clone();
+                // nobody in a (re)bind's list was sent first, as SendersForgotten,
+                // and again if a sender was counted since.
+                let theme = session.theme.clone();
+                if from_bind && lists_nobody(msg) {
+                    if sender_event_seen {
+                        send_cmd(player_tx, PlayerCommand::SendersForgotten { theme });
+                        sender_event_seen = false;
+                    }
+                } else if msg.args.contains_key("devices") {
+                    sender_event_seen |= !device_ids.is_empty() || unidentified > 0;
                     send_cmd(player_tx, PlayerCommand::SendersListed { theme, device_ids, unidentified });
                 }
             }
@@ -1444,16 +1455,64 @@ mod tests {
     #[test]
     fn a_sender_event_later_in_the_bind_response_comes_after_the_forgetting() {
         let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let phone = r#"[{"id":"phone","type":"REMOTE_CONTROL"}]"#;
+        let cast = incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "new")]);
         let commands = bind_commands(&[
             incoming("loungeStatus", &[("devices", nobody)]),
             incoming("remoteConnected", &[("id", "phone"), ("name", "Phone")]),
-            incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "new")]),
+            cast.clone(),
         ]);
         assert!(matches!(commands.as_slice(), [
             PlayerCommand::SendersForgotten { .. },
             PlayerCommand::RemoteConnected { device_ids, .. },
             PlayerCommand::SetPlaylist { from_bind: true, .. },
         ] if device_ids == &["phone".to_owned()]), "{commands:?}");
+
+        // The later event is a list naming the phone.
+        let commands = bind_commands(&[
+            incoming("loungeStatus", &[("devices", nobody)]),
+            incoming("loungeStatus", &[("devices", phone)]),
+            cast,
+        ]);
+        assert!(matches!(commands.as_slice(), [
+            PlayerCommand::SendersForgotten { .. },
+            PlayerCommand::RemoteConnected { device_ids: connected, .. },
+            PlayerCommand::SendersListed { device_ids: listed, unidentified: 0, .. },
+            PlayerCommand::SetPlaylist { from_bind: true, .. },
+        ] if connected == &["phone".to_owned()] && listed == &["phone".to_owned()]), "{commands:?}");
+    }
+
+    #[test]
+    fn a_later_list_of_nobody_in_the_bind_response_forgets_a_sender_counted_before_it() {
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let x = r#"[{"id":"x","type":"REMOTE_CONTROL"}]"#;
+        let commands = bind_commands(&[
+            incoming("remoteConnected", &[("id", "x"), ("name", "X")]),
+            incoming("loungeStatus", &[("devices", nobody)]),
+        ]);
+        assert!(matches!(commands.as_slice(), [
+            PlayerCommand::SendersForgotten { .. },
+            PlayerCommand::RemoteConnected { device_ids, .. },
+            PlayerCommand::SendersForgotten { .. },
+        ] if device_ids == &["x".to_owned()]), "{commands:?}");
+
+        let commands = bind_commands(&[
+            incoming("loungeStatus", &[("devices", x)]),
+            incoming("loungeStatus", &[("devices", nobody)]),
+        ]);
+        assert!(matches!(commands.as_slice(), [
+            PlayerCommand::SendersForgotten { .. },
+            PlayerCommand::RemoteConnected { device_ids: connected, .. },
+            PlayerCommand::SendersListed { device_ids: listed, .. },
+            PlayerCommand::SendersForgotten { .. },
+        ] if connected == &["x".to_owned()] && listed == &["x".to_owned()]), "{commands:?}");
+
+        // Without a sender event before it, the list of nobody is not sent twice.
+        let commands = bind_commands(&[
+            incoming("loungeStatus", &[("devices", nobody)]),
+            incoming("loungeStatus", &[("devices", nobody)]),
+        ]);
+        assert!(matches!(commands.as_slice(), [PlayerCommand::SendersForgotten { .. }]), "{commands:?}");
     }
 
     #[test]
