@@ -3390,6 +3390,67 @@ mod preroll_wiring_tests {
     }
 
     #[tokio::test]
+    async fn a_bind_replaying_an_old_cast_under_a_sender_it_did_not_list_plays_nothing() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        type Known = fn() -> senders::Senders;
+        // Bob connected by id; a ghost whose leave was lost, by name.
+        let cases: [(&str, Known); 2] = [("Bob", || connected(&["bob"])), ("ghost", || {
+            let mut senders = senders::Senders::default();
+            senders.connect(&[], Some("Ghost"));
+            senders
+        })];
+        for (who, known) in cases {
+            // Alice's queue plays on; the newcomer rule forgot her ctt.
+            let mut playlist = queue_at(&dial_state, 0);
+            {
+                let _lock = global_pins_lock();
+                forget_cast_tokens(&mut playlist, &dial_state);
+            }
+            let mut play_started = true;
+            let mut senders = known();
+            // The initial bind re-runs: it lists nobody, then replays Alice's cast.
+            let forgotten = lounge::PlayerCommand::SendersForgotten { theme: "m".into() };
+            on_command_on(&active, &dial_state, forgotten, &mut playlist, &mut play_started, &mut senders, vec![]).await;
+            let (seen, sent) = on_command_resolving(
+                &active, &dial_state, bind_delivered(set_playlist_d("ctt-A")), &mut playlist, &mut play_started,
+                &mut senders, playable, vec![],
+            )
+            .await;
+            assert!(seen.is_empty() && sent.is_empty(), "{who}: nothing plays");
+            assert_eq!(playlist.tokens.auth_for("ddddddddddd"), cast_tokens::VideoAuth::default(), "{who}");
+            assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default(), "{who}");
+            assert_eq!(*dial_state.ctt.read().unwrap(), None, "{who}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sender_connecting_later_in_the_bind_response_lets_its_cast_play() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 0.0\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        let mut playlist = PlaylistState::default();
+        let mut play_started = false;
+        let mut senders = senders::Senders::default();
+        // As the Lounge layer dispatches [loungeStatus(nobody), remoteConnected(phone), setPlaylist].
+        for event in [lounge::PlayerCommand::SendersForgotten { theme: "m".into() }, connect(&["phone"])] {
+            on_command_on(&active, &dial_state, event, &mut playlist, &mut play_started, &mut senders, vec![]).await;
+        }
+        let script = vec![("status", STATUS), ("clear", "OK\n"), ("add", "OK\n"), ("play", "OK\n"), ("status", STATUS)];
+        let (seen, _) = on_command_resolving(
+            &active, &dial_state, bind_delivered(set_playlist_d("ctt-new")), &mut playlist, &mut play_started,
+            &mut senders, playable, script,
+        )
+        .await;
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert!(play_started);
+        assert!(senders.any_connected());
+        assert_eq!(playlist.tokens.auth_for("ddddddddddd").ctt.as_deref(), Some("ctt-new"));
+    }
+
+    #[tokio::test]
     async fn the_end_of_the_cast_ends_the_wait_for_an_unlisted_sender() {
         const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);

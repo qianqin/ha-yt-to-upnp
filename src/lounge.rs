@@ -617,9 +617,12 @@ fn dispatch_messages(
 ) -> Vec<OutgoingMessage> {
     let mut responses: Vec<OutgoingMessage> = Vec::new();
     let from_bind = delivery == Delivery::Bind;
-    // Sent after the response's other commands: forgetting the senders must
-    // not let a cast replayed in the same response pass as a sender's.
-    let mut forgotten = None;
+    // A (re)bind that lists nobody forgets the senders before any other
+    // command of its response: a cast it replays is then judged with nobody
+    // known, and a sender event later in the response counts.
+    if from_bind && messages.iter().any(lists_nobody) {
+        send_cmd(player_tx, PlayerCommand::SendersForgotten { theme: session.theme.clone() });
+    }
 
     for msg in messages {
         session.handle_session_command(msg);
@@ -702,15 +705,10 @@ fn dispatch_messages(
                 }
                 // The list is who is connected now: a sender whose
                 // remoteDisconnected was missed is gone. No list, no news;
-                // nobody in a (re)bind's list only forgets the count.
-                let nobody = device_ids.is_empty() && unidentified == 0;
-                let theme = session.theme.clone();
-                if msg.args.contains_key("devices") {
-                    if nobody && from_bind {
-                        forgotten = Some(PlayerCommand::SendersForgotten { theme });
-                    } else {
-                        send_cmd(player_tx, PlayerCommand::SendersListed { theme, device_ids, unidentified });
-                    }
+                // nobody in a (re)bind's list was sent first, as SendersForgotten.
+                if msg.args.contains_key("devices") && !(from_bind && lists_nobody(msg)) {
+                    let theme = session.theme.clone();
+                    send_cmd(player_tx, PlayerCommand::SendersListed { theme, device_ids, unidentified });
                 }
             }
 
@@ -773,10 +771,13 @@ fn dispatch_messages(
         }
     }
 
-    if let Some(cmd) = forgotten {
-        send_cmd(player_tx, cmd);
-    }
     responses
+}
+
+/// A loungeStatus whose device list names no REMOTE_CONTROL sender.
+fn lists_nobody(msg: &IncomingMessage) -> bool {
+    msg.command == "loungeStatus"
+        && msg.args.get("devices").is_some_and(|d| remote_senders(d) == (Vec::new(), 0))
 }
 
 /// Shows what the phone sends with each cast (keys only, see `arg_keys`).
@@ -1405,29 +1406,54 @@ mod tests {
         assert!(player_rx.try_recv().is_err());
     }
 
-    #[test]
-    fn a_bind_response_tags_its_casts_and_forgets_the_senders_last() {
-        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
-        let replayed = [
-            incoming("loungeStatus", &[("devices", nobody)]),
-            incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "old")]),
-            incoming("setVideo", &[("videoId", "ddddddddddd"), ("ctt", "old")]),
-        ];
+    fn bind_commands(messages: &[IncomingMessage]) -> Vec<PlayerCommand> {
         let (player_tx, mut player_rx) = mpsc::channel(16);
-        dispatch_bind_response(&mut test_session(), &replayed, &player_tx);
+        dispatch_bind_response(&mut test_session(), messages, &player_tx);
         let mut commands = Vec::new();
         while let Ok(cmd) = player_rx.try_recv() {
             commands.push(cmd);
         }
-        assert!(matches!(commands.as_slice(), [
-            PlayerCommand::SetPlaylist { from_bind: true, .. },
-            PlayerCommand::SetVideo { from_bind: true, .. },
-            PlayerCommand::SendersForgotten { .. },
-        ]), "{commands:?}");
+        commands
+    }
 
-        let polled = commands_for(&replayed, Delivery::Poll);
+    #[test]
+    fn a_bind_response_listing_nobody_forgets_the_senders_first_and_tags_its_casts() {
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let status = incoming("loungeStatus", &[("devices", nobody)]);
+        let set_playlist = incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "old")]);
+        let set_video = incoming("setVideo", &[("videoId", "ddddddddddd"), ("ctt", "old")]);
+        // Wherever the list stands in the response, the casts in it are
+        // judged with nobody known.
+        for replayed in [
+            [status.clone(), set_playlist.clone(), set_video.clone()],
+            [set_playlist.clone(), set_video.clone(), status.clone()],
+        ] {
+            let commands = bind_commands(&replayed);
+            assert!(matches!(commands.as_slice(), [
+                PlayerCommand::SendersForgotten { .. },
+                PlayerCommand::SetPlaylist { from_bind: true, .. },
+                PlayerCommand::SetVideo { from_bind: true, .. },
+            ]), "{commands:?}");
+        }
+
+        let polled = commands_for(&[status, set_playlist, set_video], Delivery::Poll);
         assert!(polled.iter().any(|c| matches!(c, PlayerCommand::SetPlaylist { from_bind: false, .. })));
         assert!(polled.iter().any(|c| matches!(c, PlayerCommand::SetVideo { from_bind: false, .. })));
+    }
+
+    #[test]
+    fn a_sender_event_later_in_the_bind_response_comes_after_the_forgetting() {
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let commands = bind_commands(&[
+            incoming("loungeStatus", &[("devices", nobody)]),
+            incoming("remoteConnected", &[("id", "phone"), ("name", "Phone")]),
+            incoming("setPlaylist", &[("videoId", "ddddddddddd"), ("videoIds", "ddddddddddd"), ("ctt", "new")]),
+        ]);
+        assert!(matches!(commands.as_slice(), [
+            PlayerCommand::SendersForgotten { .. },
+            PlayerCommand::RemoteConnected { device_ids, .. },
+            PlayerCommand::SetPlaylist { from_bind: true, .. },
+        ] if device_ids == &["phone".to_owned()]), "{commands:?}");
     }
 
     #[test]
