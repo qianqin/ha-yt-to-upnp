@@ -13,12 +13,16 @@ import functools
 import hashlib
 import http.server
 import io
+import itertools
 import os
+import shutil
+import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +37,14 @@ URL_REFUSED = "ARTEFACTS_URL must be https://"
 # host like 192.0.2.1 makes curl wait for its connect timeout.
 FAKE_CURL = """#!/bin/sh
 echo "curl $*" >> "$FAKE_CURL_LOG"
+exit 7
+"""
+
+# Lists the fetch's TMPDIR while the download runs (where the work folder is);
+# FAKE_CURL_WAIT keeps the download running for a signal to interrupt it.
+LISTING_CURL = """#!/bin/sh
+ls -A "$TMPDIR" > "$FAKE_CURL_LOG.part" && mv "$FAKE_CURL_LOG.part" "$FAKE_CURL_LOG"
+[ -z "$FAKE_CURL_WAIT" ] || sleep "$FAKE_CURL_WAIT"
 exit 7
 """
 
@@ -145,14 +157,27 @@ class FetchArtefactsTest(unittest.TestCase):
         with open(os.path.join(self.stage, "artefacts.lock"), "w") as f:
             f.write("version: %s\nurl: %s\nsha256: %s\n" % (VERSION, url, sha256))
 
-    def run_fetch(self, artefacts_url=None, fake_curl=False, tmpdir=None):
+    def fetch_env(self, artefacts_url=None, fake_curl=False, tmpdir=None):
         env = {"PATH": os.environ["PATH"], "TMPDIR": tmpdir or self.tmp, "FAKE_CURL_LOG": self.curl_log}
         if fake_curl:
             env["PATH"] = self.fake_bin + os.pathsep + env["PATH"]
         if artefacts_url is not None:
             env["ARTEFACTS_URL"] = artefacts_url
-        return subprocess.run(["sh", SCRIPT, self.stage, self.out], env=env,
+        return env
+
+    def run_fetch(self, artefacts_url=None, fake_curl=False, tmpdir=None):
+        return subprocess.run(["sh", SCRIPT, self.stage, self.out],
+                              env=self.fetch_env(artefacts_url, fake_curl, tmpdir),
                               capture_output=True, text=True, timeout=120)
+
+    def use_listing_curl(self):
+        with open(os.path.join(self.fake_bin, "curl"), "w") as f:
+            f.write(LISTING_CURL)
+
+    def own_tmpdir(self):
+        own = os.path.join(self.tmp, "own-tmp")
+        os.makedirs(own)
+        return own
 
     def assertFails(self, result, message):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -315,6 +340,49 @@ class FetchArtefactsTest(unittest.TestCase):
         self.assertEqual(os.listdir(own), [])
         leaked = sorted(n for n in set(os.listdir(system)) - before if n.startswith("tmp."))
         self.assertEqual(leaked, [], "fetch-artefacts.sh left files in %s" % system)
+
+    def test_the_work_folder_is_made_in_the_fetchs_own_tmpdir(self):
+        """Not in the system's temporary folder, where macOS mktemp without a
+        template puts it whatever TMPDIR says."""
+        self.write_lock("0" * 64)
+        self.use_listing_curl()
+        own = self.own_tmpdir()
+        result = self.run_fetch("https://192.0.2.1/a.tar.gz", fake_curl=True, tmpdir=own)
+        self.assertFails(result, "download of https://192.0.2.1/a.tar.gz failed")
+        with open(self.curl_log) as f:
+            listing = f.read().split()
+        self.assertEqual(len(listing), 1, listing)
+        self.assertRegex(listing[0], r"^fetch-artefacts\.[A-Za-z0-9]{6}$")
+        self.assertEqual(os.listdir(own), [])
+
+    def test_an_interrupted_fetch_leaves_no_temporary_files(self):
+        """Ctrl-C (the whole process group) or a TERM / HUP during the download."""
+        self.write_lock("0" * 64)
+        self.use_listing_curl()
+        # dash (the Dockerfile's sh) runs no EXIT trap when a signal ends it.
+        shells = ["sh"] + (["dash"] if shutil.which("dash") else [])
+        for shell, sig in itertools.product(shells, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
+            with self.subTest(shell=shell, signal=sig.name):
+                own = os.path.join(self.tmp, "own-tmp-%s-%s" % (shell, sig.name))
+                os.makedirs(own)
+                if os.path.exists(self.curl_log):
+                    os.remove(self.curl_log)
+                env = self.fetch_env("https://192.0.2.1/a.tar.gz", fake_curl=True, tmpdir=own)
+                env["FAKE_CURL_WAIT"] = "30"
+                proc = subprocess.Popen([shell, SCRIPT, self.stage, self.out], env=env, start_new_session=True,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    deadline = time.monotonic() + 20
+                    while not os.path.exists(self.curl_log):
+                        self.assertLess(time.monotonic(), deadline, "the download never started")
+                        time.sleep(0.05)
+                    os.killpg(proc.pid, sig)
+                    self.assertNotEqual(proc.wait(timeout=20), 0)
+                finally:
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                self.assertEqual(os.listdir(own), [])
 
     def test_a_sha256_mismatch_leaves_no_temporary_files(self):
         url = self.serve("other.tar.gz", b"x" * 4096)

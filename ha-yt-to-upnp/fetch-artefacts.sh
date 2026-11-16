@@ -73,9 +73,11 @@ fi
 
 printf 'fetch-artefacts: %s\n' "$url"
 # One work folder in TMPDIR, removed on every exit (die included). An explicit
-# template: macOS mktemp without one ignores TMPDIR.
+# template: macOS mktemp without one ignores TMPDIR. dash runs no EXIT trap
+# when a signal ends it, so an interrupt exits through it.
 work="$(mktemp -d "${TMPDIR:-/tmp}/fetch-artefacts.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
+trap 'exit 1' INT TERM HUP
 tarball="$work/release.tar.gz"
 curl_status="$work/curl-status"
 # -q first: no .curlrc. --max-filesize refuses a Content-Length over the cap
