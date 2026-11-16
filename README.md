@@ -112,6 +112,13 @@ formats (always 251 via SABR).
 - **Speaker switched off, auto power-off, or switched to line-in or another
   source:** the adapter pauses MPD and tells the receiver to end the cast. It
   then leaves the room alone until you resume or cast again from the phone.
+- **Phone sleeps or the app is closed:** a started queue plays on and
+  advances, like on a Chromecast; reopening the app shows the running song.
+  The cast ends at the queue's end, a Stop from the phone or when the
+  speaker is switched off or to another source. Another phone connecting
+  gets none of the previous cast's tokens.
+- **Song not available:** a queue entry that cannot be played is skipped;
+  after 3 failed songs in a row playback stops.
 - **New cast or resume while the speaker is on line-in:** an explicit cast
   wins and takes the room over.
 - **Idle:** the app never puts the room into standby; the Raumfeld's own

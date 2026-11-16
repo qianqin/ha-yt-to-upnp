@@ -15,6 +15,38 @@
   (124 before). At start the log shows the helper's time zone and UTC offset,
   with a warning when there is no time zone or its offset is 0. A `TZ` that
   is not a plain zone name (e.g. a POSIX rule or a `:path`) is not passed on.
+- Playback goes on when the phone or tablet disconnects (it sleeps or the
+  app is closed): like a Chromecast, a started queue plays on and advances
+  by itself, with each song's own ctt and `/next` as before. The cast's
+  tokens stay in memory only (never on disk, never logged) until the queue
+  ends, a Stop from the phone, a release by the speaker, or a different
+  sender connecting: a new sender gets none of the previous cast's tokens
+  (the queue plays on without them until it casts), a returning sender
+  keeps them. A sender that connects while a song plays is shown that song.
+  A disconnect with nothing started still stops and forgets everything.
+- A queue entry that cannot be played (e.g. "This video is not available",
+  no stream, InnerTube or MPD error) is skipped instead of ending playback;
+  after 3 failed tracks in a row, or on the last track, it stops as before.
+  With a sender connected, a next track that does not start is left to the
+  phone, as before.
+- When `/next` names a later queue entry (YouTube skips unavailable
+  entries), the receiver follows it with that song's own ctt instead of
+  playing the queue's next without one. The songs after it keep the
+  accepted stream (Premium formats, no SABR throttling after about 60 s)
+  and the `/next` chain. YouTube's choice is kept by video id, so "Play
+  next", removals or reordering on the phone cannot make the queue jump to
+  the wrong song; a song added with "Play next" wins over it.
+- Senders are tracked per device: one sender leaving while another stays
+  connected no longer drops the other's casts as stale. The Lounge's
+  `loungeStatus` device lists are authoritative (a missed disconnect leaves
+  no ghost sender); a rebind response listing nobody quietly forgets the
+  connected senders without stopping playback, and casts replayed in a bind
+  response never pass as a new cast.
+- Build: `fetch-artefacts.sh` keeps its temporary download in one work
+  folder in `TMPDIR` and removes it on every exit, including failures and
+  interrupts. Before, it was removed only on success and macOS `mktemp`
+  ignored `TMPDIR`, so failed test downloads (up to 512 MiB each) were left
+  in the per-user temporary folder.
 
 ## 0.4.2
 

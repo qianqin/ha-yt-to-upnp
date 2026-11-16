@@ -181,7 +181,11 @@ programs, which its first stage (`fetch-artefacts.sh`) takes from:
   version than `config.yaml`'s (copied into the stage; a `BUILD_VERSION`
   from the Supervisor must agree with it too), a failed download, more than
   512 MiB (with or without a Content-Length) or a missing entry stops the
-  build. Files are extracted without
+  build. The download goes to one `fetch-artefacts.XXXXXX` work folder in
+  `TMPDIR` (explicit template: macOS `mktemp -d` ignores `TMPDIR` without
+  one), removed on every exit, also after a failure or an interrupt (dash
+  runs no EXIT trap on a signal, so INT/TERM/HUP exit first). Files are
+  extracted without
   their owners or stored permissions, and no setuid or setgid bit is kept.
   No secret is needed (public release). The build argument `ARTEFACTS_URL`
   is for `scripts/smoke-ha-app.sh --release-path` only: it may name
