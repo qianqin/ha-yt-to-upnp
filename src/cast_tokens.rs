@@ -30,11 +30,15 @@ const MAX_VIDEOS: usize = 4;
 pub struct CastTokens {
     /// Oldest first.
     videos: Vec<(String, VideoAuth)>,
-    /// Bumped by `clear`, so a /next answer for an earlier cast is dropped.
+    /// Bumped by `clear` and `next_song`, so a /next answer for an earlier
+    /// cast or song is dropped.
     generation: u64,
     /// The (generation, current video, expected next video) /next was asked
     /// about: at most one request per song.
     prefetched: Option<(u64, String, String)>,
+    /// The queue index /next named after the current song, when it is a
+    /// later entry than the queue's next (YouTube skipped entries itself).
+    next_choice: Option<usize>,
 }
 
 impl CastTokens {
@@ -42,7 +46,25 @@ impl CastTokens {
     pub fn clear(&mut self) {
         self.videos.clear();
         self.prefetched = None;
+        self.next_choice = None;
         self.generation += 1;
+    }
+
+    /// The queue moved to another song: a /next answer still on its way,
+    /// and YouTube's choice after the earlier song, no longer apply. The
+    /// songs' own tokens stay.
+    pub fn next_song(&mut self) {
+        self.next_choice = None;
+        self.generation += 1;
+    }
+
+    /// /next names queue index `index` to follow the current song.
+    pub fn choose_next(&mut self, index: usize) {
+        self.next_choice = Some(index);
+    }
+
+    pub fn next_choice(&self) -> Option<usize> {
+        self.next_choice
     }
 
     pub fn generation(&self) -> u64 {
@@ -139,6 +161,24 @@ mod tests {
         assert!(tokens.start_prefetch("bbbbbbbbbbb", "ccccccccccc"));
         // A changed queue (another next video) is asked about again.
         assert!(tokens.start_prefetch("bbbbbbbbbbb", "ddddddddddd"));
+    }
+
+    #[test]
+    fn youtubes_next_choice_holds_for_the_current_song_only() {
+        let mut tokens = CastTokens::default();
+        assert_eq!(tokens.next_choice(), None);
+        tokens.choose_next(7);
+        assert_eq!(tokens.next_choice(), Some(7));
+        let before = tokens.generation();
+        tokens.next_song();
+        assert_eq!(tokens.next_choice(), None, "another song plays");
+        assert_ne!(tokens.generation(), before, "an answer for the earlier song is stale");
+        tokens.remember("aaaaaaaaaaa", auth("ctt-a"));
+        tokens.next_song();
+        assert_eq!(tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"), "the songs' tokens stay");
+        tokens.choose_next(7);
+        tokens.clear();
+        assert_eq!(tokens.next_choice(), None, "a new cast has no choice");
     }
 
     #[test]

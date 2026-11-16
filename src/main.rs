@@ -542,6 +542,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             };
 
                             if let Some((next, why)) = next {
+                                if next > ended_index + 1 {
+                                    tracing::info!(
+                                        "[player] Following YouTube's next after index {}: index {}, passing over {}",
+                                        ended_index, next,
+                                        passed_over(&playlist, ended_index + 1, next),
+                                    );
+                                }
                                 let video_id = adopt_index(&mut playlist, &dial_state, next, why);
 
                                 match play_video(
@@ -910,7 +917,7 @@ const MAX_FAILED_IN_ROW: u32 = 3;
 /// Also counts `playlist.failed_in_row`: a failure adds one, a song that
 /// played resets it.
 fn stop_action(stream_failure: Option<String>, playlist: &mut PlaylistState) -> StopAction {
-    let next = playlist.current_index + 1;
+    let next = next_index(playlist);
     let has_next = next < playlist.video_ids.len();
     match stream_failure {
         Some(reason) => {
@@ -930,6 +937,25 @@ fn stop_action(stream_failure: Option<String>, playlist: &mut PlaylistState) -> 
             }
         }
     }
+}
+
+/// The queue index after the current song: YouTube's own choice from /next
+/// when the queue's next has no ctt (YouTube skipped it, e.g. as
+/// unavailable), else the queue's next.
+fn next_index(playlist: &PlaylistState) -> usize {
+    let queue_next = playlist.current_index + 1;
+    match (playlist.tokens.next_choice(), playlist.video_ids.get(queue_next)) {
+        (Some(chosen), Some(next_id)) if resolve_ctt(playlist, next_id).is_none() => chosen,
+        _ => queue_next,
+    }
+}
+
+/// "index i (video id)" for the queue entries from `from` up to `to`.
+fn passed_over(playlist: &PlaylistState, from: usize, to: usize) -> String {
+    (from..to)
+        .map(|i| format!("index {i} ({})", playlist.video_ids[i]))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether the queue plays on when the last sender leaves: only a song
@@ -1072,6 +1098,7 @@ fn video_ctt(video_id: &str, ctt: Option<String>) -> Option<(String, String)> {
 /// without one it streams as a song without ctt. Returns its video id.
 fn adopt_index(playlist: &mut PlaylistState, dial_state: &dial::DialState, index: usize, why: &str) -> String {
     playlist.current_index = index;
+    playlist.tokens.next_song();
     let video_id = playlist.video_ids[index].clone();
     let ctt = resolve_ctt(playlist, &video_id);
     tracing::info!(
@@ -1175,9 +1202,13 @@ struct PrefetchResult {
 enum PrefetchVerdict {
     /// The next video's own ctt (and params) are stored.
     Stored,
-    /// The cast changed since the request.
+    /// /next named this later queue entry (YouTube skipped the ones before
+    /// it): its own ctt and params are stored and it follows the current
+    /// song when the queue's next has no ctt.
+    StoredLater(usize),
+    /// The cast or its song changed since the request.
     Stale,
-    /// /next named another video than the queue's next.
+    /// /next named a video that is no later entry of the queue.
     Mismatch,
     /// /next named the queue's next video, without a ctt.
     NoToken,
@@ -1243,8 +1274,9 @@ fn spawn_prefetch(
 }
 
 /// Store the next video's own ctt and params from a /next answer, if it is
-/// for this cast and names the queue's next video. Anything else leaves that
-/// video without a ctt: it then streams like a song without one.
+/// for this cast and song and names the queue's next video or a later entry
+/// (then also YouTube's choice). Anything else leaves the next video without
+/// a ctt: it then streams like a song without one.
 fn apply_prefetch(playlist: &mut PlaylistState, result: PrefetchResult) -> PrefetchVerdict {
     let after = &result.video_id;
     let verdict = match result.outcome {
@@ -1263,28 +1295,45 @@ fn apply_prefetch(playlist: &mut PlaylistState, result: PrefetchResult) -> Prefe
                 next.params.is_some(),
                 next.index,
             );
-            if next.video_id != result.expected_next {
+            let later = later_queue_index(playlist, &next.video_id);
+            if next.video_id != result.expected_next && later.is_none() {
                 PrefetchVerdict::Mismatch
             } else if next.ctt.is_none() {
                 PrefetchVerdict::NoToken
             } else {
                 let auth = cast_tokens::VideoAuth { ctt: next.ctt, params: next.params };
                 playlist.tokens.remember(&next.video_id, auth);
-                PrefetchVerdict::Stored
+                match later {
+                    Some(index) if next.video_id != result.expected_next => {
+                        playlist.tokens.choose_next(index);
+                        PrefetchVerdict::StoredLater(index)
+                    }
+                    _ => PrefetchVerdict::Stored,
+                }
             }
         }
     };
     let expected = &result.expected_next;
     match verdict {
         PrefetchVerdict::Stored => tracing::info!("[next] {expected} will play with its own ctt"),
-        PrefetchVerdict::Stale => tracing::info!("[next] /next answer after {after} is for an earlier cast; dropped"),
-        PrefetchVerdict::Mismatch => {
-            tracing::warn!("[next] /next names another video than the queue's next {expected}; not used")
-        }
+        PrefetchVerdict::Stale => tracing::info!("[next] /next answer after {after} is for an earlier cast or song; dropped"),
+        PrefetchVerdict::StoredLater(index) => tracing::info!(
+            "[next] /next names a later queue entry than the queue's next {expected}: index {index}; \
+             it plays with its own ctt, after {after} if {expected} has no ctt"
+        ),
+        PrefetchVerdict::Mismatch => tracing::warn!(
+            "[next] /next names a video that is no later queue entry; not used, {expected} follows as queued"
+        ),
         PrefetchVerdict::NoToken => tracing::warn!("[next] /next gave no ctt for {expected}"),
         PrefetchVerdict::NoNext => tracing::warn!("[next] /next gave no next video after {after}"),
     }
     verdict
+}
+
+/// The first queue index after the queue's next that holds `video_id`.
+fn later_queue_index(playlist: &PlaylistState, video_id: &str) -> Option<usize> {
+    let first = playlist.current_index + 2;
+    playlist.video_ids.iter().skip(first).position(|id| id == video_id).map(|i| first + i)
 }
 
 /// Forget the cast and build the messages that end it on the sender.
@@ -2315,6 +2364,162 @@ mod preroll_wiring_tests {
         assert!(matches!(action, StopAction::SkipFailed { next: 2, .. }), "{action:?}");
         assert_eq!(adopt_index(&mut playlist, &dial_state, 2, "Skipping"), "ccccccccccc");
         assert_eq!(playlist.tokens.auth_for("zzzzzzzzzzz"), cast_tokens::VideoAuth::default());
+    }
+
+    /// A four-song queue cast with `ctt-a` for its first song, playing.
+    fn long_queue(dial_state: &dial::DialState) -> PlaylistState {
+        let mut playlist = PlaylistState::default();
+        let ids = ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"].map(str::to_owned).to_vec();
+        adopt_playlist(&mut playlist, dial_state, "aaaaaaaaaaa", ids, 0, "RDAMVMaaaaaaaaaaa".into(), auth("ctt-a"));
+        playlist
+    }
+
+    /// /next after the first song names the third (YouTube skipped the second).
+    fn choose_third(playlist: &mut PlaylistState) {
+        let answer = next_answer(playlist, "ccccccccccc", Some("ctt-c"));
+        assert_eq!(apply_prefetch(playlist, answer), PrefetchVerdict::StoredLater(2));
+    }
+
+    fn next_ctt_c() -> cast_tokens::VideoAuth {
+        cast_tokens::VideoAuth { ctt: Some("ctt-c".into()), params: Some("next-params".into()) }
+    }
+
+    #[test]
+    fn youtubes_later_next_is_played_on_song_end_with_its_ctt_and_the_chain_goes_on() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = long_queue(&dial_state);
+        choose_third(&mut playlist);
+        assert_eq!(playlist.tokens.auth_for("ccccccccccc"), next_ctt_c());
+        assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
+
+        // The queue's next has no ctt: YouTube's own choice plays.
+        assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(2));
+        assert_eq!(adopt_index(&mut playlist, &dial_state, 2, "Advancing"), "ccccccccccc");
+        assert_eq!(dial_state.ctt_for("ccccccccccc").as_deref(), Some("ctt-c"));
+        let job = prefetch_job(&mut playlist, true).expect("/next is asked after YouTube's choice");
+        assert_eq!(
+            (job.video_id.as_str(), job.expected_next.as_str(), job.ctt.as_str(), job.index),
+            ("ccccccccccc", "ddddddddddd", "ctt-c", 2)
+        );
+        assert_eq!(job.params.as_deref(), Some("next-params"));
+    }
+
+    #[test]
+    fn a_failed_song_skips_to_youtubes_later_next() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = long_queue(&dial_state);
+        choose_third(&mut playlist);
+        let action = stop_action(Some("UNPLAYABLE".into()), &mut playlist);
+        assert!(matches!(action, StopAction::SkipFailed { next: 2, .. }), "{action:?}");
+    }
+
+    #[test]
+    fn youtubes_later_next_reached_another_way_plays_with_its_ctt() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = long_queue(&dial_state);
+        choose_third(&mut playlist);
+
+        // The user steps to the queue's next, which fails and is skipped.
+        assert_eq!(adopt_index(&mut playlist, &dial_state, 1, "Next"), "bbbbbbbbbbb");
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        let action = stop_action(Some("UNPLAYABLE".into()), &mut playlist);
+        assert!(matches!(action, StopAction::SkipFailed { next: 2, .. }), "{action:?}");
+        assert_eq!(adopt_index(&mut playlist, &dial_state, 2, "Skipping"), "ccccccccccc");
+        assert_eq!(dial_state.ctt_for("ccccccccccc").as_deref(), Some("ctt-c"));
+        let job = prefetch_job(&mut playlist, true).expect("the chain goes on");
+        assert_eq!((job.video_id.as_str(), job.expected_next.as_str()), ("ccccccccccc", "ddddddddddd"));
+    }
+
+    #[test]
+    fn youtubes_later_next_is_not_taken_when_the_queue_next_has_its_own_ctt() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = long_queue(&dial_state);
+        choose_third(&mut playlist);
+        playlist.tokens.remember("bbbbbbbbbbb", auth("ctt-b"));
+        assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1));
+    }
+
+    #[test]
+    fn next_naming_no_later_queue_entry_or_no_ctt_is_not_followed() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        type Answer = fn(&PlaylistState) -> PrefetchResult;
+        let cases: [(Answer, PrefetchVerdict); 3] = [
+            (|p| next_answer(p, "zzzzzzzzzzz", Some("ctt-z")), PrefetchVerdict::Mismatch),
+            (|p| next_answer(p, "aaaaaaaaaaa", Some("ctt-a2")), PrefetchVerdict::Mismatch),
+            (|p| next_answer(p, "ccccccccccc", None), PrefetchVerdict::NoToken),
+        ];
+        for (answer, verdict) in cases {
+            let mut playlist = long_queue(&dial_state);
+            let answer = answer(&playlist);
+            assert_eq!(apply_prefetch(&mut playlist, answer), verdict);
+            assert_eq!(playlist.tokens.next_choice(), None, "{verdict:?}");
+            assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"), "{verdict:?}");
+            assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1), "{verdict:?}");
+        }
+    }
+
+    #[test]
+    fn a_next_answer_is_stale_once_the_user_moved_to_another_song() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        for steps in [&[1][..], &[1, 0][..]] {
+            let mut playlist = long_queue(&dial_state);
+            let answer = next_answer(&playlist, "ccccccccccc", Some("ctt-c"));
+            for &index in steps {
+                adopt_index(&mut playlist, &dial_state, index, "Next/Previous");
+            }
+            assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale, "{steps:?}");
+            assert_eq!(playlist.tokens.auth_for("ccccccccccc"), cast_tokens::VideoAuth::default());
+            assert_eq!(playlist.tokens.next_choice(), None);
+        }
+
+        // A choice already made is forgotten when the user moves on and back.
+        let mut playlist = long_queue(&dial_state);
+        choose_third(&mut playlist);
+        adopt_index(&mut playlist, &dial_state, 1, "Next");
+        adopt_index(&mut playlist, &dial_state, 0, "Previous");
+        assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1));
+    }
+
+    #[test]
+    fn youtubes_later_next_is_forgotten_with_its_cast() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let ids = ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"].map(str::to_owned).to_vec();
+        type Change = fn(&mut PlaylistState, &dial::DialState, &[String]);
+        let changes: [(&str, Change); 3] = [
+            ("setPlaylist", |p, d, ids| {
+                adopt_playlist(p, d, "aaaaaaaaaaa", ids.to_vec(), 0, "RDAMVMaaaaaaaaaaa".into(), auth("ctt-a"))
+            }),
+            ("setVideo", |p, d, _| adopt_video(p, d, "aaaaaaaaaaa", Some("ctt-a".into()))),
+            ("a new sender", |p, d, _| {
+                forget_tokens_on_new_sender(p, d, false, &["old-sender".into()], &["new-sender".into()])
+            }),
+        ];
+        for (change, apply) in changes {
+            let mut playlist = long_queue(&dial_state);
+            let late = next_answer(&playlist, "ccccccccccc", Some("ctt-c"));
+            choose_third(&mut playlist);
+            apply(&mut playlist, &dial_state, &ids);
+            assert_eq!(playlist.tokens.next_choice(), None, "{change}");
+            assert_eq!(playlist.tokens.auth_for("ccccccccccc"), cast_tokens::VideoAuth::default(), "{change}");
+            assert_eq!(apply_prefetch(&mut playlist, late), PrefetchVerdict::Stale, "{change}");
+            if playlist.video_ids.len() > 1 {
+                assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1), "{change}");
+            }
+        }
     }
 
     #[tokio::test]
