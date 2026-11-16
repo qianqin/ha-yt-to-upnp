@@ -109,9 +109,10 @@ pub enum PlayerCommand {
     Stop,
     Previous,
     Next,
-    /// `device_ids`: the senders' Lounge device ids, for /next's MDX context.
-    RemoteConnected { theme: String, device_ids: Vec<String> },
-    RemoteDisconnected { theme: String },
+    /// `device_ids`: the senders' Lounge device ids, for /next's MDX context;
+    /// `name`: the sender's name, which tells apart senders without an id.
+    RemoteConnected { theme: String, device_ids: Vec<String>, name: Option<String> },
+    RemoteDisconnected { theme: String, device_id: Option<String>, name: Option<String> },
     UpdatePlaylist {
         video_ids: Vec<String>,
         list_id: String,
@@ -598,8 +599,9 @@ fn dispatch_messages(
             "remoteConnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
                 tracing::info!("[lounge:{}] remote connected: {name}", session.theme);
-                let device_ids = msg.args.get("id").filter(|id| !id.is_empty()).cloned().into_iter().collect();
-                send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids });
+                let device_ids = sender_id(&msg.args).into_iter().collect();
+                let name = msg.args.get("name").cloned();
+                send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name });
                 // Tell the phone we're ready — matches yt-cast-receiver handleSenderConnected:
                 // 1. onHasPreviousNextChanged
                 // 2. nowPlaying (empty = nothing playing)
@@ -625,7 +627,14 @@ fn dispatch_messages(
             "remoteDisconnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
                 tracing::info!("[lounge:{}] remote disconnected: {name}", session.theme);
-                send_cmd(player_tx, PlayerCommand::RemoteDisconnected { theme: session.theme.clone() });
+                send_cmd(
+                    player_tx,
+                    PlayerCommand::RemoteDisconnected {
+                        theme: session.theme.clone(),
+                        device_id: sender_id(&msg.args),
+                        name: msg.args.get("name").cloned(),
+                    },
+                );
             }
 
             // -- Lounge status --
@@ -638,7 +647,7 @@ fn dispatch_messages(
                 if has_senders {
                     tracing::info!("[lounge:{}] loungeStatus has remote senders, sending readiness", session.theme);
                     let device_ids = msg.args.get("devices").map(|d| remote_device_ids(d)).unwrap_or_default();
-                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids });
+                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name: None });
                     responses.push(
                         OutgoingMessage::new("onHasPreviousNextChanged")
                             .with_arg("hasPrevious", "false")
@@ -719,6 +728,11 @@ fn dispatch_messages(
 /// Shows what the phone sends with each cast (keys only, see `arg_keys`).
 fn log_cast_keys(theme: &str, command: &str, args: &HashMap<String, String>) {
     tracing::info!("[lounge:{}] {} keys={:?}", theme, command, arg_keys(args));
+}
+
+/// A remoteConnected / remoteDisconnected sender's device id, if it gave one.
+fn sender_id(args: &HashMap<String, String>) -> Option<String> {
+    args.get("id").filter(|id| !id.is_empty()).cloned()
 }
 
 /// The ids of the REMOTE_CONTROL senders in a loungeStatus `devices` list
@@ -1193,6 +1207,45 @@ mod tests {
         assert_eq!(
             ids,
             vec![vec!["sender-device-2".to_owned()], vec!["sender-device-1".to_owned()], vec![]]
+        );
+    }
+
+    #[test]
+    fn senders_are_named_when_they_connect_and_leave() {
+        let mut session = LoungeSession::new(
+            reqwest::Client::new(),
+            "Test Screen".to_owned(),
+            "uuid".to_owned(),
+            "screen".to_owned(),
+            "m".to_owned(),
+        );
+        let (player_tx, mut player_rx) = mpsc::channel(8);
+        let messages = [
+            incoming("remoteConnected", &[("id", "sender-device-2"), ("name", "Phone")]),
+            incoming("remoteDisconnected", &[("id", "sender-device-2"), ("name", "Phone")]),
+            incoming("remoteDisconnected", &[("id", ""), ("name", "iPad")]),
+            incoming("remoteDisconnected", &[]),
+        ];
+
+        dispatch_messages(&mut session, &messages, &player_tx);
+
+        let mut seen = Vec::new();
+        while let Ok(cmd) = player_rx.try_recv() {
+            match cmd {
+                PlayerCommand::RemoteConnected { name, .. } => seen.push((None, name)),
+                PlayerCommand::RemoteDisconnected { device_id, name, .. } => seen.push((device_id, name)),
+                _ => {}
+            }
+        }
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            seen,
+            vec![
+                (None, some("Phone")),
+                (some("sender-device-2"), some("Phone")),
+                (None, some("iPad")),
+                (None, None),
+            ]
         );
     }
 

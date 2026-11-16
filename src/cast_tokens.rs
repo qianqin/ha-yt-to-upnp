@@ -36,9 +36,10 @@ pub struct CastTokens {
     /// The (generation, current video, expected next video) /next was asked
     /// about: at most one request per song.
     prefetched: Option<(u64, String, String)>,
-    /// The queue index /next named after the current song, when it is a
-    /// later entry than the queue's next (YouTube skipped entries itself).
-    next_choice: Option<usize>,
+    /// The video /next named after the current song, when it is a later
+    /// queue entry than the queue's next (YouTube skipped entries itself).
+    /// By id: the queue may be edited (UpdatePlaylist) before the song ends.
+    next_choice: Option<String>,
 }
 
 impl CastTokens {
@@ -58,13 +59,13 @@ impl CastTokens {
         self.generation += 1;
     }
 
-    /// /next names queue index `index` to follow the current song.
-    pub fn choose_next(&mut self, index: usize) {
-        self.next_choice = Some(index);
+    /// /next names `video_id` to follow the current song.
+    pub fn choose_next(&mut self, video_id: &str) {
+        self.next_choice = Some(video_id.to_owned());
     }
 
-    pub fn next_choice(&self) -> Option<usize> {
-        self.next_choice
+    pub fn next_choice(&self) -> Option<&str> {
+        self.next_choice.as_deref()
     }
 
     pub fn generation(&self) -> u64 {
@@ -167,8 +168,8 @@ mod tests {
     fn youtubes_next_choice_holds_for_the_current_song_only() {
         let mut tokens = CastTokens::default();
         assert_eq!(tokens.next_choice(), None);
-        tokens.choose_next(7);
-        assert_eq!(tokens.next_choice(), Some(7));
+        tokens.choose_next("ccccccccccc");
+        assert_eq!(tokens.next_choice(), Some("ccccccccccc"));
         let before = tokens.generation();
         tokens.next_song();
         assert_eq!(tokens.next_choice(), None, "another song plays");
@@ -176,7 +177,7 @@ mod tests {
         tokens.remember("aaaaaaaaaaa", auth("ctt-a"));
         tokens.next_song();
         assert_eq!(tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"), "the songs' tokens stay");
-        tokens.choose_next(7);
+        tokens.choose_next("ccccccccccc");
         tokens.clear();
         assert_eq!(tokens.next_choice(), None, "a new cast has no choice");
     }
