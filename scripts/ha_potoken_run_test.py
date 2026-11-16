@@ -308,5 +308,68 @@ class ImageInstallsTheEntryFile(unittest.TestCase):
         self.assertNotIn("ytcast-entry", text[:boundary])
 
 
+def dockerfiles():
+    """The app's Dockerfile and, once assembled, dist/'s copy of it."""
+    assembled = os.path.join(ROOT, "dist", "ha-yt-to-upnp", "Dockerfile")
+    return [DOCKERFILE] + ([assembled] if os.path.exists(assembled) else [])
+
+
+def _targets_bgutil(path, recursive):
+    path = path.rstrip("/") or "/"
+    return (path == "/opt/bgutil" or path.startswith("/opt/bgutil/")
+            or (recursive and path in ("/", "/opt")))
+
+
+def bgutil_ownership_changes(text):
+    """Dockerfile instructions that hand /opt/bgutil (or a file in it) to another owner or
+    group: chown/chgrp in a RUN, or COPY/ADD --chown into it."""
+    found = []
+    for instruction in re.sub(r"\\\n", " ", text).splitlines():
+        words = instruction.split()
+        if words and words[0].upper() in ("COPY", "ADD") \
+                and any(w.startswith("--chown") for w in words) \
+                and _targets_bgutil(words[-1], True):
+            found.append(instruction.strip())
+            continue
+        for command in re.split(r"&&|\|\||;|\|", instruction):
+            args = command.split()
+            for i, arg in enumerate(args):
+                if os.path.basename(arg) not in ("chown", "chgrp"):
+                    continue
+                rest = args[i + 1:]
+                recursive = any(a.startswith("-") and ("R" in a or a == "--recursive") for a in rest)
+                if any(_targets_bgutil(a, recursive) for a in rest if a.startswith("/")):
+                    found.append(command.strip())
+    return found
+
+
+class BgutilStaysRootOwned(unittest.TestCase):
+    """The helper runs as potoken: owning its code under /opt/bgutil would let it rewrite it."""
+
+    def test_no_chown_or_chgrp_on_opt_bgutil(self):
+        for path in dockerfiles():
+            with open(path) as f:
+                self.assertEqual(bgutil_ownership_changes(f.read()), [], path)
+
+    def test_the_check_catches_ownership_changes(self):
+        for mutant in [
+            "RUN chown potoken /opt/bgutil/ytcast-entry.ts",
+            "RUN chmod 0644 /opt/bgutil/ytcast-entry.ts && chown potoken:potoken /opt/bgutil/ytcast-entry.ts",
+            "RUN true \\\n    && chgrp -R potoken /opt/bgutil",
+            "RUN chown -R potoken /opt",
+            "COPY --chown=potoken rootfs/opt/bgutil/ /opt/bgutil/",
+        ]:
+            self.assertTrue(bgutil_ownership_changes(mutant), mutant)
+
+    def test_the_check_leaves_other_paths_alone(self):
+        for fine in [
+            "RUN chmod a+rX,go-w /opt/bgutil && chmod 0644 /opt/bgutil/ytcast-entry.ts",
+            "RUN chown potoken /var/lib/potoken",
+            "RUN chown potoken /opt/other",
+            "COPY --from=artefacts /artefacts/bgutil/ /opt/bgutil/",
+        ]:
+            self.assertEqual(bgutil_ownership_changes(fine), [], fine)
+
+
 if __name__ == "__main__":
     unittest.main()
