@@ -18,6 +18,9 @@ pub struct Senders {
     /// Every device id seen since the cast began, connected or departed:
     /// /next's MDX context, and how a returning sender is recognised.
     cast_ids: Vec<String>,
+    /// The receiver's rebind listed nobody (`forget_connected`), and no
+    /// sender event has come since: a phone may still be connected.
+    unlisted: bool,
 }
 
 impl Senders {
@@ -28,6 +31,7 @@ impl Senders {
     /// A sender connected (`ids` from remoteConnected or loungeStatus, `name`
     /// when it gave no id).
     pub fn connect(&mut self, ids: &[String], name: Option<&str>) {
+        self.unlisted = false;
         if ids.is_empty() {
             let sender = name.filter(|n| !n.is_empty()).map_or(Sender::Unidentified, |n| Sender::Named(n.to_owned()));
             self.connected.push(sender);
@@ -47,6 +51,7 @@ impl Senders {
     /// the known ones without an id (named or not), first-connected first,
     /// padded with unidentified ones.
     pub fn replace_connected(&mut self, ids: &[String], unidentified: usize) {
+        self.unlisted = false;
         let mut without_id: Vec<Sender> =
             self.connected.drain(..).filter(|sender| !matches!(sender, Sender::Id(_))).collect();
         // In connect order, cut or padded to the listed number.
@@ -67,6 +72,7 @@ impl Senders {
     /// no connected sender leaves none connected: better to forget a cast
     /// than to keep it for a sender who is gone.
     pub fn disconnect(&mut self, id: Option<&str>, name: Option<&str>) {
+        self.unlisted = false;
         let by_id = id.map(|id| Sender::Id(id.to_owned()));
         let by_name = name.filter(|n| !n.is_empty()).map(|n| Sender::Named(n.to_owned()));
         let gone = [by_id, by_name]
@@ -102,6 +108,21 @@ impl Senders {
     pub fn clear(&mut self) {
         self.connected.clear();
         self.cast_ids.clear();
+        self.unlisted = false;
+    }
+
+    /// The receiver's own rebind listed nobody: a sender whose leave was
+    /// lost is no longer counted, but one still connected may not be listed
+    /// yet (see `unlisted_since_rebind`). The cast's ids stay.
+    pub fn forget_connected(&mut self) {
+        self.connected.clear();
+        self.unlisted = true;
+    }
+
+    /// Since a rebind listed nobody, no sender event has come: a cast from
+    /// the Lounge is a connected sender speaking.
+    pub fn unlisted_since_rebind(&self) -> bool {
+        self.unlisted
     }
 }
 
@@ -277,6 +298,30 @@ mod tests {
         // A leave with an empty name names nobody: everyone is dropped.
         senders.disconnect(None, Some(""));
         assert!(!senders.any_connected());
+    }
+
+    #[test]
+    fn a_rebind_listing_nobody_leaves_the_senders_unknown_until_one_speaks() {
+        let mut senders = Senders::default();
+        assert!(!senders.unlisted_since_rebind(), "a fresh start knows nobody spoke");
+        senders.connect(&ids(&["phone"]), None);
+        senders.forget_connected();
+        assert!(!senders.any_connected());
+        assert!(senders.unlisted_since_rebind());
+        assert_eq!(senders.cast_ids(), ids(&["phone"]).as_slice());
+        type Event = fn(&mut Senders);
+        let events: [Event; 4] = [
+            |s| s.connect(&[], None),
+            |s| s.replace_connected(&[], 0),
+            |s| s.disconnect(None, None),
+            |s| s.clear(),
+        ];
+        for event in events {
+            let mut senders = Senders::default();
+            senders.forget_connected();
+            event(&mut senders);
+            assert!(!senders.unlisted_since_rebind());
+        }
     }
 
     #[test]

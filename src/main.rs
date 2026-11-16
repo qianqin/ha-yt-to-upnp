@@ -572,7 +572,7 @@ async fn on_command<R, Fut>(
         PlayerCommand::SendersForgotten { theme } => {
             if *active_theme.read().unwrap() == *theme {
                 tracing::info!("[player] The Lounge's rebind lists no sender; who is connected is unknown until they speak");
-                senders.replace_connected(&[], 0);
+                senders.forget_connected();
             }
             return;
         }
@@ -581,6 +581,13 @@ async fn on_command<R, Fut>(
     // A sender left or was not listed, but another is still connected.
     if !last_left {
         return;
+    }
+    // After a rebind listed nobody, a cast is a sender speaking: accept it
+    // and count that sender. Its setPlaylist/setVideo bring its own tokens
+    // (adopt_cast_auth replaces the cast's before any nowPlaying is built).
+    if senders.unlisted_since_rebind() && is_stale_command(false, &cmd) {
+        tracing::info!("[player] A sender casts after the rebind: it is connected");
+        senders.connect(&[], None);
     }
     if is_stale_command(senders.any_connected(), &cmd) {
         tracing::info!("[player] Ignoring stale command (no remote connected yet)");
@@ -3039,12 +3046,27 @@ mod preroll_wiring_tests {
         senders: &mut senders::Senders,
         script: Vec<(&'static str, &'static str)>,
     ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
+        on_command_resolving(active, dial_state, cmd, playlist, play_started, senders, no_stream, script).await
+    }
+
+    /// `on_command_on` with songs resolved by `resolved`.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_command_resolving(
+        active: &std::sync::RwLock<String>,
+        dial_state: &Arc<dial::DialState>,
+        cmd: lounge::PlayerCommand,
+        playlist: &mut PlaylistState,
+        play_started: &mut bool,
+        senders: &mut senders::Senders,
+        resolved: fn(&str) -> innertube::Result<Option<innertube::StreamInfo>>,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Vec<String>, Vec<messages::OutgoingMessage>) {
         let _lock = global_pins_lock();
         let (port, server) = fake_mpd(script).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(32);
         let resolve = |vid: String, _, _| {
-            let result = no_stream(&vid);
+            let result = resolved(&vid);
             async move { result }
         };
         on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve).await;
@@ -3232,6 +3254,95 @@ mod preroll_wiring_tests {
                 on_command_with(&dial_state, gone(), &mut playlist, &mut started, &mut connected(&["phone"]), script).await;
                 let text = logs.text();
                 assert!(text.contains(&format!("{says}, {then}")), "{says} / {then}:\n{text}");
+            }
+        }
+    }
+
+    fn set_playlist_d(ctt: &str) -> lounge::PlayerCommand {
+        lounge::PlayerCommand::SetPlaylist {
+            video_id: "ddddddddddd".into(),
+            video_ids: strings(&["ddddddddddd", "eeeeeeeeeee"]),
+            list_id: "RDAMVMddddddddddd".into(),
+            index: 0,
+            ctt: Some(ctt.into()),
+            params: Some(format!("{ctt}-params")),
+            current_time: 0.0,
+        }
+    }
+
+    fn set_video_d(ctt: &str) -> lounge::PlayerCommand {
+        lounge::PlayerCommand::SetVideo { video_id: "ddddddddddd".into(), ctt: Some(ctt.into()), current_time: 0.0 }
+    }
+
+    #[tokio::test]
+    async fn a_phone_casting_after_a_rebind_listed_nobody_is_connected() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 0.0\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        type Cast = fn(&str) -> lounge::PlayerCommand;
+        for (name, cast) in [("setPlaylist", set_playlist_d as Cast), ("setVideo", set_video_d as Cast)] {
+            let mut playlist = queue_at(&dial_state, 0);
+            let mut play_started = true;
+            let mut senders = connected(&["phone"]);
+            let forgotten = lounge::PlayerCommand::SendersForgotten { theme: "m".into() };
+            on_command_on(&active, &dial_state, forgotten, &mut playlist, &mut play_started, &mut senders, vec![]).await;
+            assert!(!senders.any_connected(), "{name}");
+
+            let script =
+                vec![("status", STATUS), ("clear", "OK\n"), ("add", "OK\n"), ("play", "OK\n"), ("status", STATUS)];
+            let (seen, sent) = on_command_resolving(
+                &active, &dial_state, cast("ctt-new"), &mut playlist, &mut play_started, &mut senders, playable, script,
+            )
+            .await;
+            assert_eq!(seen.len(), 5, "{name}: the phone's song plays: {seen:?}");
+            assert!(play_started, "{name}");
+            assert!(senders.any_connected(), "{name}: the phone proved it is there");
+            assert_eq!(current_video_id(&playlist), "ddddddddddd", "{name}");
+            assert_eq!(playlist.tokens.auth_for("ddddddddddd").ctt.as_deref(), Some("ctt-new"), "{name}");
+            assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default(), "{name}");
+            assert_eq!(dial_state.ctt_for("ddddddddddd").as_deref(), Some("ctt-new"), "{name}");
+            // Every nowPlaying answering it carries the new cast's ctt only.
+            let now_playing: Vec<_> = sent.iter().filter(|m| m.command == "nowPlaying").collect();
+            assert!(!now_playing.is_empty(), "{name}");
+            for np in now_playing {
+                assert_eq!(arg(np, "ctt"), Some("ctt-new"), "{name}");
+                assert!(arg(np, "params").is_none_or(|p| p == "ctt-new-params"), "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cast_before_any_sender_or_after_the_senders_spoke_again_is_stale() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        type Events = fn() -> Vec<lounge::PlayerCommand>;
+        let cases: [(&str, Events); 4] = [
+            ("fresh start, no sender ever", Vec::new),
+            ("forgotten, then the phone connected and left", || {
+                vec![lounge::PlayerCommand::SendersForgotten { theme: "m".into() }, connect(&["phone"]), disconnect("phone")]
+            }),
+            ("forgotten, then a list of nobody", || {
+                vec![lounge::PlayerCommand::SendersForgotten { theme: "m".into() }, listed_on("m", &[], 0)]
+            }),
+            ("forgotten on another theme", || vec![lounge::PlayerCommand::SendersForgotten { theme: "cl".into() }]),
+        ];
+        for (case, events) in cases {
+            let mut playlist = queue_at(&dial_state, 0);
+            let mut play_started = true;
+            let mut senders = senders::Senders::default();
+            for event in events() {
+                on_command_on(&active, &dial_state, event, &mut playlist, &mut play_started, &mut senders, vec![])
+                    .await;
+            }
+            for cast in [set_playlist_d("ctt-new"), set_video_d("ctt-new")] {
+                let (seen, sent) =
+                    on_command_on(&active, &dial_state, cast, &mut playlist, &mut play_started, &mut senders, vec![])
+                        .await;
+                assert!(seen.is_empty() && sent.is_empty(), "{case}: dropped as stale");
+                assert!(!senders.any_connected(), "{case}");
+                assert_eq!(playlist.tokens.auth_for("ddddddddddd"), cast_tokens::VideoAuth::default(), "{case}");
             }
         }
     }
