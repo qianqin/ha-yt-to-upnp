@@ -41,17 +41,16 @@ impl Senders {
         self.note_ids(ids);
     }
 
-    /// The Lounge's list of who is connected now (`ids`; `listed`: anyone at
-    /// all). It replaces the known senders, so one whose leave was missed is
-    /// gone. A list of senders without readable ids keeps the known ones.
-    pub fn replace_connected(&mut self, ids: &[String], listed: bool) {
-        if !ids.is_empty() {
-            self.connected = ids.iter().cloned().map(Sender::Id).collect();
-        } else if !listed {
-            self.connected.clear();
-        } else if self.connected.is_empty() {
-            self.connected.push(Sender::Unidentified);
-        }
+    /// The Lounge's list of who is connected now: `ids`, and `unidentified`
+    /// senders without a readable id. It replaces the known senders, so one
+    /// whose leave was missed is gone. An unidentified one keeps a known
+    /// sender without an id (by its name), else counts as such.
+    pub fn replace_connected(&mut self, ids: &[String], unidentified: usize) {
+        let mut without_id: Vec<Sender> =
+            self.connected.drain(..).filter(|sender| !matches!(sender, Sender::Id(_))).collect();
+        // Kept in their order, cut or padded to the listed number.
+        without_id.resize_with(unidentified, || Sender::Unidentified);
+        self.connected = ids.iter().cloned().map(Sender::Id).chain(without_id).collect();
         self.note_ids(ids);
     }
 
@@ -188,29 +187,60 @@ mod tests {
         senders.connect(&ids(&["phone"]), Some("Phone"));
         senders.connect(&ids(&["ipad"]), Some("iPad"));
         // The iPad's remoteDisconnected was missed.
-        senders.replace_connected(&ids(&["phone"]), true);
+        senders.replace_connected(&ids(&["phone"]), 0);
         senders.disconnect(Some("phone"), Some("Phone"));
         assert!(!senders.any_connected(), "the iPad is not left behind as a ghost");
         assert_eq!(senders.cast_ids(), ids(&["phone", "ipad"]).as_slice(), "the cast's ids stay");
 
         senders.connect(&ids(&["phone"]), None);
-        senders.replace_connected(&[], false);
+        senders.replace_connected(&[], 0);
         assert!(!senders.any_connected(), "nobody listed");
 
-        senders.replace_connected(&ids(&["tv"]), true);
+        senders.replace_connected(&ids(&["tv"]), 0);
         assert!(senders.cast_ids().contains(&"tv".to_owned()));
     }
 
     #[test]
-    fn a_lounge_status_listing_senders_without_readable_ids_keeps_someone_connected() {
+    fn a_lounge_status_counts_each_sender_without_a_readable_id() {
         let mut senders = Senders::default();
-        senders.replace_connected(&[], true);
+        senders.replace_connected(&[], 1);
         assert!(senders.any_connected());
+        senders.replace_connected(&[], 1);
+        senders.replace_connected(&[], 1);
+        senders.disconnect(None, Some("someone"));
+        assert!(!senders.any_connected(), "repeated lists add no ghosts");
+
+        // A named sender without an id stays known by its name.
         let mut senders = Senders::default();
         senders.connect(&[], Some("Phone"));
-        senders.replace_connected(&[], true);
+        senders.replace_connected(&[], 1);
         senders.disconnect(None, Some("Phone"));
         assert!(!senders.any_connected(), "the known sender is kept, not doubled");
+
+        // Two known without an id, one listed: one is gone.
+        let mut senders = Senders::default();
+        senders.connect(&[], Some("Phone"));
+        senders.connect(&[], Some("iPad"));
+        senders.replace_connected(&[], 1);
+        senders.disconnect(None, Some("Phone"));
+        assert!(!senders.any_connected());
+    }
+
+    #[test]
+    fn a_mixed_lounge_status_keeps_the_sender_without_an_id() {
+        let mut senders = Senders::default();
+        senders.connect(&ids(&["phone"]), None);
+        senders.connect(&[], Some("iPad"));
+        senders.replace_connected(&ids(&["phone"]), 1);
+        senders.disconnect(Some("phone"), None);
+        assert!(senders.any_connected(), "the iPad is still listed");
+        senders.disconnect(None, Some("iPad"));
+        assert!(!senders.any_connected());
+
+        let mut senders = Senders::default();
+        senders.replace_connected(&ids(&["phone"]), 1);
+        senders.disconnect(Some("phone"), None);
+        assert!(senders.any_connected(), "an unidentified sender was listed too");
     }
 
     #[test]
