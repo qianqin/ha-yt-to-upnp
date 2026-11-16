@@ -64,6 +64,10 @@ impl CastTokens {
         self.next_choice = Some(video_id.to_owned());
     }
 
+    pub fn forget_next_choice(&mut self) {
+        self.next_choice = None;
+    }
+
     pub fn next_choice(&self) -> Option<&str> {
         self.next_choice.as_deref()
     }
@@ -177,6 +181,8 @@ mod tests {
         tokens.remember("aaaaaaaaaaa", auth("ctt-a"));
         tokens.next_song();
         assert_eq!(tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"), "the songs' tokens stay");
+        tokens.forget_next_choice();
+        assert_eq!(tokens.next_choice(), None);
         tokens.choose_next("ccccccccccc");
         tokens.clear();
         assert_eq!(tokens.next_choice(), None, "a new cast has no choice");

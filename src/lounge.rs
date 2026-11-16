@@ -113,6 +113,9 @@ pub enum PlayerCommand {
     /// `name`: the sender's name, which tells apart senders without an id.
     RemoteConnected { theme: String, device_ids: Vec<String>, name: Option<String> },
     RemoteDisconnected { theme: String, device_id: Option<String>, name: Option<String> },
+    /// A loungeStatus: the senders connected now (`listed`: any at all,
+    /// `device_ids`: those with a readable id). Replaces the known ones.
+    SendersListed { theme: String, device_ids: Vec<String>, listed: bool },
     UpdatePlaylist {
         video_ids: Vec<String>,
         list_id: String,
@@ -644,9 +647,10 @@ fn dispatch_messages(
                 let has_senders = msg.args.get("devices")
                     .map(|d| d.contains("REMOTE_CONTROL"))
                     .unwrap_or(false);
+                let device_ids = msg.args.get("devices").map(|d| remote_device_ids(d)).unwrap_or_default();
                 if has_senders {
                     tracing::info!("[lounge:{}] loungeStatus has remote senders, sending readiness", session.theme);
-                    let device_ids = msg.args.get("devices").map(|d| remote_device_ids(d)).unwrap_or_default();
+                    let device_ids = device_ids.clone();
                     send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone(), device_ids, name: None });
                     responses.push(
                         OutgoingMessage::new("onHasPreviousNextChanged")
@@ -659,6 +663,14 @@ fn dispatch_messages(
                     responses.push(
                         OutgoingMessage::new("onAutoplayModeChanged")
                             .with_arg("autoplayMode", "UNSUPPORTED"),
+                    );
+                }
+                // The list is who is connected now: a sender whose
+                // remoteDisconnected was missed is gone. No list, no news.
+                if msg.args.contains_key("devices") {
+                    send_cmd(
+                        player_tx,
+                        PlayerCommand::SendersListed { theme: session.theme.clone(), device_ids, listed: has_senders },
                     );
                 }
             }
@@ -1247,6 +1259,42 @@ mod tests {
                 (None, None),
             ]
         );
+    }
+
+    #[test]
+    fn every_lounge_status_with_a_device_list_lists_the_senders() {
+        let mut session = LoungeSession::new(
+            reqwest::Client::new(),
+            "Test Screen".to_owned(),
+            "uuid".to_owned(),
+            "screen".to_owned(),
+            "m".to_owned(),
+        );
+        let (player_tx, mut player_rx) = mpsc::channel(8);
+        let phone = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"},{"id":"phone","type":"REMOTE_CONTROL"}]"#;
+        let nobody = r#"[{"id":"screen-self","type":"LOUNGE_SCREEN"}]"#;
+        let messages = [
+            incoming("loungeStatus", &[("devices", phone)]),
+            incoming("loungeStatus", &[("devices", nobody)]),
+            incoming("loungeStatus", &[("queueId", "q")]),
+        ];
+
+        dispatch_messages(&mut session, &messages, &player_tx);
+
+        let mut listed = Vec::new();
+        let mut connects = 0;
+        while let Ok(cmd) = player_rx.try_recv() {
+            match cmd {
+                PlayerCommand::SendersListed { device_ids, listed: any, .. } => listed.push((device_ids, any)),
+                PlayerCommand::RemoteConnected { .. } => {
+                    connects += 1;
+                    assert!(listed.is_empty(), "the connect comes before its list");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(connects, 1);
+        assert_eq!(listed, vec![(vec!["phone".to_owned()], true), (vec![], false)], "no list, no news");
     }
 
     #[test]
