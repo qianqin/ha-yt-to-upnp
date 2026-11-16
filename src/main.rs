@@ -36,6 +36,8 @@ struct PlaylistState {
     last_state: messages::PlayerState,
     /// Silence MPD plays from a DIAL launch until the first song.
     preroll: preroll::PreRoll,
+    /// Tracks in a row whose stream failed (see `stop_action`).
+    failed_in_row: u32,
 }
 
 impl Default for PlaylistState {
@@ -50,6 +52,7 @@ impl Default for PlaylistState {
             cpn: messages::generate_cpn(),
             last_state: messages::PlayerState::Idle,
             preroll: preroll::PreRoll::default(),
+            failed_in_row: 0,
         }
     }
 }
@@ -389,8 +392,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "[player] Remote connected on theme={} ({} sender id(s)), ready for commands",
                             theme, device_ids.len()
                         );
+                        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active_theme, has_remote, theme, device_ids);
                         has_remote = true;
-                        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active_theme, theme, device_ids);
                         continue;
                     }
                     lounge::PlayerCommand::RemoteDisconnected { theme } => {
@@ -400,8 +403,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             continue;
                         }
                         has_remote = false;
-                        sender_ids.clear();
-                        // Fall through to handle_command for stop/cleanup
+                        // A song playing on keeps its senders for /next's
+                        // MDX context, as if they were still connected.
+                        if !plays_on_without_sender(play_started, &playlist) {
+                            sender_ids.clear();
+                        }
+                        // Fall through to handle_command: play on, or stop and clean up
                     }
                     lounge::PlayerCommand::SetVolume { volume } => reported_volume = Some(*volume),
                     _ => {}
@@ -482,45 +489,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if song_ended(&status) {
                             play_started = false;
 
-                            let failure = dial_state.take_stream_failure(&current_video_id(&playlist));
-                            let action = stop_action(failure, &playlist);
-                            if let StopAction::StreamFailed(reason) = action {
-                                tracing::error!(
-                                    "[player] Stream failed for {} (index {}): {}; not advancing",
-                                    current_video_id(&playlist), playlist.current_index, reason
-                                );
-                                playlist.last_state = messages::PlayerState::Idle;
-                                state_tx.send(stream_failed_message(&playlist)).await.ok();
-                                continue;
-                            }
-
-                            // Tell YouTube the current track has ended BEFORE
-                            // attempting auto-advance. If InnerTube fails
-                            // (LOGIN_REQUIRED), YouTube already has the ended
-                            // signal and will send a recovery setPlaylist fast.
-                            let duration = playlist.current_duration as f64;
                             let ended_vid = current_video_id(&playlist);
-                            tracing::info!(
-                                "[player] Song ended: {} (index {})",
-                                ended_vid, playlist.current_index
-                            );
-                            // Song ended: send OnStateChange only (PLAYING→STOPPED).
-                            // Reference does NOT send NowPlaying when prev was PLAYING.
-                            let dur_str = messages::fmt_time(duration);
-                            playlist.last_state = messages::PlayerState::Stopped;
-                            state_tx.send(
-                                messages::OutgoingMessage::new("onStateChange")
-                                    .with_arg("state", "0")
-                                    .with_arg("currentTime", &dur_str)
-                                    .with_arg("duration", &dur_str)
-                                    .with_arg("loadedTime", &dur_str)
-                                    .with_arg("seekableStartTime", "0")
-                                    .with_arg("seekableEndTime", &dur_str)
-                                    .with_arg("cpn", &playlist.cpn),
-                            ).await.ok();
+                            let ended_index = playlist.current_index;
+                            let failure = dial_state.take_stream_failure(&ended_vid);
+                            let next = match stop_action(failure, &mut playlist) {
+                                StopAction::StreamFailed(reason) => {
+                                    tracing::error!(
+                                        "[player] Stream failed for {} (index {}): {}; not advancing{}",
+                                        ended_vid, ended_index, reason,
+                                        if playlist.failed_in_row >= MAX_FAILED_IN_ROW {
+                                            format!(" ({} tracks in a row failed)", playlist.failed_in_row)
+                                        } else {
+                                            String::new()
+                                        }
+                                    );
+                                    playlist.last_state = messages::PlayerState::Idle;
+                                    state_tx.send(stream_failed_message(&playlist)).await.ok();
+                                    if !has_remote {
+                                        end_unattended_cast(
+                                            &mut mpd_client, &mut playlist, &mut play_started, &mut sender_ids, &dial_state,
+                                        ).await;
+                                    }
+                                    continue;
+                                }
+                                StopAction::SkipFailed { next, reason } => {
+                                    tracing::warn!(
+                                        "[player] Stream failed for {} (index {}): {}; skipping to index {} ({} of {} in a row)",
+                                        ended_vid, ended_index, reason, next, playlist.failed_in_row, MAX_FAILED_IN_ROW
+                                    );
+                                    // Unstarted at 0, not ended: the app follows
+                                    // the skip instead of advancing itself.
+                                    playlist.last_state = messages::PlayerState::Idle;
+                                    state_tx.send(stream_failed_message(&playlist)).await.ok();
+                                    Some((next, "Skipping"))
+                                }
+                                // Tell YouTube the current track has ended BEFORE
+                                // attempting auto-advance. If InnerTube fails
+                                // (LOGIN_REQUIRED), YouTube already has the ended
+                                // signal and will send a recovery setPlaylist fast.
+                                StopAction::Advance(next) => {
+                                    tracing::info!("[player] Song ended: {} (index {})", ended_vid, ended_index);
+                                    playlist.last_state = messages::PlayerState::Stopped;
+                                    state_tx.send(song_ended_message(&playlist)).await.ok();
+                                    Some((next, "Advancing"))
+                                }
+                                StopAction::Finished => {
+                                    tracing::info!("[player] Song ended: {} (index {})", ended_vid, ended_index);
+                                    playlist.last_state = messages::PlayerState::Stopped;
+                                    state_tx.send(song_ended_message(&playlist)).await.ok();
+                                    None
+                                }
+                            };
 
-                            if let StopAction::Advance(next) = action {
-                                let video_id = adopt_index(&mut playlist, &dial_state, next, "Advancing");
+                            if let Some((next, why)) = next {
+                                let video_id = adopt_index(&mut playlist, &dial_state, next, why);
 
                                 match play_video(
                                     &mut mpd_client, &state_tx,
@@ -540,6 +562,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 }
                             } else {
                                 tracing::info!("[player] Playlist finished");
+                                if !has_remote {
+                                    end_unattended_cast(
+                                        &mut mpd_client, &mut playlist, &mut play_started, &mut sender_ids, &dial_state,
+                                    ).await;
+                                }
                             }
                         }
                     }
@@ -745,18 +772,10 @@ async fn handle_command(
 
         PlayerCommand::Stop => {
             tracing::info!("[player] Stop");
-            *play_started = false;
-            // The queue is gone, and with it every song's ctt.
-            set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
-            playlist.tokens.clear();
+            forget_queue(playlist, play_started, dial_state);
             end_preroll(&mut playlist.preroll, "stop from the phone");
             mpd.stop().await?;
             mpd.clear().await?;
-            playlist.video_ids.clear();
-            playlist.current_index = 0;
-            playlist.list_id.clear();
-            playlist.current_title.clear();
-            playlist.current_duration = 0;
             send_state(mpd, state_tx, playlist, messages::PlayerState::Stopped).await?;
         }
 
@@ -812,6 +831,7 @@ async fn handle_command(
 
         PlayerCommand::Previous => {
             if playlist.current_index > 0 {
+                playlist.failed_in_row = 0;
                 let video_id = adopt_index(playlist, dial_state, playlist.current_index - 1, "Previous");
                 *play_started = false;
                 *play_started = play_video(mpd, state_tx, playlist, &video_id, 0.0, yt_session).await?;
@@ -822,6 +842,7 @@ async fn handle_command(
 
         PlayerCommand::Next => {
             if playlist.current_index + 1 < playlist.video_ids.len() {
+                playlist.failed_in_row = 0;
                 let video_id = adopt_index(playlist, dial_state, playlist.current_index + 1, "Next");
                 *play_started = false;
                 *play_started = play_video(mpd, state_tx, playlist, &video_id, 0.0, yt_session).await?;
@@ -839,20 +860,23 @@ async fn handle_command(
             // Handled in the main select! loop before handle_command
         }
 
+        // A sender leaves when the phone sleeps: like a Chromecast, the
+        // queue plays on. Its ctt stays for the queue until the cast ends
+        // (queue end, stop, release) or another sender connects.
+        PlayerCommand::RemoteDisconnected { .. } if plays_on_without_sender(*play_started, playlist) => {
+            tracing::info!(
+                "[player] Remote disconnected, playback continues without a sender (index {} of {})",
+                playlist.current_index, playlist.video_ids.len()
+            );
+        }
+
         PlayerCommand::RemoteDisconnected { .. } => {
             tracing::info!("[player] Remote disconnected, stopping playback");
-            set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
             // nowPlaying must not echo the departed cast's ctt or params.
-            playlist.tokens.clear();
-            *play_started = false;
+            forget_queue(playlist, play_started, dial_state);
             end_preroll(&mut playlist.preroll, "remote disconnected");
             mpd.stop().await?;
             mpd.clear().await?;
-            playlist.video_ids.clear();
-            playlist.current_index = 0;
-            playlist.list_id.clear();
-            playlist.current_title.clear();
-            playlist.current_duration = 0;
         }
     }
 
@@ -866,22 +890,84 @@ async fn handle_command(
 /// What to do when MPD stops while a track was playing.
 #[derive(Debug, PartialEq)]
 enum StopAction {
-    /// The receiver could not serve the stream. Not an end of track: the
-    /// app would skip ahead, so stay on this track and report the failure.
+    /// The receiver could not serve the stream, and there is no next track
+    /// or `MAX_FAILED_IN_ROW` tracks failed in a row: stay on this track and
+    /// report the failure.
     StreamFailed(String),
+    /// The receiver could not serve the stream; play this index next.
+    SkipFailed { next: usize, reason: String },
     /// The track ended; play this playlist index next.
     Advance(usize),
     /// The last track ended.
     Finished,
 }
 
-fn stop_action(stream_failure: Option<String>, playlist: &PlaylistState) -> StopAction {
+/// Failed tracks in a row after which the queue stops: with no sender to
+/// step in, a dead queue (expired ctt chain, network down) must not be
+/// skipped through song by song.
+const MAX_FAILED_IN_ROW: u32 = 3;
+
+/// Also counts `playlist.failed_in_row`: a failure adds one, a song that
+/// played resets it.
+fn stop_action(stream_failure: Option<String>, playlist: &mut PlaylistState) -> StopAction {
+    let next = playlist.current_index + 1;
+    let has_next = next < playlist.video_ids.len();
     match stream_failure {
-        Some(reason) => StopAction::StreamFailed(reason),
-        None if playlist.current_index + 1 < playlist.video_ids.len() => {
-            StopAction::Advance(playlist.current_index + 1)
+        Some(reason) => {
+            playlist.failed_in_row += 1;
+            if has_next && playlist.failed_in_row < MAX_FAILED_IN_ROW {
+                StopAction::SkipFailed { next, reason }
+            } else {
+                StopAction::StreamFailed(reason)
+            }
         }
-        None => StopAction::Finished,
+        None => {
+            playlist.failed_in_row = 0;
+            if has_next {
+                StopAction::Advance(next)
+            } else {
+                StopAction::Finished
+            }
+        }
+    }
+}
+
+/// Whether the queue plays on when the last sender leaves: only a song
+/// that started (also paused), not the pre-roll or a stopped queue.
+fn plays_on_without_sender(play_started: bool, playlist: &PlaylistState) -> bool {
+    play_started && !playlist.video_ids.is_empty() && !playlist.preroll.is_active()
+}
+
+/// Forget the queue and every song's ctt and params (and the pins that
+/// hold them). The caller stops MPD.
+fn forget_queue(playlist: &mut PlaylistState, play_started: &mut bool, dial_state: &dial::DialState) {
+    *play_started = false;
+    set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
+    playlist.tokens.clear();
+    playlist.video_ids.clear();
+    playlist.current_index = 0;
+    playlist.list_id.clear();
+    playlist.current_title.clear();
+    playlist.current_duration = 0;
+}
+
+/// A cast that played on without a sender stopped (queue end, failed
+/// tracks): nobody can resume it, so forget it as a phone's Stop would.
+async fn end_unattended_cast(
+    mpd: &mut mpd::MpdClient,
+    playlist: &mut PlaylistState,
+    play_started: &mut bool,
+    sender_ids: &mut Vec<String>,
+    dial_state: &dial::DialState,
+) {
+    tracing::info!("[player] No sender connected: cast ended, queue and ctt forgotten");
+    forget_queue(playlist, play_started, dial_state);
+    sender_ids.clear();
+    if let Err(e) = mpd.stop().await {
+        tracing::warn!("[player] mpd stop failed: {e}");
+    }
+    if let Err(e) = mpd.clear().await {
+        tracing::warn!("[player] mpd clear failed: {e}");
     }
 }
 
@@ -1014,20 +1100,40 @@ fn update_sender_ids(sender_ids: &mut Vec<String>, active: &str, theme: &str, de
     }
 }
 
-/// A sender connected on `theme`: keep its ids for /next, forget the earlier
-/// cast's tokens if the theme changed, and make `theme` the active one.
+/// A sender connected on `theme` (`had_remote`: one was connected before):
+/// keep its ids for /next, forget the earlier cast's tokens if it is another
+/// cast, and make `theme` the active one.
 fn remote_connected(
     sender_ids: &mut Vec<String>,
     playlist: &mut PlaylistState,
     dial_state: &dial::DialState,
     active_theme: &std::sync::RwLock<String>,
+    had_remote: bool,
     theme: &str,
     device_ids: &[String],
 ) {
     let active = active_theme.read().unwrap().clone();
+    forget_tokens_on_new_sender(playlist, dial_state, had_remote, sender_ids, device_ids);
     update_sender_ids(sender_ids, &active, theme, device_ids);
     forget_tokens_on_theme_change(playlist, dial_state, &active, theme);
     *active_theme.write().unwrap() = theme.to_owned();
+}
+
+/// A queue may play on after its last sender left. A sender connecting then
+/// that is none of the departed ones (or gives no id) may be someone else:
+/// the departed cast's tokens must not reach it in nowPlaying. The queue
+/// plays on without them until its setPlaylist.
+fn forget_tokens_on_new_sender(
+    playlist: &mut PlaylistState,
+    dial_state: &dial::DialState,
+    had_remote: bool,
+    departed: &[String],
+    device_ids: &[String],
+) {
+    if !had_remote && !device_ids.iter().any(|id| departed.contains(id)) {
+        playlist.tokens.clear();
+        set_cast_ctt(dial_state, None, sabr::stream::clear_pins);
+    }
 }
 
 /// A sender on the other Lounge theme is another cast: the earlier cast's
@@ -1275,9 +1381,24 @@ fn adopt_cast_auth(
         tracing::info!("[player] ctt received from cast session");
     }
     let ctt = auth.ctt.clone();
+    playlist.failed_in_row = 0;
     playlist.tokens.clear();
     playlist.tokens.remember(video_id, auth);
     set_cast_ctt(dial_state, video_ctt(video_id, ctt), sabr::stream::clear_pins);
+}
+
+/// Stopped (0) at the full duration: the song ended. Only onStateChange,
+/// no nowPlaying, as the reference does when the previous state was playing.
+fn song_ended_message(playlist: &PlaylistState) -> messages::OutgoingMessage {
+    let duration = messages::fmt_time(playlist.current_duration as f64);
+    messages::OutgoingMessage::new("onStateChange")
+        .with_arg("state", "0")
+        .with_arg("currentTime", &duration)
+        .with_arg("duration", &duration)
+        .with_arg("loadedTime", &duration)
+        .with_arg("seekableStartTime", "0")
+        .with_arg("seekableEndTime", &duration)
+        .with_arg("cpn", &playlist.cpn)
 }
 
 /// Unstarted (-1) at position 0: unlike Stopped (0) at the full duration,
@@ -1706,16 +1827,63 @@ mod stop_tests {
 
     #[test]
     fn natural_end_advances_or_finishes() {
-        assert_eq!(stop_action(None, &playlist(3, 0)), StopAction::Advance(1));
-        assert_eq!(stop_action(None, &playlist(3, 2)), StopAction::Finished);
+        assert_eq!(stop_action(None, &mut playlist(3, 0)), StopAction::Advance(1));
+        assert_eq!(stop_action(None, &mut playlist(3, 2)), StopAction::Finished);
     }
 
     #[test]
-    fn stream_failure_never_advances() {
+    fn a_failed_track_is_skipped() {
+        let mut pl = playlist(3, 0);
         assert_eq!(
-            stop_action(Some("nsig decode failed".into()), &playlist(3, 0)),
-            StopAction::StreamFailed("nsig decode failed".into())
+            stop_action(Some("nsig decode failed".into()), &mut pl),
+            StopAction::SkipFailed { next: 1, reason: "nsig decode failed".into() }
         );
+    }
+
+    #[test]
+    fn a_failed_last_track_does_not_advance() {
+        assert_eq!(
+            stop_action(Some("UNPLAYABLE".into()), &mut playlist(3, 2)),
+            StopAction::StreamFailed("UNPLAYABLE".into())
+        );
+    }
+
+    #[test]
+    fn three_failed_tracks_in_a_row_stop_the_queue() {
+        let mut pl = playlist(6, 0);
+        for expected_next in [1, 2] {
+            match stop_action(Some("UNPLAYABLE".into()), &mut pl) {
+                StopAction::SkipFailed { next, .. } => assert_eq!(next, expected_next),
+                other => panic!("expected a skip, got {other:?}"),
+            }
+            pl.current_index = expected_next;
+        }
+        assert_eq!(stop_action(Some("UNPLAYABLE".into()), &mut pl), StopAction::StreamFailed("UNPLAYABLE".into()));
+        assert_eq!(pl.failed_in_row, MAX_FAILED_IN_ROW);
+    }
+
+    #[test]
+    fn a_played_track_resets_the_failure_count() {
+        let mut pl = playlist(6, 0);
+        assert!(matches!(stop_action(Some("x".into()), &mut pl), StopAction::SkipFailed { next: 1, .. }));
+        pl.current_index = 1;
+        assert!(matches!(stop_action(Some("x".into()), &mut pl), StopAction::SkipFailed { next: 2, .. }));
+        pl.current_index = 2;
+        assert_eq!(stop_action(None, &mut pl), StopAction::Advance(3));
+        assert_eq!(pl.failed_in_row, 0);
+        pl.current_index = 3;
+        assert!(matches!(stop_action(Some("x".into()), &mut pl), StopAction::SkipFailed { next: 4, .. }));
+    }
+
+    #[test]
+    fn a_song_end_is_reported_as_stopped_at_its_duration() {
+        let msg = song_ended_message(&playlist(3, 0));
+        let arg = |k: &str| msg.args.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let duration = messages::fmt_time(200.0);
+        assert_eq!(msg.command, "onStateChange");
+        assert_eq!(arg("state"), Some("0"));
+        assert_eq!(arg("currentTime"), Some(duration.as_str()));
+        assert_eq!(arg("loadedTime"), Some(duration.as_str()));
     }
 
     #[test]
@@ -1992,7 +2160,165 @@ mod preroll_wiring_tests {
     use sabr::stream::test_support::{global_has_pin, global_pins_lock, pin_global};
 
     #[tokio::test]
-    async fn remote_disconnect_forgets_the_cast_ctt_params_and_pins() {
+    async fn remote_disconnect_keeps_a_playing_queue_and_its_ctt_chain() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = {
+            let _lock = global_pins_lock();
+            let queue = cast_queue(&dial_state);
+            pin_global("aaaaaaaaaaa", "ctt-a", "u", 10);
+            queue
+        };
+        let mut play_started = true;
+        assert!(plays_on_without_sender(play_started, &playlist));
+
+        // No MPD command at all: the song plays on.
+        let (seen, sent) = command_on(
+            &dial_state,
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into() },
+            &mut playlist,
+            &mut play_started,
+            vec![],
+        )
+        .await;
+        assert!(seen.is_empty(), "MPD untouched: {seen:?}");
+        assert!(sent.is_empty());
+        assert!(play_started, "the song end still auto-advances");
+        assert_eq!(playlist.video_ids.len(), 3);
+        assert_eq!(playlist.list_id, "RDAMVMaaaaaaaaaaa");
+        assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").as_deref(), Some("ctt-a"));
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
+
+        // The /next chain carries on as with a sender connected.
+        let _lock = global_pins_lock();
+        assert!(global_has_pin("aaaaaaaaaaa"), "the playing song keeps its pins");
+        assert!(prefetch_job(&mut playlist, play_started).is_some());
+        store_next_ctt(&mut playlist);
+        assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1));
+        adopt_index(&mut playlist, &dial_state, 1, "Advancing");
+        assert_eq!(dial_state.ctt_for("bbbbbbbbbbb").as_deref(), Some("ctt-b"));
+    }
+
+    #[test]
+    fn only_a_playing_song_plays_on_without_a_sender() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let _lock = global_pins_lock();
+        let queue = cast_queue(&dial_state);
+        assert!(plays_on_without_sender(true, &queue));
+        assert!(!plays_on_without_sender(false, &queue), "nothing started (or a failed stream)");
+        assert!(!plays_on_without_sender(true, &PlaylistState::default()), "no queue");
+        assert!(!plays_on_without_sender(true, &PlaylistState { preroll: preroll::PreRoll::running(), ..cast_queue(&dial_state) }));
+    }
+
+    #[test]
+    fn the_same_sender_reconnecting_takes_over_the_playing_cast() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        let active = std::sync::RwLock::new("m".to_owned());
+        // The iPad left; its id is still known.
+        let mut sender_ids = vec!["ipad-1".to_owned()];
+
+        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, false, "m", &["ipad-1".to_owned()]);
+
+        assert_eq!(sender_ids, vec!["ipad-1".to_owned()]);
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
+        assert_eq!(dial_state.ctt_for("aaaaaaaaaaa").as_deref(), Some("ctt-a"));
+    }
+
+    #[tokio::test]
+    async fn a_new_sender_after_the_last_left_gets_none_of_the_departed_casts_tokens() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 1.0\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        for newcomer in [vec!["phone-2".to_owned()], vec![]] {
+            let mut playlist = {
+                let _lock = global_pins_lock();
+                let mut playlist = cast_queue(&dial_state);
+                store_next_ctt(&mut playlist);
+                let answer = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b2"));
+                let mut sender_ids = vec!["ipad-1".to_owned()];
+                remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, false, "m", &newcomer);
+                assert_eq!(*dial_state.ctt.read().unwrap(), None, "{newcomer:?}");
+                assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
+                assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale, "{newcomer:?}");
+                assert_eq!(playlist.video_ids.len(), 3, "the queue plays on");
+                playlist
+            };
+            let script = vec![("status", STATUS), ("status", STATUS)];
+            let (_, sent) = command_on(&dial_state, lounge::PlayerCommand::GetNowPlaying, &mut playlist, &mut true, script).await;
+            let np = sent.into_iter().find(|m| m.command == "nowPlaying").expect("nowPlaying sent");
+            assert_eq!(arg(&np, "videoId"), Some("aaaaaaaaaaa"));
+            assert_eq!((arg(&np, "ctt"), arg(&np, "params")), (None, None), "{newcomer:?}");
+        }
+    }
+
+    #[test]
+    fn a_sender_joining_a_connected_one_keeps_the_cast() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        let active = std::sync::RwLock::new("m".to_owned());
+        let mut sender_ids = vec!["phone-1".to_owned()];
+        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, true, "m", &["phone-2".to_owned()]);
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
+    }
+
+    #[tokio::test]
+    async fn a_cast_without_a_sender_is_forgotten_when_it_ends() {
+        let _lock = global_pins_lock();
+        let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        store_next_ctt(&mut playlist);
+        pin_global("aaaaaaaaaaa", "ctt-a", "u", 10);
+        let answer = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b2"));
+        let mut sender_ids = vec!["ipad-1".to_owned()];
+        let mut play_started = true;
+
+        end_unattended_cast(&mut mpd, &mut playlist, &mut play_started, &mut sender_ids, &dial_state).await;
+        drop(mpd);
+
+        assert_eq!(server.await.unwrap(), ["stop", "clear"]);
+        assert!(!play_started);
+        assert!(sender_ids.is_empty());
+        assert!(playlist.video_ids.is_empty());
+        assert!(playlist.list_id.is_empty());
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+        assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
+        assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), cast_tokens::VideoAuth::default());
+        assert!(!global_has_pin("aaaaaaaaaaa"));
+        assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Stale);
+    }
+
+    #[test]
+    fn an_unplayable_queue_entry_after_a_next_mismatch_is_skipped() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        // /next proposes another video than the queue's next: not used.
+        let answer = next_answer(&playlist, "zzzzzzzzzzz", Some("ctt-z"));
+        assert_eq!(apply_prefetch(&mut playlist, answer), PrefetchVerdict::Mismatch);
+        assert_eq!(stop_action(None, &mut playlist), StopAction::Advance(1));
+        assert_eq!(adopt_index(&mut playlist, &dial_state, 1, "Advancing"), "bbbbbbbbbbb");
+        assert_eq!(*dial_state.ctt.read().unwrap(), None);
+
+        // The queue's next, played without a ctt, is unplayable: skip on in the queue.
+        let action = stop_action(Some("UNPLAYABLE (This video is not available)".into()), &mut playlist);
+        assert!(matches!(action, StopAction::SkipFailed { next: 2, .. }), "{action:?}");
+        assert_eq!(adopt_index(&mut playlist, &dial_state, 2, "Skipping"), "ccccccccccc");
+        assert_eq!(playlist.tokens.auth_for("zzzzzzzzzzz"), cast_tokens::VideoAuth::default());
+    }
+
+    #[tokio::test]
+    async fn remote_disconnect_with_nothing_playing_forgets_the_cast_ctt_params_and_pins() {
         let _lock = global_pins_lock();
         let (port, server) = fake_mpd(vec![("stop", "OK\n"), ("clear", "OK\n")]).await;
         let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
@@ -2230,11 +2556,11 @@ mod preroll_wiring_tests {
         let active = std::sync::RwLock::new("m".to_owned());
         let mut sender_ids = Vec::new();
 
-        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, "m", &["phone-1".to_owned()]);
+        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, true, "m", &["phone-1".to_owned()]);
         assert_eq!(sender_ids, vec!["phone-1".to_owned()]);
         assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
 
-        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, "cl", &["phone-2".to_owned()]);
+        remote_connected(&mut sender_ids, &mut playlist, &dial_state, &active, true, "cl", &["phone-2".to_owned()]);
         assert_eq!(sender_ids, vec!["phone-2".to_owned()]);
         assert_eq!(*active.read().unwrap(), "cl");
         assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
