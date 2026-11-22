@@ -626,8 +626,10 @@ async fn on_command<R, Fut>(
     }
     // The user took the cast back to the phone: end it as Stop would.
     let taken_back = match &cmd {
-        PlayerCommand::StoppedByUser { theme, device_id, nobody_left } if *active_theme.read().unwrap() == *theme => {
-            ended_this_cast(senders, device_id.as_deref(), *nobody_left)
+        PlayerCommand::StoppedByUser { theme, device_id, leaving_ids, nobody_left }
+            if *active_theme.read().unwrap() == *theme =>
+        {
+            ended_this_cast(senders, device_id.as_deref(), leaving_ids, *nobody_left)
         }
         _ => false,
     };
@@ -691,6 +693,9 @@ async fn on_command<R, Fut>(
         return;
     }
     let ends_cast = matches!(cmd, PlayerCommand::Stop);
+    if matches!(cmd, PlayerCommand::SetPlaylist { .. } | PlayerCommand::SetVideo { .. }) && !replayed_by_bind(&cmd) {
+        senders.record_casters();
+    }
     if let PlayerCommand::SetPlaylist { video_ids, list_id, .. } = &cmd {
         health.cast_started(video_ids.len(), !list_id.is_empty());
     }
@@ -1397,14 +1402,16 @@ fn list_kind(list_id: &str) -> &str {
 }
 
 /// Whether a user's end (StoppedByUser) ends this cast: nobody is listed
-/// any more, or the leaving device took part in the cast. A co-listener
-/// ending its own session leaves the cast to the others.
-fn ended_this_cast(senders: &senders::Senders, device_id: Option<&str>, nobody_left: bool) -> bool {
-    let took_part = device_id.is_some_and(|id| senders.took_part(&[id.to_owned()]));
-    if !nobody_left && !took_part {
-        tracing::info!("[player] A sender ended its own session (disconnected by the user); the cast goes on");
+/// any more, or a device that cast it ended (the details' deviceId or a
+/// sender leaving in the same batch: either may be the one, and the
+/// details' id may not be in the form the Lounge uses elsewhere). A
+/// co-listener ending its own session leaves the cast to the others.
+fn ended_this_cast(senders: &senders::Senders, device_id: Option<&str>, leaving_ids: &[String], nobody_left: bool) -> bool {
+    let by_a_caster = device_id.into_iter().chain(leaving_ids.iter().map(String::as_str)).any(|id| senders.is_caster(id));
+    if !nobody_left && !by_a_caster {
+        tracing::info!("[player] A sender that did not cast ended its own session (disconnected by the user); the cast goes on");
     }
-    nobody_left || took_part
+    nobody_left || by_a_caster
 }
 
 /// A sender's command that decides what plays (a pick, a step, play/pause,
@@ -4103,6 +4110,7 @@ mod preroll_wiring_tests {
             let mut playlist = queue_at(&dial_state, 1);
             let mut play_started = true;
             let mut senders = connected(connected_before);
+            senders.record_casters();
             // As the Lounge layer sends them for the live batch
             // [loungeStatus(iPad no longer listed, DISCONNECTED_BY_USER), remoteDisconnected(iPad)].
             let still_listed = strings(still);
@@ -4110,6 +4118,7 @@ mod preroll_wiring_tests {
                 lounge::PlayerCommand::StoppedByUser {
                     theme: "m".into(),
                     device_id: Some("ipad".into()),
+                    leaving_ids: strings(&["ipad"]),
                     nobody_left: still.is_empty(),
                 },
                 lounge::PlayerCommand::SendersListed { theme: "m".into(), device_ids: still_listed, unidentified: 0 },
@@ -4130,38 +4139,77 @@ mod preroll_wiring_tests {
         }
     }
 
+    /// The user ended a cast on the receiver: the details name `device`,
+    /// `leaving` left in the batch, `nobody_left` as the status lists.
+    fn ended_by(device: Option<&str>, leaving: &[&str], nobody_left: bool) -> lounge::PlayerCommand {
+        lounge::PlayerCommand::StoppedByUser {
+            theme: "m".into(),
+            device_id: device.map(str::to_owned),
+            leaving_ids: strings(leaving),
+            nobody_left,
+        }
+    }
+
+    /// The phone cast; the iPad joined later (it took part, but did not cast).
+    fn phone_cast_ipad_joined() -> senders::Senders {
+        let mut senders = connected(&["phone"]);
+        senders.record_casters();
+        senders.connect(&strings(&["ipad"]), None);
+        senders
+    }
+
     #[tokio::test]
-    async fn a_co_listener_ending_its_cast_does_not_stop_the_cast() {
+    async fn only_the_end_of_a_device_that_cast_stops_the_cast() {
         const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
-        // The phone casts; the iPad, never part of this cast, ends its own
-        // session by the user while the phone stays listed.
-        let ended = |nobody_left| lounge::PlayerCommand::StoppedByUser {
-            theme: "m".into(),
-            device_id: Some("ipad".into()),
-            nobody_left,
-        };
-        let mut playlist = queue_at(&dial_state, 1);
-        let mut play_started = true;
+        let stop = || vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
+        let cases: [(&str, lounge::PlayerCommand, bool); 7] = [
+            ("the iPad (no caster) ends, the phone listed", ended_by(Some("ipad"), &["ipad"], false), false),
+            ("the phone (caster) ends, the iPad listed", ended_by(Some("phone"), &["phone"], false), true),
+            ("nobody listed any more", ended_by(Some("ipad"), &["ipad"], true), true),
+            ("the details' id unknown, the caster leaves", ended_by(Some("unknown-id"), &["phone"], false), true),
+            ("the details name the iPad, the caster leaves", ended_by(Some("ipad"), &["phone"], false), true),
+            ("the details name the caster, the iPad leaves", ended_by(Some("phone"), &["ipad"], false), true),
+            ("no device to check, others listed", ended_by(None, &[], false), false),
+        ];
+        for (case, cmd, stops) in cases {
+            let mut playlist = queue_at(&dial_state, 1);
+            let mut play_started = true;
+            let mut senders = phone_cast_ipad_joined();
+            let script = if stops { stop() } else { vec![] };
+            let (seen, _) = on_command_with(&dial_state, cmd, &mut playlist, &mut play_started, &mut senders, script).await;
+            if stops {
+                assert_eq!(seen, ["stop", "clear", "status"], "{case}");
+                assert!(playlist.video_ids.is_empty(), "{case}");
+            } else {
+                assert!(seen.is_empty(), "{case}: {seen:?}");
+                assert!(play_started, "{case}");
+                assert_eq!(playlist.video_ids.len(), 3, "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_cast_records_who_cast_it() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
         let mut senders = connected(&["phone"]);
-        let (seen, _) = on_command_with(&dial_state, ended(false), &mut playlist, &mut play_started, &mut senders, vec![]).await;
-        assert!(seen.is_empty(), "{seen:?}");
-        assert!(play_started);
-        assert_eq!(playlist.video_ids.len(), 3);
-
-        // Nobody listed any more: it stops whoever it was.
-        let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
-        let (seen, _) =
-            on_command_with(&dial_state, ended(true), &mut playlist, &mut play_started, &mut senders, script).await;
-        assert_eq!(seen, ["stop", "clear", "status"]);
-        assert!(playlist.video_ids.is_empty());
-
-        // Without a device to check and others listed: nothing stops.
-        let mut playlist = queue_at(&dial_state, 1);
-        let unknown = lounge::PlayerCommand::StoppedByUser { theme: "m".into(), device_id: None, nobody_left: false };
-        let (seen, _) = on_command_with(&dial_state, unknown, &mut playlist, &mut true, &mut senders, vec![]).await;
-        assert!(seen.is_empty(), "{seen:?}");
+        on_command_resolving(
+            &active, &dial_state, set_playlist_d("ctt-new"), &mut PlaylistState::default(), &mut false, &mut senders,
+            no_stream, vec![("status", STATUS_STOP), ("status", STATUS_STOP)],
+        )
+        .await;
+        assert!(senders.is_caster("phone"));
+        // A cast replayed by a bind casts nothing anew.
+        let mut senders = connected(&["phone"]);
+        on_command_resolving(
+            &active, &dial_state, bind_delivered(set_video_d("ctt-old")), &mut PlaylistState::default(), &mut false,
+            &mut senders, no_stream, vec![("status", STATUS_STOP), ("status", STATUS_STOP)],
+        )
+        .await;
+        assert!(!senders.is_caster("phone"));
     }
 
     #[tokio::test]
@@ -4172,7 +4220,7 @@ mod preroll_wiring_tests {
         let mut play_started = true;
         let mut senders = connected(&["phone"]);
         let cmd =
-            lounge::PlayerCommand::StoppedByUser { theme: "cl".into(), device_id: Some("phone".into()), nobody_left: true };
+            lounge::PlayerCommand::StoppedByUser { theme: "cl".into(), device_id: Some("phone".into()), leaving_ids: vec![], nobody_left: true };
         let (seen, _) = on_command_with(&dial_state, cmd, &mut playlist, &mut play_started, &mut senders, vec![]).await;
         assert!(seen.is_empty(), "{seen:?}");
         assert!(play_started);

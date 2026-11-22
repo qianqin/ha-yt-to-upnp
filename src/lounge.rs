@@ -121,7 +121,8 @@ pub enum PlayerCommand {
     /// A loungeStatus says the user ended a cast here (took it back to the
     /// phone): sent before the other commands of its batch. `device_id`: the
     /// leaving device, if known; `nobody_left`: the status lists no sender.
-    StoppedByUser { theme: String, device_id: Option<String>, nobody_left: bool },
+    /// `leaving_ids`: the batch's leaving senders (remoteDisconnected).
+    StoppedByUser { theme: String, device_id: Option<String>, leaving_ids: Vec<String>, nobody_left: bool },
     /// A loungeStatus: the senders connected now, `device_ids` for those with
     /// a readable id and `unidentified` for the others. Replaces the known ones.
     SendersListed { theme: String, device_ids: Vec<String>, unidentified: usize },
@@ -629,8 +630,11 @@ fn dispatch_messages(
     }
     // The user ended the cast here: before the batch's lists and leaves, so
     // no list of nobody lets the queue play on first.
-    if let Some((device_id, nobody_left)) = (!from_bind).then(|| ended_by_user(&session.theme, messages)).flatten() {
-        send_cmd(player_tx, PlayerCommand::StoppedByUser { theme: session.theme.clone(), device_id, nobody_left });
+    if let Some((device_id, leaving_ids, nobody_left)) =
+        (!from_bind).then(|| ended_by_user(&session.theme, messages)).flatten()
+    {
+        let theme = session.theme.clone();
+        send_cmd(player_tx, PlayerCommand::StoppedByUser { theme, device_id, leaving_ids, nobody_left });
     }
     // A sender counted since then in this response: a later list of nobody
     // must forget it again.
@@ -821,10 +825,10 @@ fn leave_details(args: &HashMap<String, String>) -> Option<LeaveDetails> {
 /// receiver: its details say DISCONNECTED_BY_USER and the device they name
 /// is not one still listed (another device's leave). With nobody listed any
 /// more, or no list, no deviceId is needed; with senders still listed and no
-/// deviceId, who left is unknown and nothing stops. Then: the leaving device
-/// (the details' deviceId, else the leaving sender's id) and whether nobody
-/// is listed any more; the player checks that device took part in its cast.
-fn ended_by_user(theme: &str, messages: &[IncomingMessage]) -> Option<(Option<String>, bool)> {
+/// deviceId, who left is unknown and nothing stops. Then: the details'
+/// deviceId, the batch's leaving senders and whether nobody is listed any
+/// more (no list counts as nobody); the player checks who cast.
+fn ended_by_user(theme: &str, messages: &[IncomingMessage]) -> Option<(Option<String>, Vec<String>, bool)> {
     let leaving_ids: Vec<String> = messages
         .iter()
         .filter(|msg| msg.command == "remoteDisconnected")
@@ -840,15 +844,13 @@ fn ended_by_user(theme: &str, messages: &[IncomingMessage]) -> Option<(Option<St
         };
         tracing::debug!("[lounge:{theme}] disconnected by the user; deviceId matches the leaving sender: {matched}");
         let still_listed = msg.args.get("devices").map(|d| remote_senders(d));
-        let nobody_left = still_listed.as_ref().is_some_and(|(ids, unidentified)| ids.is_empty() && *unidentified == 0);
+        let nobody_left = still_listed.as_ref().is_none_or(|(ids, unidentified)| ids.is_empty() && *unidentified == 0);
         let ended = match (&still_listed, &details.device_id) {
-            (None, _) => true,
             _ if nobody_left => true,
             (Some((ids, _)), Some(id)) => !ids.contains(id),
-            (Some(_), None) => false,
+            _ => false,
         };
-        let leaving = details.device_id.or_else(|| leaving_ids.first().cloned());
-        ended.then_some((leaving, nobody_left))
+        ended.then(|| (details.device_id, leaving_ids.clone(), nobody_left))
     })
 }
 
@@ -1686,22 +1688,48 @@ mod tests {
     }
 
     /// The device and "nobody left" the dispatch of `messages` reports the user's end with.
-    fn stopped_by(messages: &[IncomingMessage]) -> Option<(Option<String>, bool)> {
+    /// What the dispatch of `messages` reports the user's end with: the
+    /// details' device, the batch's leaving senders, whether nobody is left.
+    fn stopped_by(messages: &[IncomingMessage]) -> Option<(Option<String>, Vec<String>, bool)> {
         commands_for(messages, Delivery::Poll).into_iter().find_map(|cmd| match cmd {
-            PlayerCommand::StoppedByUser { device_id, nobody_left, .. } => Some((device_id, nobody_left)),
+            PlayerCommand::StoppedByUser { device_id, leaving_ids, nobody_left, .. } => {
+                Some((device_id, leaving_ids, nobody_left))
+            }
             _ => None,
         })
     }
 
     #[test]
-    fn the_users_end_names_the_leaving_device_for_the_player_to_check() {
-        let ipad = Some(IPAD.to_owned());
-        assert_eq!(stopped_by(&[status_with(&[], &by_user_for(IPAD)), ipad_leaves()]), Some((ipad.clone(), true)));
-        assert_eq!(stopped_by(&[status_with(&[PHONE], &by_user_for(IPAD)), ipad_leaves()]), Some((ipad.clone(), false)));
-        // Without a deviceId in the details: the leaving sender's id.
+    fn the_users_end_names_the_devices_for_the_player_to_check() {
+        let ipad = || Some(IPAD.to_owned());
+        let leaving = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            stopped_by(&[status_with(&[], &by_user_for(IPAD)), ipad_leaves()]),
+            Some((ipad(), leaving(&[IPAD]), true))
+        );
+        assert_eq!(
+            stopped_by(&[status_with(&[PHONE], &by_user_for(IPAD)), ipad_leaves()]),
+            Some((ipad(), leaving(&[IPAD]), false))
+        );
+        // The details name the iPad while the phone leaves: both are reported.
+        let phone_leaves = incoming("remoteDisconnected", &[("id", PHONE), ("name", "Phone")]);
+        assert_eq!(
+            stopped_by(&[status_with(&[], &by_user_for(IPAD)), phone_leaves]),
+            Some((ipad(), leaving(&[PHONE]), true))
+        );
+        // Without a deviceId in the details: the leaving senders only.
         let details = format!(r#"{{"disconnectBehavior":"{BY_USER}"}}"#);
-        assert_eq!(stopped_by(&[ipad_leaves(), status_with(&[], &details)]), Some((ipad, true)));
-        assert_eq!(stopped_by(&[status_with(&[], &details)]), Some((None, true)));
+        assert_eq!(stopped_by(&[ipad_leaves(), status_with(&[], &details)]), Some((None, leaving(&[IPAD]), true)));
+        assert_eq!(stopped_by(&[status_with(&[], &details)]), Some((None, vec![], true)));
+        // Only a sender without a readable id still listed: someone is left.
+        let unidentified = incoming(
+            "loungeStatus",
+            &[("devices", r#"[{"type":"REMOTE_CONTROL"}]"#), ("connectionEventDetails", &by_user_for(IPAD))],
+        );
+        assert_eq!(stopped_by(&[unidentified, ipad_leaves()]), Some((ipad(), leaving(&[IPAD]), false)));
+        // A status without a device list counts as listing nobody.
+        let unlisted = incoming("loungeStatus", &[("connectionEventDetails", &by_user_for(IPAD))]);
+        assert_eq!(stopped_by(&[unlisted]), Some((ipad(), vec![], true)));
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub struct Senders {
     /// The receiver's rebind listed nobody (`forget_connected`), and no
     /// sender event has come since: a phone may still be connected.
     unlisted: bool,
+    /// The device ids connected when the running cast's setPlaylist or
+    /// setVideo was accepted: who cast it (the Lounge does not say which
+    /// sender sent a cast, so all connected then count). A later cast
+    /// replaces them.
+    casters: Vec<String>,
 }
 
 impl Senders {
@@ -105,6 +110,7 @@ impl Senders {
     /// an unlisted sender is no longer awaited.
     pub fn end_cast(&mut self) {
         self.unlisted = false;
+        self.casters.clear();
         let connected = &self.connected;
         self.cast_ids.retain(|id| {
             connected.contains(&Sender::Id(id.clone()))
@@ -116,6 +122,24 @@ impl Senders {
         self.connected.clear();
         self.cast_ids.clear();
         self.unlisted = false;
+        self.casters.clear();
+    }
+
+    /// A cast was accepted: the senders connected now cast it.
+    pub fn record_casters(&mut self) {
+        self.casters = self
+            .connected
+            .iter()
+            .filter_map(|sender| match sender {
+                Sender::Id(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    /// Whether `id` cast the running cast (see `record_casters`).
+    pub fn is_caster(&self, id: &str) -> bool {
+        self.casters.iter().any(|caster| caster == id)
     }
 
     /// The receiver's own rebind listed nobody: a sender whose leave was
@@ -330,6 +354,34 @@ mod tests {
             event(&mut senders);
             assert!(!senders.unlisted_since_rebind());
         }
+    }
+
+    #[test]
+    fn the_senders_connected_when_a_cast_starts_are_its_casters() {
+        let mut senders = Senders::default();
+        senders.connect(&ids(&["phone"]), None);
+        senders.record_casters();
+        senders.connect(&ids(&["ipad"]), None);
+        assert!(senders.is_caster("phone"));
+        assert!(!senders.is_caster("ipad"), "joined later: a co-listener");
+        assert!(senders.took_part(&ids(&["ipad"])), "though it took part");
+        // A later cast (the iPad's setPlaylist, say): those connected then.
+        senders.record_casters();
+        assert!(senders.is_caster("ipad") && senders.is_caster("phone"));
+        senders.disconnect(Some("ipad"), None);
+        assert!(senders.is_caster("ipad"), "a caster that left stays one");
+    }
+
+    #[test]
+    fn the_casters_go_with_the_cast() {
+        let mut senders = Senders::default();
+        senders.connect(&ids(&["phone"]), None);
+        senders.record_casters();
+        senders.end_cast();
+        assert!(!senders.is_caster("phone"));
+        senders.record_casters();
+        senders.clear();
+        assert!(!senders.is_caster("phone"));
     }
 
     #[test]
