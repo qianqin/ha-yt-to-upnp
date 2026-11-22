@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.4
+
+- Receiver identity renews itself: YouTube can come to answer the
+  receiver's `/next` with autoplay suggestions only, so songs 2+ got no ctt
+  and were throttled after about 60 s (the song looping around 1:00 on the
+  phone). After 3 list casts in a row (playlist, album, mix) answered that
+  way, the receiver makes a new identity (device id and screen ids) once
+  nothing plays, at most once a day (the cap survives a restart). The
+  speaker then shows up in the cast menu as a new device: the phone must
+  pick it again. New option `identity_generation` forces a new identity
+  once: set it to a number other than the current one (0 at first) and
+  restart; clearing it changes nothing.
+- Taking the cast back to the phone ("play on this device") stops the
+  speaker, as Stop does. Closing the app or the phone sleeping still keeps
+  the queue playing. Only a device that cast (connected when the queue was
+  started or a song was picked) stops the cast this way; a device that only
+  joined later does not. A take-back whose status lists no devices stops.
+- A song YouTube throttles because it has no ctt no longer loops around
+  1:00. Unattended it is skipped (3 failed songs in a row stop playback);
+  with the phone connected, the receiver reports the song as ended and
+  waits 15 s for the phone's pick, then skips it itself.
+- Faster first song after a new YouTube player version: the signature
+  solver for the player is prepared at start in the background, and a
+  song's `/next` is asked for before playback starts, so its answer is no
+  longer dropped when the first song ends early.
+- Logs: a cast's list kind (e.g. `RD`, `PL`, `RQ`; never the list id) and
+  the reason a sender disconnected. The receiver's uuid is no longer
+  logged.
+
 ## 0.4.3
 
 - PoTokens YouTube accepts: the PoToken helper minted tokens YouTube

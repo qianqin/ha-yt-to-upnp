@@ -144,8 +144,9 @@ The receiver presents itself to phones and to YouTube with an identity it
 keeps in `/data/ytcast/ytcast-lite.json`: a device id and one screen id each
 for YouTube and YouTube Music. YouTube can come to treat an identity badly:
 it then answers every request for the next song with an autoplay pick only,
-songs after the first get no token from the phone and stop after about a
-minute. When the first such answer comes for 3 casts in a row (casts of a
+songs after the first get no token and are throttled after about a minute
+(the receiver skips them, or with the phone connected leaves the next pick
+to it). When the first such answer comes for 3 casts in a row (casts of a
 playlist, album or mix; not a queue of single songs), the receiver makes a
 new identity by itself, as soon as nothing plays, at most once a day, and
 logs `[identity]
@@ -189,6 +190,12 @@ Troubleshooting).
 4. Pause and resume on the phone reach the speaker too: a pause is heard at
    once, a resume after about 1 s, where the pause was heard (the app sets
    MPD back by what the speaker had buffered).
+5. Stop on the phone, or taking the cast back to the phone ("play on this
+   device"), stops the speaker. Closing the app or the phone sleeping does
+   not: a started queue plays on and advances by itself, like on a
+   Chromecast. A device that only joined the cast later (it was not
+   connected when the queue was started or a song was picked) leaves the
+   cast playing when it takes the cast back.
 
 Each process is restarted by the app's supervisor if it exits; the log says
 which one and with which exit code.
@@ -216,7 +223,8 @@ which one and with which exit code.
 - **Stream stops after about a minute:** the PoToken helper is not running;
   look for its exit in the log. If it runs, YouTube may be rejecting its
   tokens (the receiver then resumes the song up to 3 times, each time after
-  about a minute): see the next item.
+  about a minute; a song without a cast token is skipped instead): see the
+  next item.
 - **PoToken rejected / time zone:** the helper's tokens reflect the local
   time zone, and YouTube rejects tokens minted with a UTC offset of 0. The
   helper takes Home Assistant's time zone (Settings > System > General >
@@ -227,14 +235,21 @@ which one and with which exit code.
   `Europe/Berlin` is ignored) or it has offset 0 (UTC, or e.g. Europe/London
   in winter): set Home Assistant's time zone and restart the app. Nothing is
   faked: the helper reports the host's real platform and time zone.
-- **Songs after the first stop after about a minute, every time:** YouTube
-  may be treating the receiver's identity badly; see
+- **Songs after the first stop or are skipped after about a minute, every
+  time:** YouTube may be treating the receiver's identity badly; see
   [Receiver identity](#receiver-identity). The receiver renews it by itself
-  after 3 such casts; to do it at once, change `identity_generation`.
+  after 3 such casts, at most once a day; to do it at once, set
+  `identity_generation` to a number other than the current one and restart
+  the app.
 - **App stops right after starting:** an option is missing or invalid; the
   log names it.
 
 ## Known limitations
+
+- **Who may stop a cast by taking it back:** the Lounge API does not say
+  which device sent a cast, so every device connected when a queue is
+  started or a song is picked counts as having cast; taking the cast back
+  on any of them stops the speaker.
 
 - **MPD's control port has no password.** "Loopback only" means the loopback
   of the Home Assistant host (host network): Home Assistant itself and any

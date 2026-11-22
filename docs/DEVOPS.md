@@ -314,7 +314,7 @@ internet through Docker's NAT, and the smoke test needs that: for the image
 build (Debian packages) and for the PoToken check below.
 
 Run 1, with test options (placeholder UDNs, cast name `Smoke Test`, no
-`raumfeld_host`, `stream_format` `flac`), checks that
+`raumfeld_host`, `stream_format` `flac`, `identity_generation` 1), checks that
 MPD answers on `127.0.0.1:6600` (and not on the container's address); while
 MPD plays a generated second of silence (MPD opens its httpd output only when
 it plays) the stream answers on `http://<container>:8000/stream.flac` as
@@ -340,11 +340,12 @@ service runs as its own non-root user, does not get the (dummy)
 `SUPERVISOR_TOKEN` the container is started with and cannot read it from
 `/run/s6/container_environment`; the options arrive as the expected
 environment (auto-detected `stream_host`, `ADAPTER_STATE_DIR=/data/adapter`,
-no `RAUMFELD_HOST`); the adapter logs that it finds no speaker
+no `RAUMFELD_HOST`, `YTCAST_IDENTITY_GENERATION=1` for the receiver); the adapter logs that it finds no speaker
 (`DeviceNotFound`) and keeps running; no service restarts within 20 s. Run 2
 sets `raumfeld_host` to the unreachable `192.0.2.20` without
 `raumfeld_speaker_udn`, an explicit `stream_host`, no optional timings and
-`stream_format` `mp3`, and no `TZ`: the PoToken helper gets an empty `TZ`
+`stream_format` `mp3`, no `identity_generation` and no `TZ`: the receiver
+gets no `YTCAST_IDENTITY_GENERATION`; the PoToken helper gets an empty `TZ`
 and logs a warning about the zero UTC offset; the stream is `/stream.mp3`,
 `audio/mpeg`, its first frame MPEG-1 Layer III at 320 kbit/s, 48 kHz,
 stereo; the adapter gets
@@ -430,7 +431,8 @@ runs the same four processes natively instead, configured as the app is:
 ```sh
 scripts/run-ha-app-local.sh --name "<cast name>" --room-udn <room UDN> \
   --raumfeld-host <speaker IPv4> [--speaker-udn <UDN>] [--stream-format flac|mp3] \
-  [--stream-host <Mac's LAN IPv4>] [--log-level debug] [--max-volume N]
+  [--stream-host <Mac's LAN IPv4>] [--log-level debug] [--max-volume N] \
+  [--identity-generation N]
 scripts/run-ha-app-local.sh --stop
 ```
 

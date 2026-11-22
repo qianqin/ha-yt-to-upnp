@@ -114,11 +114,19 @@ formats (always 251 via SABR).
   then leaves the room alone until you resume or cast again from the phone.
 - **Phone sleeps or the app is closed:** a started queue plays on and
   advances, like on a Chromecast; reopening the app shows the running song.
-  The cast ends at the queue's end, a Stop from the phone or when the
-  speaker is switched off or to another source. Another phone connecting
-  gets none of the previous cast's tokens.
+  The cast ends at the queue's end, a Stop from the phone, the phone taking
+  the cast back ("play on this device") or when the speaker is switched off
+  or to another source. A device that only joined later does not stop the
+  cast by taking it back. Another phone connecting gets none of the
+  previous cast's tokens.
 - **Song not available:** a queue entry that cannot be played is skipped;
-  after 3 failed songs in a row playback stops.
+  after 3 failed songs in a row playback stops. A song YouTube throttles
+  for lack of a ctt is skipped too; with the phone connected it gets 15 s
+  to pick the next song first.
+- **YouTube answers `/next` with autoplay only** for 3 list casts in a
+  row: the receiver makes itself a new identity when idle (at most once a
+  day); pick the speaker again in the cast menu. The option
+  `identity_generation` forces it once.
 - **New cast or resume while the speaker is on line-in:** an explicit cast
   wins and takes the room over.
 - **Idle:** the app never puts the room into standby; the Raumfeld's own
