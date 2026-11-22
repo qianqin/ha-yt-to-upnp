@@ -52,13 +52,17 @@ impl From<serde_json::Error> for ConfigError {
 // Config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub uuid: String,
     pub screen_id: String,
     /// Screen ID for the YouTube Music ("m" theme) Lounge session.
     #[serde(default)]
     pub screen_id_m: String,
+    /// The `identity_generation` option this identity was made for (see
+    /// `identity::apply_identity_generation`).
+    #[serde(default)]
+    pub identity_generation: i64,
 }
 
 impl Config {
@@ -81,6 +85,7 @@ impl Config {
                     uuid: uuid::Uuid::new_v4().to_string(),
                     screen_id: String::new(),
                     screen_id_m: String::new(),
+                    identity_generation: 0,
                 };
                 config.save_to(path)?;
                 tracing::info!("created new config at {}", path.display());
@@ -128,6 +133,14 @@ mod tests {
     }
 
     #[test]
+    fn a_config_from_before_the_identity_generation_reads_as_generation_0() {
+        let tmp = TempDir::new("config-old");
+        let path = Config::path_for(Some(tmp.path())).unwrap();
+        std::fs::write(&path, r#"{"uuid":"u","screen_id":"s","screen_id_m":"m"}"#).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().identity_generation, 0);
+    }
+
+    #[test]
     fn saved_under_data_dir_and_read_back() {
         let tmp = TempDir::new("config-roundtrip");
         let path = Config::path_for(Some(tmp.path())).unwrap();
@@ -137,12 +150,14 @@ mod tests {
             uuid: "u".into(),
             screen_id: "s".into(),
             screen_id_m: "m".into(),
+            identity_generation: 2,
         };
         config.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.uuid, "u");
         assert_eq!(loaded.screen_id, "s");
         assert_eq!(loaded.screen_id_m, "m");
+        assert_eq!(loaded.identity_generation, 2);
         #[cfg(unix)]
         assert_eq!(mode(&path), 0o600);
     }

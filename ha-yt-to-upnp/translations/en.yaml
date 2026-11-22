@@ -39,6 +39,13 @@ configuration:
     description: >-
       The phone's volume moves the speaker's own volume, scaled so that 100 %
       on the phone is this speaker volume (1-100), never more. Default 50.
+  identity_generation:
+    name: Identity generation
+    description: >-
+      Change this number (for example add 1) to give the receiver a new
+      identity at the next start; phones must then pick the speaker again.
+      Only needed if songs after the first keep stopping after about a
+      minute. Default 0.
   stream_format:
     name: Stream format
     description: >-

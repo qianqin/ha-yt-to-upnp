@@ -597,6 +597,8 @@ if "receiver" in pids:
     env = ps[pids["receiver"]][2]
     for key, value in expect.get("receiver_env", {}).items():
         check(env.get(key) == value, "receiver env %s=%r (got %r)" % (key, value, env.get(key)))
+    for key in expect.get("receiver_env_absent", []):
+        check(key not in env, "receiver env has no %s (receiver default)" % key)
 if "potoken" in pids:
     env = ps[pids["potoken"]][2]
     allowed = {"DENO_DIR", "DENO_NO_UPDATE_CHECK", "NO_COLOR", "HOME", "PATH", "TZ"}
@@ -728,12 +730,13 @@ start_app "$main" '{"cast_name": "Smoke Test",
   "raumfeld_room_udn": "uuid:00000000-0000-0000-0000-000000000001",
   "raumfeld_speaker_udn": "uuid:00000000-0000-0000-0000-000000000002",
   "start_gate_seconds": 7, "stuck_seconds": 20, "max_volume": 40, "stream_format": "flac",
-  "log_level": "debug"}'
+  "identity_generation": 1, "log_level": "debug"}'
 expect_main='{"cast_name": "Smoke Test",
   "stream": {"path": "/stream.flac", "mime": "audio/flac",
              "params": {"codec": "flac", "rate": 48000, "channels": 2, "bits": 16}},
   "receiver_env": {"DEVICE_NAME": "Smoke Test", "MPD_HOST": "127.0.0.1", "MPD_PORT": "6600",
-                   "YTCAST_DATA_DIR": "/data/ytcast", "RUST_LOG": "info,ytcast_lite=debug"},
+                   "YTCAST_DATA_DIR": "/data/ytcast", "RUST_LOG": "info,ytcast_lite=debug",
+                   "YTCAST_IDENTITY_GENERATION": "1"},
   "adapter_env": {"RAUMFELD_ROOM_UDN": "uuid:00000000-0000-0000-0000-000000000001",
                   "RAUMFELD_SPEAKER_UDN": "uuid:00000000-0000-0000-0000-000000000002",
                   "STREAM_URL": "http://{ip}:8000/stream.flac", "STREAM_MIME": "audio/flac",
@@ -783,6 +786,7 @@ start_app "$second" '{"cast_name": "Smoke Test 2",
   "raumfeld_host": "192.0.2.20",
   "stream_host": "192.0.2.10", "stream_format": "mp3", "log_level": "warning"}' "" ""
 expect_host='{"receiver_env": {"DEVICE_NAME": "Smoke Test 2", "RUST_LOG": "warn"},
+  "receiver_env_absent": ["YTCAST_IDENTITY_GENERATION"],
   "stream": {"path": "/stream.mp3", "mime": "audio/mpeg",
              "params": {"codec": "mp3", "kbit": 320, "rate": 48000, "channels": 2}},
   "adapter_env": {"RAUMFELD_HOST": "192.0.2.20", "ADAPTER_STATE_DIR": "/data/adapter",

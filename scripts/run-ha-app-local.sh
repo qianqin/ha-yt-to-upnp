@@ -23,7 +23,7 @@ usage() {
 usage: scripts/run-ha-app-local.sh --name NAME --room-udn UDN
            (--speaker-udn UDN | --raumfeld-host HOST [--speaker-udn UDN])
            [--stream-format flac|mp3] [--stream-host HOST] [--log-level LEVEL]
-           [--start-gate-seconds N] [--stuck-seconds N] [--max-volume N] [--app-dir DIR]
+           [--start-gate-seconds N] [--stuck-seconds N] [--max-volume N] [--identity-generation N] [--app-dir DIR]
        scripts/run-ha-app-local.sh --stop
   --app-dir DIR  assembled app folder (default dist/ha-yt-to-upnp)
 USAGE
@@ -78,6 +78,7 @@ while [ $# -gt 0 ]; do
     --start-gate-seconds) opts+=(start_gate_seconds "$2") ;;
     --stuck-seconds) opts+=(stuck_seconds "$2") ;;
     --max-volume) opts+=(max_volume "$2") ;;
+    --identity-generation) opts+=(identity_generation "$2") ;;
     --app-dir) app="$2" ;;
     *) usage; exit 2 ;;
   esac
@@ -112,7 +113,7 @@ python3 -I - "${opts[@]}" > "$run/data/options.json" <<'PY'
 import json, sys
 args = sys.argv[1:]
 options = dict(zip(args[0::2], args[1::2]))
-for name in ("start_gate_seconds", "stuck_seconds", "max_volume"):
+for name in ("start_gate_seconds", "stuck_seconds", "max_volume", "identity_generation"):
     if name in options:
         try:
             options[name] = int(options[name])
@@ -169,7 +170,9 @@ start potoken "$bgutil" DENO_DIR="$bgutil/.deno" DENO_NO_UPDATE_CHECK=1 NO_COLOR
   --deny-write --deny-run --deny-ffi --deny-sys --deny-import \
   src/main.ts --host 127.0.0.1 --port 4416
 
-start receiver "$run" HOME="$run/data/ytcast" DEVICE_NAME="$(option cast_name)" \
+receiver_env=()
+[ -z "$(option identity_generation)" ] || receiver_env+=(YTCAST_IDENTITY_GENERATION="$(option identity_generation)")
+start receiver "$run" HOME="$run/data/ytcast" DEVICE_NAME="$(option cast_name)" ${receiver_env[@]+"${receiver_env[@]}"} \
   RUST_LOG="$(case "$(option log_level)" in debug) echo "info,ytcast_lite=debug" ;; warning) echo warn ;; *) option log_level ;; esac)" \
   MPD_HOST=127.0.0.1 MPD_PORT=6600 YTCAST_DATA_DIR="$run/data/ytcast" \
   "$root/target/release/ytcast-lite"

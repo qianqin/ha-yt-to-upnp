@@ -29,6 +29,7 @@ SCHEMA = {
     "start_gate_seconds": "int(0,60)?",
     "stuck_seconds": "int(1,300)?",
     "max_volume": "int(1,100)?",
+    "identity_generation": "int?",
     "stream_format": "list(flac|mp3)",
     "log_level": "list(debug|info|warning|error)",
 }
@@ -36,12 +37,16 @@ SCHEMA = {
 
 def _rule_problem(rule, value):
     """Why value breaks rule (a schema type without "?"), or None."""
-    kind, arg = re.fullmatch(r"(match|int|list)\((.*)\)", rule).groups()
+    kind, arg = re.fullmatch(r"(match|int|list)(?:\((.*)\))?", rule).groups()
     if kind == "match":
         # fullmatch: "$" alone would also accept a trailing newline.
         if isinstance(value, str) and re.fullmatch(arg, value):
             return None
         return "must match %s" % arg
+    if kind == "int" and arg is None:
+        if type(value) is int:
+            return None
+        return "must be a whole number"
     if kind == "int":
         low, high = (int(n) for n in arg.split(","))
         if type(value) is int and low <= value <= high:

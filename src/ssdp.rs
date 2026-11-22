@@ -30,6 +30,11 @@ pub fn get_local_ip() -> Result<Ipv4Addr> {
     Err("no non-loopback IPv4 address found".into())
 }
 
+/// The unique service name SSDP announces for the device `uuid`.
+fn usn_for(uuid: &str) -> String {
+    format!("uuid:{}::urn:dial-multiscreen-org:service:dial:1", uuid)
+}
+
 /// Run the SSDP responder + periodic alive announcer.
 ///
 /// Listens on `239.255.255.250:1900` for M-SEARCH requests from DIAL
@@ -37,7 +42,7 @@ pub fn get_local_ip() -> Result<Ipv4Addr> {
 pub async fn run_ssdp(
     local_ip: Ipv4Addr,
     http_port: u16,
-    uuid: &str,
+    mut identity: watch::Receiver<crate::identity::Identity>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let socket = bind_multicast(local_ip)?;
@@ -49,7 +54,7 @@ pub async fn run_ssdp(
     let send_socket = Arc::new(UdpSocket::bind(SocketAddrV4::new(local_ip, 0)).await?);
 
     let location = format!("http://{}:{}/ssdp/device-desc.xml", local_ip, http_port);
-    let usn = format!("uuid:{}::urn:dial-multiscreen-org:service:dial:1", uuid);
+    let mut usn = usn_for(&identity.borrow_and_update().uuid);
 
     tracing::info!("SSDP listening on 239.255.255.250:1900 (local_ip={local_ip})");
 
@@ -74,6 +79,14 @@ pub async fn run_ssdp(
             }
 
             _ = notify_interval.tick() => {
+                send_alive(&send_socket, &location, &usn).await;
+            }
+
+            // A new identity: the old device leaves, the new one is announced.
+            Ok(()) = identity.changed() => {
+                tracing::info!("SSDP: receiver identity changed, announcing the new device");
+                send_byebye(&send_socket, &usn).await;
+                usn = usn_for(&identity.borrow_and_update().uuid);
                 send_alive(&send_socket, &location, &usn).await;
             }
 
@@ -275,5 +288,15 @@ fn nix_net_interfaces() -> Result<Vec<IfaceInfo>> {
         }])
     } else {
         Err("no IPv4 address found".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_usn_names_the_devices_uuid() {
+        assert_eq!(usn_for("abc"), "uuid:abc::urn:dial-multiscreen-org:service:dial:1");
     }
 }

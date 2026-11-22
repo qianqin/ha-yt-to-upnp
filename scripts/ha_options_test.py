@@ -126,7 +126,7 @@ class Valid(unittest.TestCase):
 
     def test_all_options(self):
         options = dict(VALID, stream_host="192.0.2.10", start_gate_seconds=0,
-                       stuck_seconds=300, max_volume=50, log_level="debug")
+                       stuck_seconds=300, max_volume=50, log_level="debug", identity_generation=1)
         self.assertIsNone(problem(options))
 
     def test_unset_optional_options(self):
@@ -145,6 +145,12 @@ class Valid(unittest.TestCase):
         options = dict(VALID, raumfeld_host="192.0.2.20")
         del options["raumfeld_speaker_udn"]
         self.assertIsNone(problem(options))
+
+    def test_identity_generation_is_any_whole_number(self):
+        for generation in (0, 1, 7, -1, 2**40):
+            self.assertIsNone(problem(dict(VALID, identity_generation=generation)), generation)
+        for unset in (None, ""):
+            self.assertIsNone(problem(dict(VALID, identity_generation=unset)))
 
     def test_stream_formats(self):
         for fmt in ("flac", "mp3"):
@@ -220,10 +226,33 @@ class Invalid(unittest.TestCase):
             for bad in (low - 1, high + 1, "10", 10.5, True):
                 self.assertProblem(dict(VALID, **{key: bad}), key)
 
+    def test_identity_generation(self):
+        for bad in ("1", 1.5, True, [1]):
+            self.assertProblem(dict(VALID, identity_generation=bad), "identity_generation")
+
     def test_message_names_the_rule_not_the_value(self):
         message = problem(dict(VALID, cast_name="secret<"))
         self.assertNotIn("secret", message)
         self.assertIn("^[^<>&", message)
+
+
+class ReceiverGetsTheIdentityGeneration(unittest.TestCase):
+    """The receiver's run script hands the option over only when it is set
+    (unset: the receiver's default 0), as the adapter's run does with its."""
+
+    def test_run_script_passes_the_option_when_set(self):
+        path = os.path.join(APP, "rootfs", "etc", "s6-overlay", "s6-rc.d", "receiver", "run")
+        with open(path) as f:
+            run = f.read()
+        self.assertIn("if ytcast_has_option identity_generation; then", run)
+        self.assertRegex(run, r'YTCAST_IDENTITY_GENERATION="\$\{?identity_generation\}?"')
+        self.assertRegex(run, r'env -i [^\n]*"\$\{env\[@\]\}"|"\$\{receiver_env\[@\]\}"')
+
+    def test_local_run_passes_the_option_too(self):
+        with open(os.path.join(ROOT, "scripts", "run-ha-app-local.sh")) as f:
+            local = f.read()
+        self.assertIn("--identity-generation) opts+=(identity_generation", local)
+        self.assertIn("YTCAST_IDENTITY_GENERATION", local)
 
 
 class CommandLine(unittest.TestCase):

@@ -30,8 +30,10 @@ pub struct DialState {
     pub preroll_tx: mpsc::Sender<()>,
     /// Human-readable name shown during discovery (e.g. "Living Room Pi").
     pub device_name: String,
-    /// UPnP UUID for this device (without the "uuid:" prefix).
-    pub uuid: String,
+    /// The receiver's identity: the UPnP uuid (without the "uuid:" prefix)
+    /// and the "cl" screen id exposed in DIAL additionalData. It can change
+    /// while the receiver runs (see `identity`).
+    pub identity: tokio::sync::watch::Receiver<crate::identity::Identity>,
     /// Local IP for building absolute Application-URL.
     pub local_ip: std::net::Ipv4Addr,
     /// Port this DIAL server listens on.
@@ -42,8 +44,6 @@ pub struct DialState {
     pub ctt: std::sync::RwLock<Option<(String, String)>>,
     /// Anonymous YouTube Music session (full INNERTUBE_CONTEXT from page).
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
-    /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
-    pub screen_id: String,
     /// Last `/stream` request that failed: (video_id, failure). Lets the
     /// player tell a failed stream from a song that ended, since MPD just
     /// stops in both cases.
@@ -166,6 +166,20 @@ fn is_loopback_peer(peer: SocketAddr) -> bool {
 impl DialState {
     /// A state with documentation-range addresses and no session.
     pub(crate) fn for_tests(preroll_tx: mpsc::Sender<()>) -> Arc<Self> {
+        let config = crate::config::Config {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            screen_id: "test-screen".to_string(),
+            ..Default::default()
+        };
+        let (_, identity) = tokio::sync::watch::channel(crate::identity::Identity::from_config(&config));
+        Self::for_tests_with_identity(preroll_tx, identity)
+    }
+
+    /// `for_tests` with the identity the test changes.
+    pub(crate) fn for_tests_with_identity(
+        preroll_tx: mpsc::Sender<()>,
+        identity: tokio::sync::watch::Receiver<crate::identity::Identity>,
+    ) -> Arc<Self> {
         let (pairing_tx, _) = mpsc::channel(1);
         let (pairing_tx_m, _) = mpsc::channel(1);
         Arc::new(DialState {
@@ -174,12 +188,11 @@ impl DialState {
             pairing_tx,
             pairing_tx_m,
             device_name: "Test Receiver".to_string(),
-            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            identity,
             local_ip: std::net::Ipv4Addr::new(192, 0, 2, 1),
             port: 8008,
             ctt: std::sync::RwLock::new(None),
             yt_session: None,
-            screen_id: "test-screen".to_string(),
             stream_failure: Default::default(),
             silence_slots: Default::default(),
         })
@@ -235,7 +248,7 @@ async fn device_description(
 </root>"#,
         base_url = base_url,
         name = state.device_name,
-        uuid = state.uuid,
+        uuid = state.identity.borrow().uuid,
     );
 
     let mut headers = HeaderMap::new();
@@ -277,7 +290,7 @@ async fn app_status(
     <screenId>{screen_id}</screenId>
   </additionalData>
 </service>"#,
-        screen_id = state.screen_id,
+        screen_id = state.identity.borrow().screen_id,
     );
 
     let mut headers = HeaderMap::new();
@@ -630,6 +643,39 @@ mod tests {
             .await
             .unwrap();
         (response, server)
+    }
+
+    /// GET `path` from the real router serving `state`, as a loopback peer.
+    async fn body_from(state: Arc<DialState>, path: &str) -> String {
+        let app = build_router(state).layer(MockConnectInfo(peer(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        let body = reqwest::get(format!("http://{addr}{path}")).await.unwrap().text().await.unwrap();
+        server.abort();
+        body
+    }
+
+    #[tokio::test]
+    async fn a_new_identity_shows_in_the_device_description_and_the_app_status() {
+        let config = |uuid: &str, screen: &str| crate::config::Config {
+            uuid: uuid.into(),
+            screen_id: screen.into(),
+            ..Default::default()
+        };
+        let (identity_tx, identity) =
+            tokio::sync::watch::channel(crate::identity::Identity::from_config(&config("first-uuid", "first-screen")));
+        let (preroll_tx, _) = mpsc::channel(1);
+        let state = DialState::for_tests_with_identity(preroll_tx, identity);
+        assert!(body_from(state.clone(), "/ssdp/device-desc.xml").await.contains("<UDN>uuid:first-uuid</UDN>"));
+        assert!(body_from(state.clone(), "/apps/YouTube").await.contains("<screenId>first-screen</screenId>"));
+
+        identity_tx.send(crate::identity::Identity::from_config(&config("second-uuid", "second-screen"))).unwrap();
+
+        assert!(body_from(state.clone(), "/ssdp/device-desc.xml").await.contains("<UDN>uuid:second-uuid</UDN>"));
+        assert!(body_from(state, "/apps/YouTube").await.contains("<screenId>second-screen</screenId>"));
     }
 
     fn lan_peers() -> Vec<SocketAddr> {

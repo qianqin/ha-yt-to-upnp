@@ -79,6 +79,7 @@ repository.
 | `start_gate_seconds` | no | 0-60, default 15. How long the song is held at its start while the speaker wakes; `0` turns it off. |
 | `stuck_seconds` | no | 1-300, default 15. How long the speaker may hang while buffering before it is restarted. |
 | `max_volume` | no | 1-100, default 50. The speaker's volume at 100 % on the phone; the phone's volume is scaled linearly to 0..`max_volume` and never sets the speaker louder. See [Volume](#volume). |
+| `identity_generation` | no | A whole number, default 0. Change it (for example add 1) and restart the app to give the receiver a new identity once; phones must then pick the speaker again. See [Receiver identity](#receiver-identity). |
 | `stream_format` | yes | `flac` (default) or `mp3`: the format of the stream the speaker plays, see [Stream format](#stream-format). |
 | `log_level` | yes | `debug`, `info` (default), `warning` or `error`, for the receiver and the adapter. |
 
@@ -136,6 +137,23 @@ stream between a 44.1 kHz and a 48 kHz song.
 
 The change takes effect when the app is restarted. The adapter announces the
 stream to the speaker with the matching MIME type.
+
+### Receiver identity
+
+The receiver presents itself to phones and to YouTube with an identity it
+keeps in `/data/ytcast/ytcast-lite.json`: a device id and one screen id each
+for YouTube and YouTube Music. YouTube can come to treat an identity badly:
+it then answers every request for the next song with an autoplay pick only,
+songs after the first get no token from the phone and stop after about a
+minute. When the first such answer comes for 3 casts in a row, the receiver
+makes a new identity by itself, as soon as nothing plays, and logs `[identity]
+YouTube answers /next with autoplay only for 3 casts in a row; new receiver
+identity (the phone must pick the speaker again)`. The speaker then shows up
+in the cast menu as a new device: pick it again.
+
+To force a new identity, change `identity_generation` and restart the app;
+the receiver makes a new identity once and keeps it (there is no need to set
+the number back).
 
 ### Finding the Raumfeld host
 
@@ -206,6 +224,10 @@ which one and with which exit code.
   `Europe/Berlin` is ignored) or it has offset 0 (UTC, or e.g. Europe/London
   in winter): set Home Assistant's time zone and restart the app. Nothing is
   faked: the helper reports the host's real platform and time zone.
+- **Songs after the first stop after about a minute, every time:** YouTube
+  may be treating the receiver's identity badly; see
+  [Receiver identity](#receiver-identity). The receiver renews it by itself
+  after 3 such casts; to do it at once, change `identity_generation`.
 - **App stops right after starting:** an option is missing or invalid; the
   log names it.
 

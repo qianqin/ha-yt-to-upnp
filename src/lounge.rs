@@ -990,15 +990,15 @@ fn dispatch_update_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Se
 pub async fn run_lounge(
     client: reqwest::Client,
     device_name: String,
-    uuid: String,
-    screen_id: String,
+    mut identity: watch::Receiver<crate::identity::Identity>,
     theme: String,
     player_cmd_tx: mpsc::Sender<PlayerCommand>,
     state_rx: mpsc::Receiver<OutgoingMessage>,
     pairing_rx: mpsc::Receiver<String>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut session = LoungeSession::new(client.clone(), device_name, uuid, screen_id, theme);
+    let current = identity.borrow_and_update().lounge(&theme);
+    let mut session = LoungeSession::new(client.clone(), device_name, current.uuid, current.screen_id, theme);
     let theme_tag = format!("[lounge:{}]", session.theme);
     let mut state_rx = state_rx;
     let mut shutdown = shutdown;
@@ -1006,17 +1006,19 @@ pub async fn run_lounge(
     // Spawn a dedicated task for pairing code registration so it never
     // interrupts the long-poll. This runs independently from the session loop.
     let pair_client = client;
-    let pair_screen = session.screen_id.clone();
     let pair_name = session.device_name.clone();
-    let pair_uuid = session.uuid.clone();
+    let pair_identity = identity.clone();
+    let pair_theme = session.theme.clone();
     tokio::spawn(async move {
         let mut pairing_rx = pairing_rx;
         while let Some(code) = pairing_rx.recv().await {
+            // The identity at the time of the code: it can change.
+            let current = pair_identity.borrow().lounge(&pair_theme);
             if let Err(e) = register_pairing_code(
                 &pair_client,
-                &pair_screen,
+                &current.screen_id,
                 &pair_name,
-                &pair_uuid,
+                &current.uuid,
                 &code,
             ).await {
                 tracing::error!("failed to register pairing code: {e}");
@@ -1029,6 +1031,11 @@ pub async fn run_lounge(
         if *shutdown.borrow() {
             return Err(LoungeError::Shutdown);
         }
+
+        // A new identity (see below) is registered with a new token and bind.
+        let current = identity.borrow_and_update().lounge(&session.theme);
+        session.uuid = current.uuid;
+        session.screen_id = current.screen_id;
 
         // -- Get lounge token --
         tracing::info!("{} obtaining lounge token", theme_tag);
@@ -1101,6 +1108,12 @@ pub async fn run_lounge(
                         if *shutdown.borrow() {
                             return Err(LoungeError::Shutdown);
                         }
+                    }
+
+                    // A new receiver identity: register its screen afresh.
+                    Ok(()) = identity.changed() => {
+                        tracing::info!("{} receiver identity changed; binding the new screen", theme_tag);
+                        break 'session;
                     }
 
                     // Incoming messages from the streaming poll

@@ -1,6 +1,7 @@
 mod cast_tokens;
 mod config;
 mod dial;
+mod identity;
 mod innertube;
 mod lounge;
 mod messages;
@@ -99,6 +100,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.uuid = uuid::Uuid::new_v4().to_string();
         config.save()?;
     }
+    // The identity_generation option: a new value asks for a new identity once.
+    let generation = std::env::var("YTCAST_IDENTITY_GENERATION").ok();
+    match identity::wanted_generation(generation.as_deref()) {
+        Some(wanted) => {
+            if identity::apply_identity_generation(&mut config, wanted) {
+                tracing::warn!(
+                    "[identity] identity_generation is now {wanted}: new receiver identity (the phone must pick the speaker again)"
+                );
+                config.save()?;
+            }
+        }
+        None => tracing::warn!("[identity] identity_generation is not a whole number; the identity stays"),
+    }
     tracing::info!("[init] UUID: {}", config.uuid);
 
     // 3. Read env vars
@@ -150,6 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if config_changed {
         config.save()?;
     }
+    // The identity the DIAL server, SSDP and both Lounge sessions present;
+    // the player loop renews it when YouTube treats it badly.
+    let (identity_tx, identity_rx) = tokio::sync::watch::channel(identity::Identity::from_config(&config));
 
     // 7. Connect to MPD (command connection)
     let mut mpd_client = mpd::MpdClient::connect(&mpd_host, mpd_port).await?;
@@ -213,12 +230,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pairing_tx_m: pairing_m_tx,
         preroll_tx,
         device_name: device_name.clone(),
-        uuid: config.uuid.clone(),
+        identity: identity_rx.clone(),
         local_ip,
         port: dial_port,
         ctt: std::sync::RwLock::new(None),
         yt_session: yt_session.clone(),
-        screen_id: config.screen_id.clone(),
         stream_failure: Default::default(),
         silence_slots: Default::default(),
     });
@@ -227,9 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // SSDP discovery responder
     let ssdp_shutdown = shutdown_rx.clone();
-    let ssdp_uuid = config.uuid.clone();
+    let ssdp_identity = identity_rx.clone();
     tokio::spawn(async move {
-        if let Err(e) = ssdp::run_ssdp(local_ip, dial_port, &ssdp_uuid, ssdp_shutdown).await {
+        if let Err(e) = ssdp::run_ssdp(local_ip, dial_port, ssdp_identity, ssdp_shutdown).await {
             tracing::error!("[SSDP] Error: {}", e);
         }
     });
@@ -247,15 +263,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let lounge_cl_shutdown = shutdown_rx.clone();
     let lounge_cl_client = http_client.clone();
     let lounge_cl_name = device_name.clone();
-    let lounge_cl_uuid = config.uuid.clone();
-    let lounge_cl_screen = config.screen_id.clone();
+    let lounge_cl_identity = identity_rx.clone();
     let player_cmd_tx_cl = player_cmd_tx.clone();
     tokio::spawn(async move {
         if let Err(e) = lounge::run_lounge(
             lounge_cl_client,
             lounge_cl_name,
-            lounge_cl_uuid,
-            lounge_cl_screen,
+            lounge_cl_identity,
             "cl".to_string(),
             player_cmd_tx_cl,
             state_cl_rx,
@@ -272,14 +286,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let lounge_m_shutdown = shutdown_rx.clone();
     let lounge_m_client = http_client.clone();
     let lounge_m_name = device_name.clone();
-    let lounge_m_uuid = uuid::Uuid::new_v4().to_string(); // separate device id per session
-    let lounge_m_screen = config.screen_id_m.clone();
+    let lounge_m_identity = identity_rx.clone();
     tokio::spawn(async move {
         if let Err(e) = lounge::run_lounge(
             lounge_m_client,
             lounge_m_name,
-            lounge_m_uuid,
-            lounge_m_screen,
+            lounge_m_identity,
             "m".to_string(),
             player_cmd_tx,
             state_m_rx,
@@ -375,6 +387,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let resolve = |video_id: String, ctt: Option<String>, list_id: Option<String>| async move {
         innertube::resolve_stream(&video_id, ctt.as_deref(), list_id.as_deref(), yt).await
     };
+    let mut health = identity::Health::default();
+    // A renewed identity (and the casts that made it due), made off the loop
+    // and presented once nothing plays.
+    let (renewed_tx, mut renewed_rx) =
+        tokio::sync::mpsc::channel::<(Result<config::Config, String>, u32)>(1);
+    let mut renewed_identity: Option<(config::Config, u32)> = None;
     let ask_next = {
         let (session, tx) = (innertube_session.clone(), prefetch_tx.clone());
         move |job: PrefetchJob, sender_ids: &[String]| {
@@ -385,6 +403,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     loop {
+        // A due new identity: made in the background, presented when idle.
+        if let Some(casts) = health.take_renewal(is_idle(&playlist, play_started)) {
+            let (current, http, tx) = (config.clone(), http_client.clone(), renewed_tx.clone());
+            tokio::spawn(async move {
+                let renewed = identity::renewed(current, || async {
+                    lounge::generate_screen_id(&http).await.map_err(|e| e.to_string().into())
+                })
+                .await
+                .map_err(|e| e.to_string());
+                tx.send((renewed, casts)).await.ok();
+            });
+        }
+        if is_idle(&playlist, play_started) {
+            if let Some((renewed, casts)) = renewed_identity.take() {
+                config = adopt_identity(renewed, casts, &mut senders, config::Config::save, &identity_tx);
+            }
+        }
+
         // Once a song plays with its own ctt, ask /next for the next one's.
         // Here, before select!, it also runs after a branch's `continue`.
         if let Some(session) = innertube_session.as_ref() {
@@ -406,7 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 on_command(
                     cmd, &mut mpd_client, &state_tx, &mut playlist, &mut play_started, &mut senders, &dial_state,
-                    &active_theme, &resolve, &ask_next,
+                    &active_theme, &resolve, &ask_next, &mut health,
                 ).await;
             }
 
@@ -458,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if plan.check_song_end {
                     if let Ok(status) = mpd_client.status().await {
                         if song_ended(&status) {
-                            apply_pending_prefetches(&mut prefetch_rx, &mut playlist);
+                            apply_pending_prefetches(&mut prefetch_rx, &mut playlist, &mut health);
                             on_song_end(
                                 &mut mpd_client, &state_tx, &mut playlist, &mut play_started, &mut senders, &dial_state,
                                 &resolve, &ask_next,
@@ -470,7 +506,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // The next video's own ctt from /next
             Some(result) = prefetch_rx.recv() => {
-                apply_prefetch(&mut playlist, result);
+                take_next_answer(&mut health, &mut playlist, result);
+            }
+
+            // A new identity is ready (or could not be made)
+            Some((renewed, casts)) = renewed_rx.recv() => {
+                match renewed {
+                    Ok(renewed) => renewed_identity = Some((renewed, casts)),
+                    Err(e) => tracing::warn!("[identity] a new identity could not be made ({e}); the current one stays"),
+                }
             }
 
             // DIAL launch: play silence so the speaker wakes while the phone loads
@@ -558,6 +602,7 @@ async fn on_command<R, Fut>(
     active_theme: &std::sync::RwLock<String>,
     resolve: &R,
     ask_next: &AskNext,
+    health: &mut identity::Health,
 ) where
     R: Fn(String, Option<String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
@@ -617,6 +662,9 @@ async fn on_command<R, Fut>(
         return;
     }
     let ends_cast = matches!(cmd, PlayerCommand::Stop);
+    if let PlayerCommand::SetPlaylist { video_ids, .. } = &cmd {
+        health.cast_started(video_ids.len());
+    }
     let sender_ids = senders.cast_ids().to_vec();
     if let Err(e) =
         handle_command(cmd, mpd, state_tx, playlist, play_started, dial_state, resolve, ask_next, &sender_ids).await
@@ -1486,13 +1534,45 @@ fn next_job(playlist: &mut PlaylistState) -> Option<PrefetchJob> {
 fn apply_pending_prefetches(
     rx: &mut tokio::sync::mpsc::Receiver<PrefetchResult>,
     playlist: &mut PlaylistState,
+    health: &mut identity::Health,
 ) -> usize {
     let mut applied = 0;
     while let Ok(result) = rx.try_recv() {
-        apply_prefetch(playlist, result);
+        take_next_answer(health, playlist, result);
         applied += 1;
     }
     applied
+}
+
+/// A /next answer: noted for the identity's health (if it is for the playing
+/// song of this cast), then applied.
+fn take_next_answer(health: &mut identity::Health, playlist: &mut PlaylistState, result: PrefetchResult) -> PrefetchVerdict {
+    if result.generation == playlist.tokens.generation() {
+        if let Ok(Some((source, next))) = &result.outcome {
+            let queue_has_next = playlist.current_index + 1 < playlist.video_ids.len();
+            health.next_answered(*source, next.index, queue_has_next);
+        }
+    }
+    apply_prefetch(playlist, result)
+}
+
+/// Present a new identity (see `identity::publish`). The Lounge sessions of
+/// the old one are left, and with them every sender counted on them.
+fn adopt_identity(
+    renewed: config::Config,
+    autoplay_only_casts: u32,
+    senders: &mut senders::Senders,
+    save: impl FnOnce(&config::Config) -> config::Result<()>,
+    identity: &tokio::sync::watch::Sender<identity::Identity>,
+) -> config::Config {
+    senders.clear();
+    identity::publish(renewed, autoplay_only_casts, save, identity)
+}
+
+/// Nothing plays and no queue is left (a stopped or paused one is kept for
+/// its sender): the identity may change now without cutting a cast.
+fn is_idle(playlist: &PlaylistState, play_started: bool) -> bool {
+    !play_started && playlist.video_ids.is_empty() && !playlist.preroll.is_active()
 }
 
 /// Run the /next request off the player loop; the answer comes back on `tx`.
@@ -2840,6 +2920,88 @@ mod preroll_wiring_tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    // The identity health the glue under test keeps, per test thread.
+    thread_local! {
+        static HEALTH: std::cell::RefCell<identity::Health> = std::cell::RefCell::new(identity::Health::default());
+    }
+
+    /// A /next answer for the playing song with an autoplay pick only.
+    fn autoplay_only_answer(playlist: &PlaylistState) -> PrefetchResult {
+        PrefetchResult {
+            generation: playlist.tokens.generation(),
+            video_id: current_video_id(playlist),
+            expected_next: playlist.video_ids.get(playlist.current_index + 1).cloned().unwrap_or_default(),
+            outcome: Ok(Some((
+                watch_next::NextSource::MdxAutoplay,
+                watch_next::NextVideo {
+                    video_id: "zzzzzzzzzzz".into(),
+                    ctt: Some("ctt-z".into()),
+                    params: None,
+                    playlist_id: None,
+                    index: None,
+                },
+            ))),
+        }
+    }
+
+    #[tokio::test]
+    async fn casts_answered_with_autoplay_only_make_a_new_identity_due() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        HEALTH.with(|health| health.take());
+        let mut playlist = PlaylistState::default();
+        for cast in 1..=3 {
+            on_command_resolving(
+                &active, &dial_state, set_playlist_d("ctt-new"), &mut playlist, &mut false, &mut connected(&["phone"]),
+                no_stream, vec![("status", STATUS_STOP), ("status", STATUS_STOP)],
+            )
+            .await;
+            let mut health = HEALTH.with(|health| health.take());
+            // A stale answer (an earlier song's, here naming the queue's next)
+            // and a failed one do not count.
+            let mut stale = autoplay_only_answer(&playlist);
+            stale.generation -= 1;
+            if let Ok(Some((source, _))) = &mut stale.outcome {
+                *source = watch_next::NextSource::NextVideoRenderer;
+            }
+            take_next_answer(&mut health, &mut playlist, stale);
+            let failed = PrefetchResult { outcome: Err("HTTP 400".into()), ..autoplay_only_answer(&playlist) };
+            take_next_answer(&mut health, &mut playlist, failed);
+            let answer = autoplay_only_answer(&playlist);
+            take_next_answer(&mut health, &mut playlist, answer);
+            let due = health.take_renewal(true);
+            assert_eq!(due, (cast == 3).then_some(3), "cast {cast}");
+            HEALTH.with(|kept| *kept.borrow_mut() = health);
+        }
+    }
+
+    #[test]
+    fn a_new_identity_leaves_the_old_ones_senders_behind() {
+        let old = config::Config { uuid: "old-uuid".into(), ..Default::default() };
+        let (tx, rx) = tokio::sync::watch::channel(identity::Identity::from_config(&old));
+        let mut senders = connected(&["phone"]);
+        let renewed = config::Config { uuid: "new-uuid".into(), ..Default::default() };
+
+        let adopted = adopt_identity(renewed, 3, &mut senders, |_| Ok(()), &tx);
+
+        assert_eq!(adopted.uuid, "new-uuid");
+        assert_eq!(rx.borrow().uuid, "new-uuid");
+        assert!(!senders.any_connected());
+        assert!(senders.cast_ids().is_empty());
+    }
+
+    #[test]
+    fn the_identity_is_renewed_only_when_nothing_plays_and_no_queue_is_left() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        assert!(is_idle(&PlaylistState::default(), false));
+        assert!(!is_idle(&PlaylistState::default(), true));
+        assert!(!is_idle(&cast_queue(&dial_state), false), "a queue (stopped or paused) is kept");
+        assert!(!is_idle(&PlaylistState { preroll: preroll::PreRoll::running(), ..PlaylistState::default() }, false));
+    }
+
     fn record_next(job: PrefetchJob, sender_ids: &[String]) {
         ASKED_NEXT.with(|asked| asked.borrow_mut().push((job.video_id, job.expected_next, job.ctt, sender_ids.to_vec())));
     }
@@ -2916,9 +3078,10 @@ mod preroll_wiring_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         tx.send(next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b"))).await.unwrap();
 
-        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist), 1);
+        let mut health = identity::Health::default();
+        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist, &mut health), 1);
         assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb").ctt.as_deref(), Some("ctt-b"));
-        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist), 0);
+        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist, &mut health), 0);
     }
 
     fn playable(vid: &str) -> innertube::Result<Option<innertube::StreamInfo>> {
@@ -3298,8 +3461,13 @@ mod preroll_wiring_tests {
             let result = resolved(&vid);
             async move { result }
         };
-        on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve, &record_next)
-            .await;
+        let mut health = HEALTH.with(|health| health.take());
+        on_command(
+            cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve, &record_next,
+            &mut health,
+        )
+        .await;
+        HEALTH.with(|kept| *kept.borrow_mut() = health);
         drop(mpd);
         let mut sent = Vec::new();
         while let Ok(msg) = state_rx.try_recv() {
