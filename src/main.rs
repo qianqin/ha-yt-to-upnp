@@ -115,9 +115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 config.save()?;
             }
         }
-        None => tracing::warn!("[identity] identity_generation is not a whole number; the identity stays"),
+        None if generation.as_deref().is_some_and(|g| !g.trim().is_empty()) => {
+            tracing::warn!("[identity] identity_generation is not a whole number; the identity stays")
+        }
+        None => {}
     }
-    tracing::info!("[init] UUID: {}", config.uuid);
+    tracing::info!("[init] receiver identity loaded");
 
     // 3. Read env vars
     let device_name = std::env::var("DEVICE_NAME").unwrap_or_else(|_| "Living Room Pi".into());
@@ -408,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     loop {
         // A due new identity: made in the background, presented when idle.
-        if let Some(casts) = health.take_renewal(is_idle(&playlist, play_started)) {
+        if let Some(casts) = health.take_renewal(is_idle(&playlist, play_started), config.last_auto_renewal, unix_now()) {
             let (current, http, tx) = (config.clone(), http_client.clone(), renewed_tx.clone());
             tokio::spawn(async move {
                 let renewed = identity::renewed(current, || async {
@@ -419,10 +422,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tx.send((renewed, casts)).await.ok();
             });
         }
-        if is_idle(&playlist, play_started) {
-            if let Some((renewed, casts)) = renewed_identity.take() {
-                config = adopt_identity(renewed, casts, &mut senders, config::Config::save, &identity_tx);
-            }
+        if let Some((renewed, casts)) = health.take_prepared(&mut renewed_identity, is_idle(&playlist, play_started)) {
+            config = adopt_identity(renewed, casts, unix_now(), &mut senders, config::Config::save, &identity_tx);
         }
 
         // Once a song plays with its own ctt, ask /next for the next one's.
@@ -686,8 +687,8 @@ async fn on_command<R, Fut>(
         return;
     }
     let ends_cast = matches!(cmd, PlayerCommand::Stop);
-    if let PlayerCommand::SetPlaylist { video_ids, .. } = &cmd {
-        health.cast_started(video_ids.len());
+    if let PlayerCommand::SetPlaylist { video_ids, list_id, .. } = &cmd {
+        health.cast_started(video_ids.len(), !list_id.is_empty());
     }
     let sender_ids = senders.cast_ids().to_vec();
     if let Err(e) =
@@ -1657,12 +1658,18 @@ fn take_next_answer(health: &mut identity::Health, playlist: &mut PlaylistState,
 fn adopt_identity(
     renewed: config::Config,
     autoplay_only_casts: u32,
+    now: u64,
     senders: &mut senders::Senders,
     save: impl FnOnce(&config::Config) -> config::Result<()>,
     identity: &tokio::sync::watch::Sender<identity::Identity>,
 ) -> config::Config {
     senders.clear();
-    identity::publish(renewed, autoplay_only_casts, save, identity)
+    identity::publish(renewed, autoplay_only_casts, now, save, identity)
+}
+
+/// Unix seconds now (the identity renewal's once-a-day cap).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Nothing plays and no queue is left (a stopped or paused one is kept for
@@ -3067,10 +3074,77 @@ mod preroll_wiring_tests {
             take_next_answer(&mut health, &mut playlist, failed);
             let answer = autoplay_only_answer(&playlist);
             take_next_answer(&mut health, &mut playlist, answer);
-            let due = health.take_renewal(true);
+            let due = health.take_renewal(true, None, 0);
             assert_eq!(due, (cast == 3).then_some(3), "cast {cast}");
             HEALTH.with(|kept| *kept.borrow_mut() = health);
         }
+    }
+
+    /// Three casts of `cast`, each answered with `answers` (the playlist as
+    /// the cast left it): whether a new identity is then due.
+    async fn three_casts(
+        cast: fn() -> lounge::PlayerCommand,
+        answers: fn(&mut PlaylistState) -> Vec<PrefetchResult>,
+    ) -> Option<u32> {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        HEALTH.with(|health| health.take());
+        let mut playlist = PlaylistState::default();
+        for _ in 0..3 {
+            on_command_resolving(
+                &active, &dial_state, cast(), &mut playlist, &mut false, &mut connected(&["phone"]), no_stream,
+                vec![("status", STATUS_STOP), ("status", STATUS_STOP)],
+            )
+            .await;
+            let mut health = HEALTH.with(|health| health.take());
+            for answer in answers(&mut playlist) {
+                take_next_answer(&mut health, &mut playlist, answer);
+            }
+            HEALTH.with(|kept| *kept.borrow_mut() = health);
+        }
+        HEALTH.with(|health| health.borrow_mut().take_renewal(true, None, 0))
+    }
+
+    #[tokio::test]
+    async fn casts_whose_only_answer_failed_do_not_count() {
+        let due = three_casts(
+            || set_playlist_d("ctt-new"),
+            |playlist| vec![PrefetchResult { outcome: Err("HTTP 400".into()), ..autoplay_only_answer(playlist) }],
+        )
+        .await;
+        assert_eq!(due, None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_the_queues_last_song_does_not_count() {
+        let due = three_casts(
+            || set_playlist_d("ctt-new"),
+            |playlist| {
+                playlist.current_index = playlist.video_ids.len() - 1;
+                vec![autoplay_only_answer(playlist)]
+            },
+        )
+        .await;
+        assert_eq!(due, None);
+    }
+
+    #[tokio::test]
+    async fn casts_without_a_list_do_not_count() {
+        let without_list = || match set_playlist_d("ctt-new") {
+            lounge::PlayerCommand::SetPlaylist { video_id, video_ids, index, current_time, ctt, params, from_bind, .. } => {
+                lounge::PlayerCommand::SetPlaylist {
+                    video_id, video_ids, index, current_time, list_id: String::new(), ctt, params, from_bind,
+                }
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(three_casts(without_list, |playlist| vec![autoplay_only_answer(playlist)]).await, None);
+        assert_eq!(
+            three_casts(|| set_playlist_d("ctt-new"), |playlist| vec![autoplay_only_answer(playlist)]).await,
+            Some(3),
+            "with a list they do"
+        );
     }
 
     #[test]
@@ -3080,7 +3154,7 @@ mod preroll_wiring_tests {
         let mut senders = connected(&["phone"]);
         let renewed = config::Config { uuid: "new-uuid".into(), ..Default::default() };
 
-        let adopted = adopt_identity(renewed, 3, &mut senders, |_| Ok(()), &tx);
+        let adopted = adopt_identity(renewed, 3, 1234, &mut senders, |_| Ok(()), &tx);
 
         assert_eq!(adopted.uuid, "new-uuid");
         assert_eq!(rx.borrow().uuid, "new-uuid");
@@ -3173,10 +3247,13 @@ mod preroll_wiring_tests {
         let dial_state = dial::DialState::for_tests(preroll_tx);
         let mut playlist = cast_queue(&dial_state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut stale = next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-stale"));
+        stale.generation -= 1;
+        tx.send(stale).await.unwrap();
         tx.send(next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b"))).await.unwrap();
 
         let mut health = identity::Health::default();
-        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist, &mut health), 1);
+        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist, &mut health), 2);
         assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb").ctt.as_deref(), Some("ctt-b"));
         assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist, &mut health), 0);
     }
@@ -4758,6 +4835,7 @@ mod log_hygiene_tests {
             concat!("ctt received", ": {}"),
             concat!("Generated screen_id (cl)", ": {}"),
             concat!("Generated screen_id (m)", ": {}"),
+            concat!("[init] UUID", ": {}"),
         ] {
             assert!(!src.contains(needle), "secret-logging format string found: {needle}");
         }

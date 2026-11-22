@@ -10,7 +10,7 @@ device_name="$(ytcast_option cast_name)"
 rust_log="$(ytcast_log_level rust)"
 
 receiver_env=()
-# Unset: the receiver's default generation 0.
+# Unset: no change to the receiver's identity.
 if ytcast_has_option identity_generation; then
     identity_generation="$(ytcast_option identity_generation)"
     receiver_env+=(YTCAST_IDENTITY_GENERATION="${identity_generation}")

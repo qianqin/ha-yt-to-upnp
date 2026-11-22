@@ -238,7 +238,7 @@ class Invalid(unittest.TestCase):
 
 class ReceiverGetsTheIdentityGeneration(unittest.TestCase):
     """The receiver's run script hands the option over only when it is set
-    (unset: the receiver's default 0), as the adapter's run does with its."""
+    (unset: the identity stays), as the adapter's run does with its."""
 
     def test_run_script_passes_the_option_when_set(self):
         path = os.path.join(APP, "rootfs", "etc", "s6-overlay", "s6-rc.d", "receiver", "run")

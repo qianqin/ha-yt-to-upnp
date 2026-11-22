@@ -63,6 +63,10 @@ pub struct Config {
     /// `identity::apply_identity_generation`).
     #[serde(default)]
     pub identity_generation: i64,
+    /// When the identity was last renewed automatically (unix seconds), so
+    /// a restart does not lift the once-a-day cap.
+    #[serde(default)]
+    pub last_auto_renewal: Option<u64>,
 }
 
 impl Config {
@@ -86,6 +90,7 @@ impl Config {
                     screen_id: String::new(),
                     screen_id_m: String::new(),
                     identity_generation: 0,
+                    last_auto_renewal: None,
                 };
                 config.save_to(path)?;
                 tracing::info!("created new config at {}", path.display());
@@ -151,6 +156,7 @@ mod tests {
             screen_id: "s".into(),
             screen_id_m: "m".into(),
             identity_generation: 2,
+            last_auto_renewal: Some(7),
         };
         config.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
@@ -158,6 +164,7 @@ mod tests {
         assert_eq!(loaded.screen_id, "s");
         assert_eq!(loaded.screen_id_m, "m");
         assert_eq!(loaded.identity_generation, 2);
+        assert_eq!(loaded.last_auto_renewal, Some(7));
         #[cfg(unix)]
         assert_eq!(mode(&path), 0o600);
     }
