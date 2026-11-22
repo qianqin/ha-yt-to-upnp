@@ -631,10 +631,11 @@ where
             ..
         } => {
             tracing::info!(
-                "[player] SetPlaylist: {} videos, starting at index {} ({})",
+                "[player] SetPlaylist: {} videos, starting at index {} ({}), list {}",
                 video_ids.len(),
                 index,
-                video_id
+                video_id,
+                list_kind(&list_id),
             );
 
             let auth = cast_tokens::VideoAuth { ctt, params };
@@ -1206,6 +1207,14 @@ fn resolve_ctt(playlist: &PlaylistState, video_id: &str) -> Option<String> {
 fn is_stale_command(any_connected: bool, cmd: &lounge::PlayerCommand) -> bool {
     !any_connected
         && matches!(cmd, lounge::PlayerCommand::SetPlaylist { .. } | lounge::PlayerCommand::SetVideo { .. })
+}
+
+/// The kind of a list id for the log (RD radio/mix, PL playlist, OLAK album,
+/// …): its leading uppercase letters, at most six, so the id itself (and
+/// a video id a mix id ends in) is never logged.
+fn list_kind(list_id: &str) -> &str {
+    let len = list_id.bytes().take(6).take_while(u8::is_ascii_uppercase).count();
+    if len == 0 { "none" } else { &list_id[..len] }
 }
 
 /// A setPlaylist / setVideo replayed in the receiver's own bind response.
@@ -3286,6 +3295,41 @@ mod preroll_wiring_tests {
             current_time: 0.0,
             from_bind: false,
         }
+    }
+
+    #[test]
+    fn a_list_id_is_logged_as_its_kind_only() {
+        for (list_id, kind) in [
+            ("RDAMVMddddddddddd", "RDAMVM"),
+            ("RDAMVMKFmLs1opNhs", "RDAMVM"),
+            ("RDCLAK5uy_abcdefg", "RDCLAK"),
+            ("PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf", "PL"),
+            ("OLAK5uy_mabcdefghij", "OLAK"),
+            ("VLPLrAXtmErZgOe", "VLPL"),
+            ("TLGGabcdefgh", "TLGG"),
+            ("", "none"),
+            ("lowercase", "none"),
+        ] {
+            assert_eq!(list_kind(list_id), kind, "{list_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_playlist_logs_the_list_kind_not_the_list_id() {
+        const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = PlaylistState::default();
+        let logs = crate::storage::test_util::LogCapture::start();
+        on_command_with(
+            &dial_state, set_playlist_d("ctt-new"), &mut playlist, &mut false, &mut connected(&["phone"]),
+            vec![("status", STATUS), ("status", STATUS)],
+        )
+        .await;
+        let text = logs.text();
+        let line = text.lines().find(|l| l.contains("[player] SetPlaylist")).expect("logged");
+        assert!(line.contains("list RDAMVM"), "{line}");
+        assert!(!text.contains("RDAMVMddddddddddd"), "{text}");
     }
 
     fn set_video_d(ctt: &str) -> lounge::PlayerCommand {
