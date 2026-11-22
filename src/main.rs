@@ -1210,9 +1210,13 @@ fn passed_over(playlist: &PlaylistState, from: usize, to: usize) -> String {
 }
 
 /// Whether the queue plays on when the last sender leaves: only a song
-/// that started (also paused), not the pre-roll or a stopped queue.
+/// that started (also paused) or awaits its sender's pick, not the pre-roll
+/// or a stopped queue.
 fn plays_on_without_sender(play_started: bool, playlist: &PlaylistState) -> bool {
-    play_started && !playlist.video_ids.is_empty() && !playlist.preroll.is_active()
+    // Waiting for a sender's pick after a throttled song: the queue goes on
+    // (see `advance_for_silent_sender`).
+    let going_on = play_started || playlist.sender_wait.is_some();
+    going_on && !playlist.video_ids.is_empty() && !playlist.preroll.is_active()
 }
 
 /// Forget the queue and every song's ctt and params (and the pins that
@@ -3428,6 +3432,58 @@ mod preroll_wiring_tests {
         assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 0), "the phone's pick, no skip of ours");
     }
 
+    #[test]
+    fn the_sender_has_15_s_to_pick() {
+        assert_eq!(SENDER_PICK_WAIT, std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn every_command_that_decides_what_plays_ends_the_wait_and_no_query_does() {
+        let picks = [
+            set_playlist_d("ctt-new"),
+            set_video_d("ctt-new"),
+            lounge::PlayerCommand::Next,
+            lounge::PlayerCommand::Previous,
+            lounge::PlayerCommand::Play,
+            lounge::PlayerCommand::Pause,
+            lounge::PlayerCommand::SeekTo { position: 1.0 },
+            lounge::PlayerCommand::Stop,
+            lounge::PlayerCommand::UpdatePlaylist { video_ids: strings(&["aaaaaaaaaaa"]), list_id: String::new(), current_index: None },
+        ];
+        for cmd in &picks {
+            assert!(picks_a_song(cmd), "{cmd:?}");
+        }
+        let others = [
+            lounge::PlayerCommand::GetVolume,
+            lounge::PlayerCommand::GetNowPlaying,
+            lounge::PlayerCommand::GetPlaylist,
+            lounge::PlayerCommand::SetVolume { volume: 10 },
+            connect(&["phone"]),
+            disconnect("phone"),
+            listed_on("m", &[], 0),
+        ];
+        for cmd in &others {
+            assert!(!picks_a_song(cmd), "{cmd:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_throttled_song_with_a_sender_waits_for_its_pick() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        // Unattended: skipped at once.
+        let mut playlist = queue_at(&dial_state, 0);
+        *dial_state.stream_failure.lock().unwrap() =
+            Some((current_video_id(&playlist), dial::StreamFailure::ThrottledWithoutCtt));
+        song_end(&dial_state, &mut playlist, &mut true, &mut departed(&["phone"]), playable, plays()).await;
+        assert_eq!(playlist.sender_wait, None);
+        // A song that ended as songs do, with a sender: the receiver advances.
+        let mut playlist = queue_at(&dial_state, 0);
+        song_end(&dial_state, &mut playlist, &mut true, &mut connected(&["phone"]), playable, plays()).await;
+        assert_eq!(playlist.sender_wait, None);
+        assert_eq!(playlist.current_index, 1);
+    }
+
     #[tokio::test]
     async fn queries_do_not_end_the_wait_for_the_senders_pick() {
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
@@ -3478,18 +3534,33 @@ mod preroll_wiring_tests {
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
         let active = std::sync::RwLock::new("m".to_owned());
-        let mut playlist = waiting_for_the_sender(&dial_state).await;
-        let mut play_started = false;
-        let mut senders = connected(&["phone"]);
-        let (seen, _) = on_command_resolving(
-            &active, &dial_state, disconnect("phone"), &mut playlist, &mut play_started, &mut senders, playable, plays(),
-        )
-        .await;
-        assert_eq!(seen.len(), 5, "the next song plays, the queue is not forgotten: {seen:?}");
-        assert!(play_started);
-        assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1));
-        assert_eq!(playlist.video_ids.len(), 3);
-        assert_eq!(playlist.sender_wait, None);
+        let leaves = [
+            ("its leave", disconnect("phone")),
+            ("a list of nobody", lounge::PlayerCommand::SendersListed { theme: "m".into(), device_ids: vec![], unidentified: 0 }),
+        ];
+        for (how, gone) in leaves {
+            let mut playlist = waiting_for_the_sender(&dial_state).await;
+            let mut play_started = false;
+            let mut senders = connected(&["phone"]);
+            let (seen, _) = on_command_resolving(
+                &active, &dial_state, gone, &mut playlist, &mut play_started, &mut senders, playable, plays(),
+            )
+            .await;
+            assert_eq!(seen.len(), 5, "{how}: the next song plays, the queue is not forgotten: {seen:?}");
+            assert!(play_started, "{how}");
+            assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1), "{how}");
+            assert_eq!(playlist.video_ids.len(), 3, "{how}");
+            assert_eq!(playlist.sender_wait, None, "{how}");
+            assert_eq!(senders.cast_ids(), strings(&["phone"]).as_slice(), "{how}: kept for /next and a return");
+
+            // The phone returns: no newcomer, its cast keeps its tokens.
+            {
+                let _lock = global_pins_lock();
+                playlist.tokens.remember("bbbbbbbbbbb", auth("ctt-b"));
+                remote_connected(&mut senders, &mut playlist, &dial_state, &active, "m", &strings(&["phone"]), None);
+            }
+            assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb"), auth("ctt-b"), "{how}");
+        }
     }
 
     #[tokio::test]
