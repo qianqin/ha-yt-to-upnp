@@ -1687,7 +1687,6 @@ mod tests {
         assert_eq!(stop_at(&[unlisted], Delivery::Poll), Some(0));
     }
 
-    /// The device and "nobody left" the dispatch of `messages` reports the user's end with.
     /// What the dispatch of `messages` reports the user's end with: the
     /// details' device, the batch's leaving senders, whether nobody is left.
     fn stopped_by(messages: &[IncomingMessage]) -> Option<(Option<String>, Vec<String>, bool)> {

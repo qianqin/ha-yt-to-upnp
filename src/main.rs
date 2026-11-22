@@ -3446,7 +3446,9 @@ mod preroll_wiring_tests {
         let before = tokio::time::Instant::now();
         song_end(dial_state, &mut playlist, &mut true, &mut connected(&["phone"]), playable, vec![]).await;
         let wait = playlist.sender_wait.expect("waiting for the sender");
-        assert!(wait >= before + SENDER_PICK_WAIT && wait <= tokio::time::Instant::now() + SENDER_PICK_WAIT);
+        // The sender has 15 s to pick.
+        let pick_wait = std::time::Duration::from_secs(15);
+        assert!(wait >= before + pick_wait && wait <= tokio::time::Instant::now() + pick_wait);
         playlist
     }
 
@@ -3471,11 +3473,6 @@ mod preroll_wiring_tests {
         assert_eq!(playlist.sender_wait, None);
         assert!(play_started);
         assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 0), "the phone's pick, no skip of ours");
-    }
-
-    #[test]
-    fn the_sender_has_15_s_to_pick() {
-        assert_eq!(SENDER_PICK_WAIT, std::time::Duration::from_secs(15));
     }
 
     #[test]
