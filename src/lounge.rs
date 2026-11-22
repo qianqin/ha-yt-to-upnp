@@ -117,9 +117,10 @@ pub enum PlayerCommand {
     /// `device_ids`: the senders' Lounge device ids, for /next's MDX context;
     /// `name`: the sender's name, which tells apart senders without an id.
     RemoteConnected { theme: String, device_ids: Vec<String>, name: Option<String> },
-    /// `by_user`: the loungeStatus with this leave says the user ended the
-    /// cast here (took it back to the phone), not that the phone just went.
-    RemoteDisconnected { theme: String, device_id: Option<String>, name: Option<String>, by_user: bool },
+    RemoteDisconnected { theme: String, device_id: Option<String>, name: Option<String> },
+    /// A loungeStatus says the user ended the cast here (took it back to the
+    /// phone): sent before the other commands of its batch.
+    StoppedByUser { theme: String },
     /// A loungeStatus: the senders connected now, `device_ids` for those with
     /// a readable id and `unidentified` for the others. Replaces the known ones.
     SendersListed { theme: String, device_ids: Vec<String>, unidentified: usize },
@@ -625,15 +626,11 @@ fn dispatch_messages(
     if from_bind && messages.iter().any(lists_nobody) {
         send_cmd(player_tx, PlayerCommand::SendersForgotten { theme: session.theme.clone() });
     }
-    // The leaves the user chose, by the loungeStatus that comes with them in
-    // the same batch (before or after the remoteDisconnected).
-    let by_user_leaves: Vec<Option<String>> = messages
-        .iter()
-        .filter(|msg| msg.command == "loungeStatus")
-        .filter_map(|msg| leave_details(&msg.args))
-        .filter(|details| details.behavior.as_deref() == Some(DISCONNECTED_BY_USER))
-        .map(|details| details.device_id)
-        .collect();
+    // The user ended the cast here: before the batch's lists and leaves, so
+    // no list of nobody lets the queue play on first.
+    if !from_bind && ended_by_user(&session.theme, messages) {
+        send_cmd(player_tx, PlayerCommand::StoppedByUser { theme: session.theme.clone() });
+    }
     // A sender counted since then in this response: a later list of nobody
     // must forget it again.
     let mut sender_event_seen = false;
@@ -681,19 +678,12 @@ fn dispatch_messages(
             "remoteDisconnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
                 tracing::info!("[lounge:{}] remote disconnected: {name}", session.theme);
-                let device_id = sender_id(&msg.args);
-                // A status naming another device is not this leave's.
-                let by_user = by_user_leaves.iter().any(|leaving| match (leaving, &device_id) {
-                    (Some(leaving), Some(id)) => leaving == id,
-                    _ => true,
-                });
                 send_cmd(
                     player_tx,
                     PlayerCommand::RemoteDisconnected {
                         theme: session.theme.clone(),
-                        device_id,
+                        device_id: sender_id(&msg.args),
                         name: msg.args.get("name").cloned(),
-                        by_user,
                     },
                 );
             }
@@ -824,6 +814,39 @@ fn leave_details(args: &HashMap<String, String>) -> Option<LeaveDetails> {
     };
     let text = |key: &str| details.get(key).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_owned);
     Some(LeaveDetails { device_id: text("deviceId"), behavior: text("disconnectBehavior") })
+}
+
+/// Whether a loungeStatus in `messages` says the user ended the cast on this
+/// receiver: its details say DISCONNECTED_BY_USER and the device they name
+/// is not one still listed (another device's leave). With nobody listed any
+/// more, or no list, no deviceId is needed; with senders still listed and no
+/// deviceId, who left is unknown and nothing stops.
+fn ended_by_user(theme: &str, messages: &[IncomingMessage]) -> bool {
+    let leaving_ids: Vec<String> = messages
+        .iter()
+        .filter(|msg| msg.command == "remoteDisconnected")
+        .filter_map(|msg| sender_id(&msg.args))
+        .collect();
+    messages.iter().filter(|msg| msg.command == "loungeStatus").any(|msg| {
+        let Some(details) = leave_details(&msg.args).filter(|d| d.behavior.as_deref() == Some(DISCONNECTED_BY_USER))
+        else {
+            return false;
+        };
+        let matched = match &details.device_id {
+            _ if leaving_ids.is_empty() => "no leave in the batch",
+            Some(id) if leaving_ids.contains(id) => "yes",
+            Some(_) => "no",
+            None => "no deviceId",
+        };
+        tracing::debug!("[lounge:{theme}] disconnected by the user; deviceId matches the leaving sender: {matched}");
+        let still_listed = msg.args.get("devices").map(|d| remote_senders(d));
+        match (still_listed, &details.device_id) {
+            (None, _) => true,
+            (Some((ids, unidentified)), _) if ids.is_empty() && unidentified == 0 => true,
+            (Some((ids, _)), Some(id)) => !ids.contains(id),
+            (Some(_), None) => false,
+        }
+    })
 }
 
 /// An enum value from YouTube as it can be logged: only an enum-like name.
@@ -1607,49 +1630,98 @@ mod tests {
 
     const BY_USER: &str = "MDX_SESSION_DISCONNECT_BEHAVIOR_DISCONNECTED_BY_USER";
 
-    /// A loungeStatus as it comes with a sender's leave.
-    fn status_with_details(details: &str) -> IncomingMessage {
-        incoming("loungeStatus", &[("devices", "[]"), ("connectionEventDetails", details)])
+    // Lounge device ids have the 36-character UUID form in both places.
+    const IPAD: &str = "a1b2c3d4-0000-1111-2222-333344445555";
+    const PHONE: &str = "f0e1d2c3-9999-8888-7777-666655554444";
+
+    /// A loungeStatus listing `remotes` (as REMOTE_CONTROL senders), with `details`.
+    fn status_with(remotes: &[&str], details: &str) -> IncomingMessage {
+        let mut devices = vec![r#"{"id":"screen-self","type":"LOUNGE_SCREEN"}"#.to_owned()];
+        devices.extend(remotes.iter().map(|id| format!(r#"{{"id":"{id}","type":"REMOTE_CONTROL"}}"#)));
+        incoming(
+            "loungeStatus",
+            &[("devices", &format!("[{}]", devices.join(","))), ("connectionEventDetails", details)],
+        )
     }
 
-    /// Whether each RemoteDisconnected the dispatch of `messages` sends is a leave by the user.
-    fn leaves(messages: &[IncomingMessage]) -> Vec<bool> {
-        commands_for(messages, Delivery::Poll)
-            .into_iter()
-            .filter_map(|cmd| match cmd {
-                PlayerCommand::RemoteDisconnected { by_user, .. } => Some(by_user),
-                _ => None,
-            })
-            .collect()
+    fn by_user_for(id: &str) -> String {
+        format!(r#"{{"deviceId":"{id}","disconnectBehavior":"{BY_USER}"}}"#)
+    }
+
+    fn ipad_leaves() -> IncomingMessage {
+        incoming("remoteDisconnected", &[("id", IPAD), ("name", "iPad")])
+    }
+
+    /// Where in the dispatch of `messages` the player is told to stop, if at all.
+    fn stop_at(messages: &[IncomingMessage], delivery: Delivery) -> Option<usize> {
+        let commands = commands_for(messages, delivery);
+        let stops: Vec<usize> = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, cmd)| matches!(cmd, PlayerCommand::StoppedByUser { theme } if theme == "m"))
+            .map(|(at, _)| at)
+            .collect();
+        assert!(stops.len() <= 1, "{commands:?}");
+        stops.first().copied()
     }
 
     #[test]
-    fn a_leave_the_user_chose_is_marked_whether_its_status_comes_before_or_after() {
-        let leave = incoming("remoteDisconnected", &[("id", "phone"), ("name", "Phone")]);
-        let details = format!(r#"{{"deviceId":"phone","disconnectBehavior":"{BY_USER}"}}"#);
-        assert_eq!(leaves(&[leave.clone(), status_with_details(&details)]), [true]);
-        assert_eq!(leaves(&[status_with_details(&details), leave.clone()]), [true]);
-        // Without a deviceId the status still names the leave in its batch.
+    fn the_user_ending_the_cast_stops_it_before_the_batchs_other_commands() {
+        // As live: the status (the iPad no longer listed) before the iPad's leave.
+        let live = [status_with(&[], &by_user_for(IPAD)), ipad_leaves()];
+        assert_eq!(stop_at(&live, Delivery::Poll), Some(0));
+        let reversed = [ipad_leaves(), status_with(&[], &by_user_for(IPAD))];
+        assert_eq!(stop_at(&reversed, Delivery::Poll), Some(0));
+        // Nobody listed any more: no deviceId needed, nor a leave in the batch.
         let details = format!(r#"{{"disconnectBehavior":"{BY_USER}"}}"#);
-        assert_eq!(leaves(&[leave, status_with_details(&details)]), [true]);
+        assert_eq!(stop_at(&[status_with(&[], &details)], Delivery::Poll), Some(0));
+        // The leaving device is not among those still listed.
+        assert_eq!(stop_at(&[status_with(&[PHONE], &by_user_for(IPAD)), ipad_leaves()], Delivery::Poll), Some(0));
+        // A status without a device list.
+        let unlisted = incoming("loungeStatus", &[("connectionEventDetails", &by_user_for(IPAD))]);
+        assert_eq!(stop_at(&[unlisted], Delivery::Poll), Some(0));
     }
 
     #[test]
-    fn a_leave_without_the_users_choice_is_not_marked() {
-        let leave = || incoming("remoteDisconnected", &[("id", "phone"), ("name", "Phone")]);
-        let by_user_for = |id: &str| format!(r#"{{"deviceId":"{id}","disconnectBehavior":"{BY_USER}"}}"#);
-        for batch in [
-            vec![leave()],
-            vec![leave(), status_with_details(r#"{"deviceId":"phone"}"#)],
-            vec![leave(), status_with_details(r#"{"deviceId":"phone","disconnectBehavior":"MDX_SESSION_DISCONNECT_BEHAVIOR_SOMETHING_ELSE"}"#)],
-            vec![leave(), status_with_details("not json")],
-            vec![leave(), status_with_details(r#"["MDX_SESSION_DISCONNECT_BEHAVIOR_DISCONNECTED_BY_USER"]"#)],
-            vec![leave(), status_with_details(&by_user_for("another-phone"))],
-            // The user's choice in another batch is not this leave's.
+    fn other_leaves_do_not_stop_the_cast() {
+        for (name, batch) in [
+            ("no details", vec![status_with(&[], "{}"), ipad_leaves()]),
+            ("no behavior", vec![status_with(&[], &format!(r#"{{"deviceId":"{IPAD}"}}"#)), ipad_leaves()]),
+            (
+                "another behavior",
+                vec![
+                    status_with(&[], &format!(r#"{{"deviceId":"{IPAD}","disconnectBehavior":"MDX_SESSION_DISCONNECT_BEHAVIOR_SOMETHING_ELSE"}}"#)),
+                    ipad_leaves(),
+                ],
+            ),
+            ("no JSON", vec![status_with(&[], "not json"), ipad_leaves()]),
+            ("no JSON object", vec![status_with(&[], &format!(r#"["{BY_USER}"]"#)), ipad_leaves()]),
+            ("a leave alone", vec![ipad_leaves()]),
+            // The device the details name is still listed: another one left.
+            ("named device still listed", vec![status_with(&[PHONE], &by_user_for(PHONE)), ipad_leaves()]),
+            // Several still listed and no deviceId: who left is unknown.
+            (
+                "no deviceId, others listed",
+                vec![status_with(&[PHONE], &format!(r#"{{"disconnectBehavior":"{BY_USER}"}}"#)), ipad_leaves()],
+            ),
         ] {
-            assert_eq!(leaves(&batch), [false], "{batch:?}");
+            assert_eq!(stop_at(&batch, Delivery::Poll), None, "{name}");
         }
-        assert_eq!(leaves(&[status_with_details(&by_user_for("phone"))]), Vec::<bool>::new());
+        // A bind response replays an earlier status: no news of a leave now.
+        assert_eq!(stop_at(&[status_with(&[], &by_user_for(IPAD)), ipad_leaves()], Delivery::Bind), None);
+    }
+
+    #[test]
+    fn whether_the_details_name_the_leaving_sender_is_logged_at_debug() {
+        let logs = crate::storage::test_util::LogCapture::start();
+        commands_for(&[status_with(&[], &by_user_for(IPAD)), ipad_leaves()], Delivery::Poll);
+        commands_for(&[status_with(&[], &by_user_for(PHONE)), ipad_leaves()], Delivery::Poll);
+        commands_for(&[status_with(&[], &by_user_for(IPAD))], Delivery::Poll);
+        let text = logs.text();
+        for matched in ["yes", "no", "no leave in the batch"] {
+            assert!(text.contains(&format!("deviceId matches the leaving sender: {matched}")), "{matched}: {text}");
+        }
+        assert!(!text.contains(IPAD) && !text.contains(PHONE), "{text}");
     }
 
     #[test]
@@ -1666,7 +1738,7 @@ mod tests {
         commands_for(
             &[
                 incoming("remoteDisconnected", &[("id", "phone-id-1"), ("name", "Phone")]),
-                status_with_details(&format!(r#"{{"deviceId":"phone-id-1","disconnectBehavior":"{other}"}}"#)),
+                status_with(&[], &format!(r#"{{"deviceId":"phone-id-1","disconnectBehavior":"{other}"}}"#)),
             ],
             Delivery::Poll,
         );

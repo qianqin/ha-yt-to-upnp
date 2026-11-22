@@ -610,7 +610,7 @@ async fn on_command<R, Fut>(
     use lounge::PlayerCommand;
     // The user took the cast back to the phone: end it as Stop would.
     let taken_back = matches!(&cmd,
-        PlayerCommand::RemoteDisconnected { theme, by_user: true, .. } if *active_theme.read().unwrap() == *theme);
+        PlayerCommand::StoppedByUser { theme } if *active_theme.read().unwrap() == *theme);
     let last_left = match &cmd {
         PlayerCommand::RemoteConnected { theme, device_ids, name } => {
             tracing::info!(
@@ -624,7 +624,9 @@ async fn on_command<R, Fut>(
             .await;
             return;
         }
-        PlayerCommand::RemoteDisconnected { theme, device_id, name, .. } => remote_disconnected(
+        // Another theme's: nothing here.
+        PlayerCommand::StoppedByUser { .. } => taken_back,
+        PlayerCommand::RemoteDisconnected { theme, device_id, name } => remote_disconnected(
             senders, active_theme, theme, device_id.as_deref(), name.as_deref(), *play_started, playlist,
         ),
         PlayerCommand::SendersListed { theme, device_ids, unidentified } => senders_listed(
@@ -893,7 +895,9 @@ where
             }
         }
 
-        PlayerCommand::RemoteConnected { .. } | PlayerCommand::SendersForgotten { .. } => {
+        PlayerCommand::RemoteConnected { .. }
+        | PlayerCommand::SendersForgotten { .. }
+        | PlayerCommand::StoppedByUser { .. } => {
             // Handled in on_command
         }
 
@@ -2584,7 +2588,7 @@ mod preroll_wiring_tests {
         // No MPD command at all: the song plays on.
         let (seen, sent) = command_locked(
             &dial_state,
-            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None, by_user: false },
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None },
             &mut playlist,
             &mut play_started,
             vec![],
@@ -3709,47 +3713,47 @@ mod preroll_wiring_tests {
         assert!(!text.contains("RDAMVMddddddddddd"), "{text}");
     }
 
-    fn taken_back(theme: &str, id: &str) -> lounge::PlayerCommand {
-        lounge::PlayerCommand::RemoteDisconnected {
-            theme: theme.into(),
-            device_id: Some(id.into()),
-            name: None,
-            by_user: true,
-        }
-    }
-
     #[tokio::test]
-    async fn a_sender_taking_the_cast_back_stops_it_like_stop() {
+    async fn the_user_taking_the_cast_back_stops_it_like_stop_in_the_live_order() {
         const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
-        for (connected_before, still) in [(&["phone"][..], &[][..]), (&["phone", "ipad"][..], &["ipad"][..])] {
+        for (connected_before, still) in [(&["ipad"][..], &[][..]), (&["ipad", "phone"][..], &["phone"][..])] {
             let mut playlist = queue_at(&dial_state, 1);
             let mut play_started = true;
             let mut senders = connected(connected_before);
-            let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
-            let (seen, _) =
-                on_command_with(&dial_state, taken_back("m", "phone"), &mut playlist, &mut play_started, &mut senders, script)
-                    .await;
-            assert_eq!(seen, ["stop", "clear", "status"], "{connected_before:?}");
+            // As the Lounge layer sends them for the live batch
+            // [loungeStatus(iPad no longer listed, DISCONNECTED_BY_USER), remoteDisconnected(iPad)].
+            let still_listed = strings(still);
+            let batch = [
+                lounge::PlayerCommand::StoppedByUser { theme: "m".into() },
+                lounge::PlayerCommand::SendersListed { theme: "m".into(), device_ids: still_listed, unidentified: 0 },
+                disconnect("ipad"),
+            ];
+            let mut seen = Vec::new();
+            for cmd in batch {
+                let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
+                let (commands, _) =
+                    on_command_with(&dial_state, cmd, &mut playlist, &mut play_started, &mut senders, script).await;
+                seen.extend(commands);
+            }
+            assert_eq!(seen[..3], ["stop", "clear", "status"], "{connected_before:?}: {seen:?}");
             assert!(!play_started);
             assert!(playlist.video_ids.is_empty());
             assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), cast_tokens::VideoAuth::default());
             assert_eq!(*dial_state.ctt.read().unwrap(), None);
-            assert_eq!(senders.cast_ids(), strings(still).as_slice(), "{connected_before:?}");
         }
     }
 
     #[tokio::test]
-    async fn a_sender_taking_back_another_themes_cast_changes_nothing() {
+    async fn the_user_ending_another_themes_cast_changes_nothing() {
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
         let mut playlist = queue_at(&dial_state, 1);
         let mut play_started = true;
         let mut senders = connected(&["phone"]);
-        let (seen, _) =
-            on_command_with(&dial_state, taken_back("cl", "phone"), &mut playlist, &mut play_started, &mut senders, vec![])
-                .await;
+        let cmd = lounge::PlayerCommand::StoppedByUser { theme: "cl".into() };
+        let (seen, _) = on_command_with(&dial_state, cmd, &mut playlist, &mut play_started, &mut senders, vec![]).await;
         assert!(seen.is_empty(), "{seen:?}");
         assert!(play_started);
         assert_eq!(playlist.video_ids.len(), 3);
@@ -3977,7 +3981,7 @@ mod preroll_wiring_tests {
     }
 
     fn disconnect(id: &str) -> lounge::PlayerCommand {
-        lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: Some(id.into()), name: None, by_user: false }
+        lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: Some(id.into()), name: None }
     }
 
     #[tokio::test]
@@ -4140,7 +4144,7 @@ mod preroll_wiring_tests {
         playlist.tokens.remember("mainpin0009", auth("ctt-next"));
 
         handle_command(
-            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None, by_user: false },
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None },
             &mut mpd, &state_tx, &mut playlist, &mut false, &dial_state,
             &|vid: String, _: Option<String>, _: Option<String>| {
                 let result = no_stream(&vid);
@@ -4453,7 +4457,7 @@ mod preroll_wiring_tests {
     async fn remote_disconnect_ends_the_pre_roll() {
         let mut playlist = pre_rolling();
         let (seen, _) = command(
-            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None, by_user: false },
+            lounge::PlayerCommand::RemoteDisconnected { theme: "m".into(), device_id: None, name: None },
             &mut playlist,
             &mut false,
             vec![("stop", "OK\n"), ("clear", "OK\n")],
