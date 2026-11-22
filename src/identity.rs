@@ -100,7 +100,13 @@ impl Health {
         }
         self.renewal_due = false;
         let casts = std::mem::take(&mut self.autoplay_only_in_row);
-        if last_auto.is_some_and(|last| now.saturating_sub(last) < AUTO_RENEWAL_INTERVAL_S) {
+        let last_auto = last_auto.filter(|&last| {
+            if last > now {
+                tracing::warn!("[identity] the last renewal's time is in the future (the clock was set back); ignored");
+            }
+            last <= now
+        });
+        if last_auto.is_some_and(|last| now - last < AUTO_RENEWAL_INTERVAL_S) {
             tracing::warn!(
                 "[identity] YouTube answers /next with autoplay only for {casts} casts in a row; the identity was renewed less than 24 h ago, so it stays"
             );
@@ -112,6 +118,7 @@ impl Health {
 
     /// Whether a taken renewal is still wanted: an answer naming the queue's
     /// next song since makes it moot.
+    #[cfg(test)]
     pub fn renewal_wanted(&self) -> bool {
         self.renewing
     }
@@ -303,6 +310,28 @@ mod tests {
     }
 
     #[test]
+    fn casts_counted_while_busy_are_forgotten_once_youtube_answers_well_again() {
+        let mut health = Health::default();
+        for _ in 0..AUTOPLAY_ONLY_CASTS {
+            cast(&mut health, NextSource::MdxAutoplay, None);
+            assert_eq!(health.take_renewal(false, None, NOW), None, "busy");
+        }
+        health.next_answered(NextSource::NextVideoRenderer, Some(1), true);
+        assert_eq!(health.take_renewal(true, None, NOW), None);
+    }
+
+    #[test]
+    fn a_last_renewal_time_in_the_future_does_not_block_renewals() {
+        let mut health = Health::default();
+        for _ in 0..AUTOPLAY_ONLY_CASTS {
+            cast(&mut health, NextSource::MdxAutoplay, None);
+        }
+        let logs = crate::storage::test_util::LogCapture::start();
+        assert_eq!(health.take_renewal(true, Some(NOW + 3600), NOW), Some(3), "a clock set back since");
+        assert!(logs.text().contains("in the future"), "{}", logs.text());
+    }
+
+    #[test]
     fn a_prepared_identity_is_dropped_once_youtube_answers_well_again() {
         let renewal = || (config(), 3);
         let mut health = Health::default();
@@ -402,7 +431,8 @@ mod tests {
 
     #[test]
     fn only_a_set_generation_other_than_the_stored_one_renews() {
-        let mut config = Config { identity_generation: 0, ..config() };
+        // A renewal made just now does not hold off the option.
+        let mut config = Config { identity_generation: 0, last_auto_renewal: Some(NOW), ..config() };
         let mut renews = |option: Option<&str>| {
             wanted_generation(option).is_some_and(|wanted| apply_identity_generation(&mut config, wanted))
         };

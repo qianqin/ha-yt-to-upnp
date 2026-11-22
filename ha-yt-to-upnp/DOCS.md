@@ -79,7 +79,7 @@ repository.
 | `start_gate_seconds` | no | 0-60, default 15. How long the song is held at its start while the speaker wakes; `0` turns it off. |
 | `stuck_seconds` | no | 1-300, default 15. How long the speaker may hang while buffering before it is restarted. |
 | `max_volume` | no | 1-100, default 50. The speaker's volume at 100 % on the phone; the phone's volume is scaled linearly to 0..`max_volume` and never sets the speaker louder. See [Volume](#volume). |
-| `identity_generation` | no | A whole number, unset by default. Set it, or change it (for example add 1), and restart the app to give the receiver a new identity once; phones must then pick the speaker again. Clearing it changes nothing. See [Receiver identity](#receiver-identity). |
+| `identity_generation` | no | A whole number, unset by default. Set it to a number other than the current one (0 at first; for example 1, later 2) and restart the app to give the receiver a new identity once; phones must then pick the speaker again. Clearing it changes nothing. See [Receiver identity](#receiver-identity). |
 | `stream_format` | yes | `flac` (default) or `mp3`: the format of the stream the speaker plays, see [Stream format](#stream-format). |
 | `log_level` | yes | `debug`, `info` (default), `warning` or `error`, for the receiver and the adapter. |
 
@@ -153,10 +153,10 @@ YouTube answers /next with autoplay only for 3 casts in a row; new receiver
 identity (the phone must pick the speaker again)`. The speaker then shows up
 in the cast menu as a new device: pick it again.
 
-To force a new identity, set `identity_generation` (or change it to a number
-it did not have before) and restart the app; the receiver makes a new
-identity once and keeps it. There is no need to set the number back, and
-clearing it changes nothing.
+To force a new identity, set `identity_generation` to a number other than
+the current one (0 at first, so 1; the next time 2) and restart the app; the
+receiver makes a new identity once and keeps it. There is no need to set the
+number back, and clearing it changes nothing.
 
 ### Finding the Raumfeld host
 

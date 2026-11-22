@@ -411,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     loop {
         // A due new identity: made in the background, presented when idle.
-        if let Some(casts) = health.take_renewal(is_idle(&playlist, play_started), config.last_auto_renewal, unix_now()) {
+        if let Some(casts) = due_renewal(&mut health, &playlist, play_started, &config, unix_now()) {
             let (current, http, tx) = (config.clone(), http_client.clone(), renewed_tx.clone());
             tokio::spawn(async move {
                 let renewed = identity::renewed(current, || async {
@@ -1691,6 +1691,18 @@ fn adopt_identity(
 ) -> config::Config {
     senders.clear();
     identity::publish(renewed, autoplay_only_casts, now, save, identity)
+}
+
+/// A renewal of the identity due now: when idle, and not within a day of
+/// the last automatic one (stored with the identity).
+fn due_renewal(
+    health: &mut identity::Health,
+    playlist: &PlaylistState,
+    play_started: bool,
+    config: &config::Config,
+    now: u64,
+) -> Option<u32> {
+    health.take_renewal(is_idle(playlist, play_started), config.last_auto_renewal, now)
 }
 
 /// Unix seconds now (the identity renewal's once-a-day cap).
@@ -3171,6 +3183,28 @@ mod preroll_wiring_tests {
             Some(3),
             "with a list they do"
         );
+    }
+
+    #[test]
+    fn a_due_renewal_waits_for_idle_and_a_day_after_the_stored_last_one() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        const NOW: u64 = 2_000_000_000;
+        let due = |last: Option<u64>, playlist: &PlaylistState| {
+            let mut health = identity::Health::default();
+            for _ in 0..identity::AUTOPLAY_ONLY_CASTS {
+                health.cast_started(2, true);
+                health.next_answered(watch_next::NextSource::MdxAutoplay, None, true);
+            }
+            let config = config::Config { last_auto_renewal: last, ..Default::default() };
+            due_renewal(&mut health, playlist, false, &config, NOW)
+        };
+        let idle = PlaylistState::default();
+        assert_eq!(due(None, &idle), Some(3));
+        assert_eq!(due(Some(NOW - 60), &idle), None, "the stored stamp is passed");
+        assert_eq!(due(Some(NOW - 2 * 24 * 3600), &idle), Some(3));
+        assert_eq!(due(None, &cast_queue(&dial_state)), None, "not idle");
     }
 
     #[test]
@@ -5012,6 +5046,21 @@ mod log_hygiene_tests {
         ] {
             assert!(!src.contains(needle), "secret-logging format string found: {needle}");
         }
+    }
+
+    #[test]
+    fn no_log_line_carries_the_receivers_ids() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find(concat!("#[cfg", "(test)]")).unwrap()];
+        let mut calls = 0;
+        for (at, _) in code.match_indices("tracing::") {
+            let call = &code[at..at + code[at..].find(");").unwrap()];
+            calls += 1;
+            for id in [".uuid", "screen_id_m", "config.screen_id", "identity.borrow"] {
+                assert!(!call.contains(id), "a log call with {id}: {call}");
+            }
+        }
+        assert!(calls > 50, "the scan found the log calls ({calls})");
     }
 }
 

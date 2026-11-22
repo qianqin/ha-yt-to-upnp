@@ -42,9 +42,9 @@ configuration:
   identity_generation:
     name: Identity generation
     description: >-
-      Set or change this number (for example add 1) to give the receiver a
-      new identity at the next start; phones must then pick the speaker
-      again. Clearing it changes nothing. Only needed if songs after the
+      Set it to a number other than the current one (0 at first, so 1; the
+      next time 2) to give the receiver a new identity at the next start;
+      phones must then pick the speaker again. Clearing it changes nothing. Only needed if songs after the
       first keep stopping after about a minute.
   stream_format:
     name: Stream format
