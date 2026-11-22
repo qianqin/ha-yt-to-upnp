@@ -651,6 +651,52 @@ async fn solve_nsig(
     solve_nsig_with(server_url, session, decode_nsig).await
 }
 
+/// Prepare the nsig solver for the session's base.js in the background, so
+/// the first song does not wait for a cold parse (~11 s on HA) while MPD
+/// waits for its stream. It runs under the solver permit like every solve,
+/// so memory stays bounded to one solver at a time; a song's solve waits for
+/// it and then finds the preprocessed player.
+pub fn spawn_nsig_prewarm(session: std::sync::Arc<crate::music_session::YtMusicSession>) {
+    tokio::spawn(async move {
+        prewarm_nsig_with(&session, crate::nsig::prewarm, crate::nsig::is_prepared).await;
+    });
+}
+
+/// The prewarm entry point (`nsig::prewarm`; a fake in tests).
+type NsigPrewarm = fn(&str, &str) -> Result<(), String>;
+
+/// [`spawn_nsig_prewarm`]'s work: true if base.js was prepared now, false
+/// if there is none or it already was (`prepared`).
+async fn prewarm_nsig_with(
+    session: &crate::music_session::YtMusicSession,
+    prewarm: NsigPrewarm,
+    prepared: fn(&str) -> bool,
+) -> bool {
+    let (Some(js), Some(hash)) = (session.player_js.clone(), session.player_hash.clone()) else {
+        return false;
+    };
+    if prepared(&hash) {
+        tracing::info!("[nsig] base.js {hash} is preprocessed already");
+        return false;
+    }
+    tracing::info!("[nsig] preparing base.js {hash} in the background");
+    let Ok(permit) = solver_permit().await else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let done = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        prewarm(&js, &hash)
+    })
+    .await;
+    match done {
+        Ok(Ok(())) => tracing::info!("[nsig] base.js prepared in {:.1} s", started.elapsed().as_secs_f64()),
+        Ok(Err(e)) => tracing::warn!("[nsig] preparing base.js failed: {}; the first song parses it", e),
+        Err(e) => tracing::warn!("[nsig] preparing base.js did not finish: {}", e),
+    }
+    true
+}
+
 /// The nsig solver entry point (`decode_nsig`; a fake in tests).
 type NsigSolver = fn(&str, &str, &str) -> Result<String, SabrError>;
 
@@ -3753,6 +3799,52 @@ mod tests {
         source.resolve(&trusted_format()).await.unwrap();
 
         assert!(!NSIG_PROBE.overlapped(), "permit released on a cancelled nsig solve");
+    }
+
+    /// The hashes `recording_prewarm` was asked to prepare.
+    static PREWARMED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn recording_prewarm(_js: &str, hash: &str) -> Result<(), String> {
+        PREWARMED.lock().unwrap().push(hash.to_owned());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_player_is_prepared_once_in_the_background() {
+        let _lock = nsig_probe_lock();
+        PREWARMED.lock().unwrap().clear();
+        let session = crate::music_session::test_fixtures::session();
+
+        assert!(prewarm_nsig_with(&session, recording_prewarm, |_| false).await);
+        assert_eq!(*PREWARMED.lock().unwrap(), ["4e67f8a0"]);
+
+        // Already prepared (memory or disk cache), or no base.js: nothing to do.
+        assert!(!prewarm_nsig_with(&session, recording_prewarm, |_| true).await);
+        let without_js = crate::music_session::YtMusicSession { player_js: None, ..session };
+        assert!(!prewarm_nsig_with(&without_js, recording_prewarm, |_| false).await);
+        assert_eq!(PREWARMED.lock().unwrap().len(), 1);
+    }
+
+    fn probing_prewarm(_js: &str, _hash: &str) -> Result<(), String> {
+        NSIG_PROBE.run();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_runs_under_the_solver_permit() {
+        let _lock = nsig_probe_lock();
+        let session = crate::music_session::test_fixtures::session();
+        let source = probing_source(&NSIG_PROBE, false);
+
+        let format = trusted_format();
+        let (prewarmed, premium) = tokio::join!(
+            prewarm_nsig_with(&session, probing_prewarm, |_| false),
+            source.resolve(&format),
+        );
+
+        assert!(prewarmed);
+        assert!(premium.is_ok());
+        assert!(!NSIG_PROBE.overlapped(), "the prewarm and a Premium decipher overlapped");
     }
 
     /// The two nsig tests share `NSIG_PROBE` (a plain fn solver cannot carry

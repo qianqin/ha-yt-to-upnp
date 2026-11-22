@@ -124,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let yt_session = match music_session::fetch_music_session().await {
         Some(session) => {
             tracing::info!("[init] YouTube Music session extracted (anonymous)");
-            Some(Arc::new(session))
+            let session = Arc::new(session);
+            // base.js is parsed now, not while the first song waits for it.
+            sabr::stream::spawn_nsig_prewarm(session.clone());
+            Some(session)
         }
         None => {
             tracing::warn!("[init] No YouTube Music session — WEB_REMIX + ctt is off until restart; every cast uses the IOS client");
@@ -372,6 +375,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let resolve = |video_id: String, ctt: Option<String>, list_id: Option<String>| async move {
         innertube::resolve_stream(&video_id, ctt.as_deref(), list_id.as_deref(), yt).await
     };
+    let ask_next = {
+        let (session, tx) = (innertube_session.clone(), prefetch_tx.clone());
+        move |job: PrefetchJob, sender_ids: &[String]| {
+            if let Some(session) = session.as_ref() {
+                spawn_prefetch(job, session.clone(), sender_ids.to_vec(), tx.clone());
+            }
+        }
+    };
 
     loop {
         // Once a song plays with its own ctt, ask /next for the next one's.
@@ -395,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 on_command(
                     cmd, &mut mpd_client, &state_tx, &mut playlist, &mut play_started, &mut senders, &dial_state,
-                    &active_theme, &resolve,
+                    &active_theme, &resolve, &ask_next,
                 ).await;
             }
 
@@ -447,9 +458,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if plan.check_song_end {
                     if let Ok(status) = mpd_client.status().await {
                         if song_ended(&status) {
+                            apply_pending_prefetches(&mut prefetch_rx, &mut playlist);
                             on_song_end(
                                 &mut mpd_client, &state_tx, &mut playlist, &mut play_started, &mut senders, &dial_state,
-                                &resolve,
+                                &resolve, &ask_next,
                             ).await;
                         }
                     }
@@ -545,6 +557,7 @@ async fn on_command<R, Fut>(
     dial_state: &dial::DialState,
     active_theme: &std::sync::RwLock<String>,
     resolve: &R,
+    ask_next: &AskNext,
 ) where
     R: Fn(String, Option<String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
@@ -604,7 +617,10 @@ async fn on_command<R, Fut>(
         return;
     }
     let ends_cast = matches!(cmd, PlayerCommand::Stop);
-    if let Err(e) = handle_command(cmd, mpd, state_tx, playlist, play_started, dial_state, resolve).await {
+    let sender_ids = senders.cast_ids().to_vec();
+    if let Err(e) =
+        handle_command(cmd, mpd, state_tx, playlist, play_started, dial_state, resolve, ask_next, &sender_ids).await
+    {
         tracing::error!("[player] Error handling command: {}", e);
     }
     if ends_cast {
@@ -621,12 +637,15 @@ async fn handle_command<R, Fut>(
     play_started: &mut bool,
     dial_state: &dial::DialState,
     resolve: &R,
+    ask_next: &AskNext,
+    sender_ids: &[String],
 ) -> CmdResult
 where
     R: Fn(String, Option<String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
 {
     use lounge::PlayerCommand;
+    let early = |playlist: &mut PlaylistState| ask_next_early(playlist, ask_next, sender_ids);
 
     match cmd {
         PlayerCommand::SetPlaylist {
@@ -651,7 +670,7 @@ where
             adopt_playlist(playlist, dial_state, &video_id, video_ids, index, list_id, auth);
 
             *play_started = false;
-            *play_started = play_video_with(mpd, state_tx, playlist, &video_id, current_time, resolve).await?;
+            *play_started = play_video_with(mpd, state_tx, playlist, &video_id, current_time, early, resolve).await?;
         }
 
         PlayerCommand::SetVideo {
@@ -665,7 +684,7 @@ where
             adopt_video(playlist, dial_state, &video_id, ctt);
 
             *play_started = false;
-            *play_started = play_video_with(mpd, state_tx, playlist, &video_id, current_time, resolve).await?;
+            *play_started = play_video_with(mpd, state_tx, playlist, &video_id, current_time, early, resolve).await?;
         }
 
         // The silence is no song: resuming, pausing or seeking it would make
@@ -805,7 +824,7 @@ where
             if playlist.current_index > 0 {
                 let video_id = user_step(playlist, dial_state, playlist.current_index - 1, "Previous");
                 *play_started = false;
-                *play_started = play_video_with(mpd, state_tx, playlist, &video_id, 0.0, resolve).await?;
+                *play_started = play_video_with(mpd, state_tx, playlist, &video_id, 0.0, early, resolve).await?;
             } else {
                 tracing::info!("[player] Previous: already at start");
             }
@@ -815,7 +834,7 @@ where
             if playlist.current_index + 1 < playlist.video_ids.len() {
                 let video_id = user_step(playlist, dial_state, playlist.current_index + 1, "Next");
                 *play_started = false;
-                *play_started = play_video_with(mpd, state_tx, playlist, &video_id, 0.0, resolve).await?;
+                *play_started = play_video_with(mpd, state_tx, playlist, &video_id, 0.0, early, resolve).await?;
             } else {
                 tracing::info!("[player] Next: end of playlist");
                 *play_started = false;
@@ -884,6 +903,7 @@ async fn on_song_end<R, Fut>(
     senders: &mut senders::Senders,
     dial_state: &dial::DialState,
     resolve: R,
+    ask_next: &AskNext,
 ) where
     R: Fn(String, Option<String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
@@ -965,7 +985,9 @@ async fn on_song_end<R, Fut>(
             );
         }
         let video_id = adopt_index(playlist, dial_state, next, why);
-        failure = match play_video_with(mpd, state_tx, playlist, &video_id, 0.0, &resolve).await {
+        let sender_ids = senders.cast_ids().to_vec();
+        let early = |playlist: &mut PlaylistState| ask_next_early(playlist, ask_next, &sender_ids);
+        failure = match play_video_with(mpd, state_tx, playlist, &video_id, 0.0, early, &resolve).await {
             Ok(true) => {
                 *play_started = true;
                 return;
@@ -1415,11 +1437,30 @@ enum PrefetchVerdict {
 }
 
 /// /next is asked once per song, while a song plays with its own ctt and the
-/// queue has a next video whose ctt is not known yet.
+/// queue has a next video whose ctt is not known yet. Usually already asked
+/// when the song started (`ask_next_early`).
 fn prefetch_job(playlist: &mut PlaylistState, play_started: bool) -> Option<PrefetchJob> {
     if !play_started || playlist.preroll.is_active() {
         return None;
     }
+    next_job(playlist)
+}
+
+/// Sends a /next request for a song and the sender ids for its MDX context.
+type AskNext = dyn Fn(PrefetchJob, &[String]);
+
+/// Ask /next for the song about to play right away, not once MPD has started
+/// it: MPD's play waits for the stream, which can wait ~11 s for a cold nsig
+/// solve, and an answer arriving after the song changed is dropped.
+fn ask_next_early(playlist: &mut PlaylistState, ask_next: &AskNext, sender_ids: &[String]) {
+    if let Some(job) = next_job(playlist) {
+        ask_next(job, sender_ids);
+    }
+}
+
+/// The /next request for the current song, once per song: it has its own
+/// ctt and the queue a next video whose ctt is not known yet.
+fn next_job(playlist: &mut PlaylistState) -> Option<PrefetchJob> {
     let video_id = current_video_id(playlist);
     let expected_next = playlist.video_ids.get(playlist.current_index + 1)?.clone();
     let auth = playlist.tokens.auth_for(&video_id);
@@ -1438,6 +1479,20 @@ fn prefetch_job(playlist: &mut PlaylistState, play_started: bool) -> Option<Pref
         index: playlist.current_index,
         ctt,
     })
+}
+
+/// Apply the /next answers already waiting (they can arrive while MPD's play
+/// blocks the player loop), so a song end handled next sees them.
+fn apply_pending_prefetches(
+    rx: &mut tokio::sync::mpsc::Receiver<PrefetchResult>,
+    playlist: &mut PlaylistState,
+) -> usize {
+    let mut applied = 0;
+    while let Ok(result) = rx.try_recv() {
+        apply_prefetch(playlist, result);
+        applied += 1;
+    }
+    applied
 }
 
 /// Run the /next request off the player loop; the answer comes back on `tx`.
@@ -1748,6 +1803,7 @@ async fn play_video_with<F, Fut>(
     playlist: &mut PlaylistState,
     video_id: &str,
     start_position: f64,
+    before_play: impl FnOnce(&mut PlaylistState),
     resolve: F,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -1772,6 +1828,7 @@ where
             playlist.current_title = info.title;
             playlist.current_duration = info.duration;
 
+            before_play(playlist);
             playlist.preroll.play_song(mpd, &info.stream_url).await?;
 
             if start_position > 0.0 {
@@ -2187,7 +2244,7 @@ mod preroll_wiring_tests {
         let resolve = |video_id: String, ctt: Option<String>, list_id: Option<String>| async move {
             innertube::resolve_stream(&video_id, ctt.as_deref(), list_id.as_deref(), None).await
         };
-        handle_command(cmd, &mut mpd, &state_tx, playlist, play_started, dial_state, &resolve)
+        handle_command(cmd, &mut mpd, &state_tx, playlist, play_started, dial_state, &resolve, &record_next, &[])
             .await
             .unwrap();
         drop(mpd);
@@ -2767,13 +2824,101 @@ mod preroll_wiring_tests {
             let result = resolved(&vid);
             async move { result }
         };
-        on_song_end(&mut mpd, &state_tx, playlist, play_started, senders, dial_state, &resolve).await;
+        on_song_end(&mut mpd, &state_tx, playlist, play_started, senders, dial_state, &resolve, &record_next).await;
         drop(mpd);
         let mut sent = Vec::new();
         while let Ok(msg) = state_rx.try_recv() {
             sent.push(msg);
         }
         (server.await.unwrap(), sent, asked.into_inner())
+    }
+
+    // The /next requests the glue under test asked for: (song, expected
+    // next, ctt, sender ids). Per test thread (current-thread runtime).
+    thread_local! {
+        static ASKED_NEXT: std::cell::RefCell<Vec<(String, String, String, Vec<String>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_next(job: PrefetchJob, sender_ids: &[String]) {
+        ASKED_NEXT.with(|asked| asked.borrow_mut().push((job.video_id, job.expected_next, job.ctt, sender_ids.to_vec())));
+    }
+
+    fn take_asked_next() -> Vec<(String, String, String, Vec<String>)> {
+        ASKED_NEXT.with(|asked| asked.take())
+    }
+
+    fn asked(song: &str, next: &str, ctt: &str, ids: &[&str]) -> (String, String, String, Vec<String>) {
+        (song.into(), next.into(), ctt.into(), strings(ids))
+    }
+
+    #[tokio::test]
+    async fn the_next_song_is_asked_for_before_mpd_starts_its_song() {
+        const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = queue_at(&dial_state, 0);
+        {
+            let _lock = global_pins_lock();
+            store_next_ctt(&mut playlist);
+        }
+        take_asked_next();
+        // MPD answers the Loading state, then never sees the song: /next was
+        // asked before MPD's play, which waits for the stream (and its nsig).
+        let (seen, _, _) =
+            song_end(&dial_state, &mut playlist, &mut true, &mut connected(&["phone"]), playable, vec![("status", STATUS)])
+                .await;
+        assert_eq!(seen, ["status"]);
+        assert_eq!(take_asked_next(), [asked("bbbbbbbbbbb", "ccccccccccc", "ctt-b", &["phone"])]);
+    }
+
+    #[tokio::test]
+    async fn a_cast_asks_for_its_next_song_before_mpd_starts_it_also_during_the_pre_roll() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 1.0\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        let mut playlist = PlaylistState { preroll: preroll::PreRoll::running(), ..PlaylistState::default() };
+        take_asked_next();
+        on_command_resolving(
+            &active, &dial_state, set_playlist_d("ctt-new"), &mut playlist, &mut false, &mut connected(&["phone"]),
+            playable, vec![("status", STATUS)],
+        )
+        .await;
+        assert_eq!(take_asked_next(), [asked("ddddddddddd", "eeeeeeeeeee", "ctt-new", &["phone"])]);
+
+        // A song without its own ctt asks nothing.
+        let mut playlist = PlaylistState::default();
+        let cast = lounge::PlayerCommand::SetPlaylist {
+            video_id: "ddddddddddd".into(),
+            video_ids: strings(&["ddddddddddd", "eeeeeeeeeee"]),
+            list_id: String::new(),
+            index: 0,
+            ctt: None,
+            params: None,
+            current_time: 0.0,
+            from_bind: false,
+        };
+        on_command_resolving(
+            &active, &dial_state, cast, &mut playlist, &mut false, &mut connected(&["phone"]), playable,
+            vec![("status", STATUS)],
+        )
+        .await;
+        assert!(take_asked_next().is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_answers_that_came_while_the_song_started_are_applied_before_its_end() {
+        let _lock = global_pins_lock();
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = cast_queue(&dial_state);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(next_answer(&playlist, "bbbbbbbbbbb", Some("ctt-b"))).await.unwrap();
+
+        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist), 1);
+        assert_eq!(playlist.tokens.auth_for("bbbbbbbbbbb").ctt.as_deref(), Some("ctt-b"));
+        assert_eq!(apply_pending_prefetches(&mut rx, &mut playlist), 0);
     }
 
     fn playable(vid: &str) -> innertube::Result<Option<innertube::StreamInfo>> {
@@ -3153,7 +3298,8 @@ mod preroll_wiring_tests {
             let result = resolved(&vid);
             async move { result }
         };
-        on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve).await;
+        on_command(cmd, &mut mpd, &state_tx, playlist, play_started, senders, dial_state, active, &resolve, &record_next)
+            .await;
         drop(mpd);
         let mut sent = Vec::new();
         while let Ok(msg) = state_rx.try_recv() {
@@ -3832,6 +3978,8 @@ mod preroll_wiring_tests {
                 let result = no_stream(&vid);
                 async move { result }
             },
+            &record_next,
+            &[],
         )
         .await
         .unwrap();
@@ -4023,7 +4171,7 @@ mod preroll_wiring_tests {
         let (state_tx, _state_rx) = tokio::sync::mpsc::channel(16);
         let asked = std::sync::Mutex::new(None);
 
-        let played = play_video_with(&mut mpd, &state_tx, &mut playlist, "bbbbbbbbbbb", 0.0, |vid, ctt, list| {
+        let played = play_video_with(&mut mpd, &state_tx, &mut playlist, "bbbbbbbbbbb", 0.0, |_| {}, |vid, ctt, list| {
             *asked.lock().unwrap() = Some((vid.clone(), ctt, list));
             async move {
                 Ok(Some(innertube::StreamInfo {

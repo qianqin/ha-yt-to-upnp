@@ -83,6 +83,36 @@ impl Challenge {
     }
 }
 
+/// The n challenge a prewarm solves: any value does, its answer is dropped.
+const PREWARM_N: &str = "ytcastPrewarmN00";
+
+/// Whether `player_hash`'s base.js is preprocessed already (memory or disk
+/// cache), so a song's solve need not parse it.
+pub fn is_prepared(player_hash: &str) -> bool {
+    is_prepared_at(player_hash, cache_path(player_hash).as_deref())
+}
+
+fn is_prepared_at(player_hash: &str, disk_cache: Option<&std::path::Path>) -> bool {
+    let in_memory = PREPROCESSED_CACHE.lock().unwrap().as_ref().map(|(hash, _)| hash.clone());
+    is_prepared_in(player_hash, in_memory.as_deref(), disk_cache)
+}
+
+/// `player_hash` is prepared if the memory cache holds its player
+/// (`in_memory`: the hash it holds) or its disk cache file exists.
+fn is_prepared_in(player_hash: &str, in_memory: Option<&str>, disk_cache: Option<&std::path::Path>) -> bool {
+    in_memory == Some(player_hash) || disk_cache.is_some_and(std::path::Path::exists)
+}
+
+/// Parse and preprocess base.js ahead of the first song (into the memory and
+/// disk caches), so that song does not wait for a cold parse.
+pub fn prewarm(player_js: &str, player_hash: &str) -> Result<(), String> {
+    prewarm_at(player_js, player_hash, cache_path(player_hash))
+}
+
+fn prewarm_at(player_js: &str, player_hash: &str, disk_cache: Option<PathBuf>) -> Result<(), String> {
+    decode_nsig_cached_at(player_js, PREWARM_N, player_hash, disk_cache).map(|_| ())
+}
+
 /// [`decode_nsig`] with an explicit disk cache file.
 pub fn decode_nsig_cached_at(
     player_js: &str,
@@ -525,6 +555,37 @@ mod tests {
 
         let cached = decode_nsig_cached_at("", "xyz", "test-synthetic-disk", Some(path));
         assert_eq!(cached.unwrap(), "zyx");
+    }
+
+    #[test]
+    fn a_prewarm_prepares_a_new_player_ahead_of_the_first_song() {
+        let tmp = TempDir::new("nsig-prewarm");
+        let path = tmp.path().join("nsig-preprocessed-prewarm.js");
+        assert!(!is_prepared_at("test-prewarm", Some(&path)));
+
+        prewarm_at(SYNTHETIC_PLAYER, "test-prewarm", Some(path.clone())).unwrap();
+
+        assert!(path.exists(), "preprocessed player cached on disk");
+        assert!(is_prepared_at("test-prewarm", Some(&path)));
+        // The first song then runs the preprocessed player.
+        assert_eq!(decode_nsig_cached_at("", "abc123", "test-prewarm", Some(path)).unwrap(), "321cba");
+    }
+
+    #[test]
+    fn a_player_is_prepared_only_for_its_own_hash() {
+        let tmp = TempDir::new("nsig-prepared");
+        let path = tmp.path().join("nsig-preprocessed-other.js");
+        assert!(!is_prepared_at("test-prepared-none", Some(&path)));
+        std::fs::write(&path, "preprocessed").unwrap();
+        assert!(is_prepared_at("test-prepared-none", Some(&path)), "a disk cache for the hash");
+        assert!(!is_prepared_at("test-prepared-none", None));
+    }
+
+    #[test]
+    fn a_player_in_the_memory_cache_is_prepared() {
+        assert!(is_prepared_in("abc", Some("abc"), None));
+        assert!(!is_prepared_in("abc", Some("other"), None));
+        assert!(!is_prepared_in("abc", None, None));
     }
 
     /// Limits far below what lib.js needs, so every attempt fails.
