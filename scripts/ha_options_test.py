@@ -252,7 +252,21 @@ class ReceiverGetsTheIdentityGeneration(unittest.TestCase):
         with open(os.path.join(ROOT, "scripts", "run-ha-app-local.sh")) as f:
             local = f.read()
         self.assertIn("--identity-generation) opts+=(identity_generation", local)
-        self.assertIn("YTCAST_IDENTITY_GENERATION", local)
+        self.assertIn('receiver_env+=(YTCAST_IDENTITY_GENERATION="$(option identity_generation)")', local)
+        start = [line for line in local.splitlines() if line.startswith("start receiver ")]
+        self.assertEqual(len(start), 1, start)
+        self.assertIn('${receiver_env[@]+"${receiver_env[@]}"}', start[0])
+
+    def test_local_run_writes_the_option_as_a_number(self):
+        # The heredoc that writes options.json, run as the script runs it.
+        with open(os.path.join(ROOT, "scripts", "run-ha-app-local.sh")) as f:
+            local = f.read()
+        program = re.search(r"<<'PY'\n(.*?)\nPY\n", local, re.S).group(1)
+        r = subprocess.run([sys.executable, "-I", "-", "identity_generation", "3", "max_volume", "40"],
+                           input=program, capture_output=True, text=True, check=True)
+        options = json.loads(r.stdout)
+        self.assertEqual(options["identity_generation"], 3)
+        self.assertEqual(options["max_volume"], 40)
 
 
 class CommandLine(unittest.TestCase):

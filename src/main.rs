@@ -625,8 +625,12 @@ async fn on_command<R, Fut>(
         playlist.sender_wait = None;
     }
     // The user took the cast back to the phone: end it as Stop would.
-    let taken_back = matches!(&cmd,
-        PlayerCommand::StoppedByUser { theme } if *active_theme.read().unwrap() == *theme);
+    let taken_back = match &cmd {
+        PlayerCommand::StoppedByUser { theme, device_id, nobody_left } if *active_theme.read().unwrap() == *theme => {
+            ended_this_cast(senders, device_id.as_deref(), *nobody_left)
+        }
+        _ => false,
+    };
     let last_left = match &cmd {
         PlayerCommand::RemoteConnected { theme, device_ids, name } => {
             tracing::info!(
@@ -664,7 +668,7 @@ async fn on_command<R, Fut>(
         cmd
     };
     // A sender left or was not listed, but another is still connected.
-    if !last_left && !taken_back {
+    if !last_left {
         return;
     }
     // The last sender left while the receiver waited for its pick.
@@ -1386,6 +1390,17 @@ fn is_stale_command(any_connected: bool, cmd: &lounge::PlayerCommand) -> bool {
 fn list_kind(list_id: &str) -> &str {
     let len = list_id.bytes().take(6).take_while(u8::is_ascii_uppercase).count();
     if len == 0 { "none" } else { &list_id[..len] }
+}
+
+/// Whether a user's end (StoppedByUser) ends this cast: nobody is listed
+/// any more, or the leaving device took part in the cast. A co-listener
+/// ending its own session leaves the cast to the others.
+fn ended_this_cast(senders: &senders::Senders, device_id: Option<&str>, nobody_left: bool) -> bool {
+    let took_part = device_id.is_some_and(|id| senders.took_part(&[id.to_owned()]));
+    if !nobody_left && !took_part {
+        tracing::info!("[player] A sender ended its own session (disconnected by the user); the cast goes on");
+    }
+    nobody_left || took_part
 }
 
 /// A sender's command that decides what plays (a pick, a step, play/pause,
@@ -4021,7 +4036,11 @@ mod preroll_wiring_tests {
             // [loungeStatus(iPad no longer listed, DISCONNECTED_BY_USER), remoteDisconnected(iPad)].
             let still_listed = strings(still);
             let batch = [
-                lounge::PlayerCommand::StoppedByUser { theme: "m".into() },
+                lounge::PlayerCommand::StoppedByUser {
+                    theme: "m".into(),
+                    device_id: Some("ipad".into()),
+                    nobody_left: still.is_empty(),
+                },
                 lounge::PlayerCommand::SendersListed { theme: "m".into(), device_ids: still_listed, unidentified: 0 },
                 disconnect("ipad"),
             ];
@@ -4041,13 +4060,48 @@ mod preroll_wiring_tests {
     }
 
     #[tokio::test]
+    async fn a_co_listener_ending_its_cast_does_not_stop_the_cast() {
+        const STATUS: &str = "state: stop\nvolume: 50\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        // The phone casts; the iPad, never part of this cast, ends its own
+        // session by the user while the phone stays listed.
+        let ended = |nobody_left| lounge::PlayerCommand::StoppedByUser {
+            theme: "m".into(),
+            device_id: Some("ipad".into()),
+            nobody_left,
+        };
+        let mut playlist = queue_at(&dial_state, 1);
+        let mut play_started = true;
+        let mut senders = connected(&["phone"]);
+        let (seen, _) = on_command_with(&dial_state, ended(false), &mut playlist, &mut play_started, &mut senders, vec![]).await;
+        assert!(seen.is_empty(), "{seen:?}");
+        assert!(play_started);
+        assert_eq!(playlist.video_ids.len(), 3);
+
+        // Nobody listed any more: it stops whoever it was.
+        let script = vec![("stop", "OK\n"), ("clear", "OK\n"), ("status", STATUS)];
+        let (seen, _) =
+            on_command_with(&dial_state, ended(true), &mut playlist, &mut play_started, &mut senders, script).await;
+        assert_eq!(seen, ["stop", "clear", "status"]);
+        assert!(playlist.video_ids.is_empty());
+
+        // Without a device to check and others listed: nothing stops.
+        let mut playlist = queue_at(&dial_state, 1);
+        let unknown = lounge::PlayerCommand::StoppedByUser { theme: "m".into(), device_id: None, nobody_left: false };
+        let (seen, _) = on_command_with(&dial_state, unknown, &mut playlist, &mut true, &mut senders, vec![]).await;
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
     async fn the_user_ending_another_themes_cast_changes_nothing() {
         let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
         let dial_state = dial::DialState::for_tests(preroll_tx);
         let mut playlist = queue_at(&dial_state, 1);
         let mut play_started = true;
         let mut senders = connected(&["phone"]);
-        let cmd = lounge::PlayerCommand::StoppedByUser { theme: "cl".into() };
+        let cmd =
+            lounge::PlayerCommand::StoppedByUser { theme: "cl".into(), device_id: Some("phone".into()), nobody_left: true };
         let (seen, _) = on_command_with(&dial_state, cmd, &mut playlist, &mut play_started, &mut senders, vec![]).await;
         assert!(seen.is_empty(), "{seen:?}");
         assert!(play_started);
