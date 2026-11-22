@@ -44,12 +44,31 @@ pub struct DialState {
     pub yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
     pub screen_id: String,
-    /// Last `/stream` request that failed: (video_id, reason). Lets the
+    /// Last `/stream` request that failed: (video_id, failure). Lets the
     /// player tell a failed stream from a song that ended, since MPD just
     /// stops in both cases.
-    pub stream_failure: std::sync::Mutex<Option<(String, String)>>,
+    pub stream_failure: std::sync::Mutex<Option<(String, StreamFailure)>>,
     /// Caps the endless `/silence` streams open at once.
     pub silence_slots: SilenceSlots,
+}
+
+/// Why a song's stream failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamFailure {
+    /// The stream could not be served.
+    Failed(String),
+    /// The song, streamed without a ctt, was given up at YouTube's throttle
+    /// (`sabr::stream::ThrottledWithoutCtt`).
+    ThrottledWithoutCtt,
+}
+
+impl std::fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamFailure::Failed(reason) => f.write_str(reason),
+            StreamFailure::ThrottledWithoutCtt => f.write_str("stalled at YouTube's throttle without a ctt"),
+        }
+    }
 }
 
 impl DialState {
@@ -57,7 +76,12 @@ impl DialState {
     /// failure on success: MPD plays one stream at a time, so it is stale.
     fn note_stream_result(&self, video_id: &str, result: std::result::Result<(), String>) {
         *self.stream_failure.lock().unwrap() =
-            result.err().map(|reason| (video_id.to_owned(), reason));
+            result.err().map(|reason| (video_id.to_owned(), StreamFailure::Failed(reason)));
+    }
+
+    /// `video_id`'s stream was given up at the throttle while it played.
+    fn note_throttled(&self, video_id: &str) {
+        *self.stream_failure.lock().unwrap() = Some((video_id.to_owned(), StreamFailure::ThrottledWithoutCtt));
     }
 
     /// `video_id`'s own ctt: none for any other video than the one it was
@@ -71,14 +95,14 @@ impl DialState {
             .map(|(_, ctt)| ctt.clone())
     }
 
-    /// Takes the recorded failure; returns its reason if it was for `video_id`.
-    pub fn take_stream_failure(&self, video_id: &str) -> Option<String> {
+    /// Takes the recorded failure; returns it if it was for `video_id`.
+    pub fn take_stream_failure(&self, video_id: &str) -> Option<StreamFailure> {
         self.stream_failure
             .lock()
             .unwrap()
             .take()
             .filter(|(vid, _)| vid == video_id)
-            .map(|(_, reason)| reason)
+            .map(|(_, failure)| failure)
     }
 }
 
@@ -441,8 +465,8 @@ async fn stream_audio(
         return (StatusCode::BAD_REQUEST, "invalid video id").into_response();
     }
 
-    serve_stream(&state, &video_id, &request_headers, |video_id, ctt, yt_session, start| async move {
-        crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session, start).await
+    serve_stream(&state, &video_id, &request_headers, |video_id, ctt, yt_session, start, on_throttled| async move {
+        crate::sabr::stream::stream_audio(&video_id, ctt.as_deref(), yt_session, start, on_throttled).await
     })
     .await
 }
@@ -456,19 +480,30 @@ type StreamResult = std::result::Result<
 /// `open` (the real one is `sabr::stream::stream_audio`), and its result is
 /// framed (200, 206, or 416 past the end).
 async fn serve_stream<F, Fut>(
-    state: &DialState,
+    state: &Arc<DialState>,
     video_id: &str,
     request_headers: &HeaderMap,
     open: F,
 ) -> Response
 where
-    F: FnOnce(String, Option<String>, Option<Arc<crate::music_session::YtMusicSession>>, u64) -> Fut,
+    F: FnOnce(
+        String,
+        Option<String>,
+        Option<Arc<crate::music_session::YtMusicSession>>,
+        u64,
+        crate::sabr::stream::OnThrottled,
+    ) -> Fut,
     Fut: std::future::Future<Output = StreamResult>,
 {
     let ctt = state.ctt_for(video_id);
     let yt_session = state.yt_session.clone();
     let start = range_start(request_headers);
-    match open(video_id.to_owned(), ctt, yt_session, start).await {
+    let on_throttled: crate::sabr::stream::OnThrottled = {
+        let state = state.clone();
+        let video_id = video_id.to_owned();
+        Box::new(move || state.note_throttled(&video_id))
+    };
+    match open(video_id.to_owned(), ctt, yt_session, start, on_throttled).await {
         Ok((info, rx)) => {
             if start == 0 {
                 state.note_stream_result(video_id, Ok(()));
@@ -823,7 +858,7 @@ mod tests {
     async fn range_request_reaches_the_stream_and_is_answered_206() {
         let state = test_state();
         let seen = std::sync::Mutex::new(None);
-        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |video_id, _, _, start| {
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |video_id, _, _, start, _| {
             *seen.lock().unwrap() = Some((video_id, start));
             async move {
                 let (tx, rx) = mpsc::channel(1);
@@ -845,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn range_past_the_end_is_416_and_no_song_failure() {
         let state = test_state();
-        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=1000-"), |_, _, _, _| async {
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=1000-"), |_, _, _, _, _| async {
             let err: crate::sabr::stream::SabrError =
                 Box::new(crate::sabr::stream::RangeNotSatisfiable { content_length: 1000 });
             Err(err)
@@ -860,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_seek_is_500_but_no_song_failure() {
         let state = test_state();
-        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |_, _, _, _| async {
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &range("bytes=400-"), |_, _, _, _, _| async {
             Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("no media via url".into())
         })
         .await;
@@ -868,7 +903,7 @@ mod tests {
         assert!(state.stream_failure.lock().unwrap().is_none());
 
         // The same failure at byte 0 is the song failing.
-        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, _| async {
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, _, _| async {
             Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("no media via url".into())
         })
         .await;
@@ -882,7 +917,7 @@ mod tests {
         *state.ctt.write().unwrap() = Some(("dQw4w9WgXcQ".to_owned(), "ctt-first".to_owned()));
         let seen = std::sync::Mutex::new(Vec::new());
         for video_id in ["dQw4w9WgXcQ", "bbbbbbbbbbb"] {
-            serve_stream(&state, video_id, &HeaderMap::new(), |_, ctt, _, _| {
+            serve_stream(&state, video_id, &HeaderMap::new(), |_, ctt, _, _, _| {
                 seen.lock().unwrap().push(ctt);
                 async { Err::<(crate::sabr::stream::SabrStreamInfo, mpsc::Receiver<bytes::Bytes>), _>("x".into()) }
             })
@@ -892,9 +927,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_song_given_up_at_the_throttle_is_recorded_for_its_video() {
+        let state = test_state();
+        let report = std::sync::Mutex::new(None);
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, _, on_throttled| {
+            *report.lock().unwrap() = Some(on_throttled);
+            async {
+                let (_tx, rx) = mpsc::channel(1);
+                Ok((fake_info(Some(1000), 0), rx))
+            }
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*state.stream_failure.lock().unwrap(), None, "the song started");
+
+        // The SABR loop gives the song up later, while MPD plays it.
+        (report.lock().unwrap().take().expect("handed to the stream"))();
+        assert_eq!(state.take_stream_failure("dQw4w9WgXcQ"), Some(StreamFailure::ThrottledWithoutCtt));
+    }
+
+    #[tokio::test]
     async fn whole_song_request_starts_at_zero_and_is_200() {
         let state = test_state();
-        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, start| async move {
+        let resp = serve_stream(&state, "dQw4w9WgXcQ", &HeaderMap::new(), |_, _, _, start, _| async move {
             assert_eq!(start, 0);
             let (_tx, rx) = mpsc::channel(1);
             Ok((fake_info(Some(1000), 0), rx))
@@ -970,7 +1025,7 @@ mod tests {
     fn stream_failure_is_taken_once_for_its_video() {
         let state = test_state();
         state.note_stream_result("aaaaaaaaaaa", Err("nsig decode failed".into()));
-        assert_eq!(state.take_stream_failure("aaaaaaaaaaa").as_deref(), Some("nsig decode failed"));
+        assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), Some(StreamFailure::Failed("nsig decode failed".into())));
         assert_eq!(state.take_stream_failure("aaaaaaaaaaa"), None);
     }
 

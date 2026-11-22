@@ -1604,13 +1604,18 @@ async fn sabr_request_cycle(
 ///
 /// Requests go through `credential_client()` so that redirects cannot carry
 /// the ctt or tokens off Google hosts.
+/// Called when the SABR stream gives its song up at the throttle without a
+/// ctt (see `ThrottledWithoutCtt`), before the stream's body ends.
+pub type OnThrottled = Box<dyn FnOnce() + Send + 'static>;
+
 pub async fn stream_audio(
     video_id: &str,
     ctt: Option<&str>,
     yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     start_offset: u64,
+    on_throttled: OnThrottled,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
-    stream_audio_in(pins::global(), video_id, ctt, yt_session, start_offset).await
+    stream_audio_in(pins::global(), video_id, ctt, yt_session, start_offset, on_throttled).await
 }
 
 /// Forget every pinned format: the cast ended or changed hands, and a pin
@@ -1626,6 +1631,7 @@ async fn stream_audio_in(
     ctt: Option<&str>,
     yt_session: Option<std::sync::Arc<crate::music_session::YtMusicSession>>,
     start_offset: u64,
+    on_throttled: OnThrottled,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     let started = std::time::Instant::now();
     // Pins made by this request must not outlive a cast change during it.
@@ -1725,14 +1731,25 @@ async fn stream_audio_in(
             ustreamer_config, client_config, session_version, gvs_po_token, &tx, &mut reloader, started,
         ).await;
 
-        match result {
-            Ok(()) => tracing::info!("[sabr] streaming complete"),
-            Err(e) => tracing::error!("[sabr] streaming error: {}", e),
-        }
+        // Reported before tx goes, so the song's end already sees it.
+        report_stream_end(result, on_throttled);
         // tx is dropped here, closing the channel.
     });
 
     Ok((info, rx))
+}
+
+/// Log how a SABR stream ended; a song given up at the throttle without a
+/// ctt is reported through `on_throttled`.
+fn report_stream_end(result: Result<(), SabrError>, on_throttled: OnThrottled) {
+    match result {
+        Ok(()) => tracing::info!("[sabr] streaming complete"),
+        Err(e) if e.is::<ThrottledWithoutCtt>() => {
+            tracing::warn!("[sabr] streaming given up: {}", e);
+            on_throttled();
+        }
+        Err(e) => tracing::error!("[sabr] streaming error: {}", e),
+    }
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -2301,6 +2318,8 @@ enum ReloadReason<'a> {
 /// Fetches a fresh /player response for the streaming song.
 trait PlayerReloader {
     fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a>;
+    /// Whether the song streams with its own ctt (WEB_REMIX), not anonymously.
+    fn has_ctt(&self) -> bool;
 }
 
 /// The client the song's first /player call used, which a reload repeats.
@@ -2360,6 +2379,10 @@ impl HttpReloader {
 }
 
 impl PlayerReloader for HttpReloader {
+    fn has_ctt(&self) -> bool {
+        matches!(self.client, ReloadClient::WebRemix { .. })
+    }
+
     fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
         Box::pin(async move {
             let req = self.player_request(reason)?;
@@ -2417,6 +2440,28 @@ const MAX_STALLED_REQUESTS: u32 = 30;
 
 /// Resumes per song after a stall; each costs a /player call and a PoToken.
 const MAX_STALL_RESUMES_PER_SONG: u32 = 3;
+
+/// A song without a ctt stalled at the throttle (stream_protection_status 2
+/// or 3): a fresh anonymous /player gets the same throttle, so it is given
+/// up instead of resumed.
+#[derive(Debug)]
+pub struct ThrottledWithoutCtt {
+    pub reached_ms: i64,
+}
+
+impl std::fmt::Display for ThrottledWithoutCtt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "throttled at {}ms without a ctt", self.reached_ms)
+    }
+}
+
+impl std::error::Error for ThrottledWithoutCtt {}
+
+/// Whether YouTube throttles this stream: attestation pending (2, ~60 s of
+/// media) or required (3).
+fn throttled(state: &SabrState) -> bool {
+    state.stats.protection_statuses.iter().any(|status| matches!(status, 2 | 3))
+}
 
 /// Answer a stall: point the stream at a fresh /player response with a
 /// fresh PoToken and go on from the reached position (buffered ranges,
@@ -2513,6 +2558,13 @@ async fn drive_loop(
         if state.audio_downloaded_ms == prev_progress && prev_progress > 0 {
             stall_count += 1;
             if stall_count > MAX_STALLED_REQUESTS {
+                if !reloader.has_ctt() && throttled(state) {
+                    tracing::warn!(
+                        "[sabr] stalled at {}ms for {} requests (stream_protection_status {:?}) without a ctt; no resume, the song is given up",
+                        state.audio_downloaded_ms, stall_count, state.stats.protection_statuses,
+                    );
+                    return Err(Box::new(ThrottledWithoutCtt { reached_ms: state.audio_downloaded_ms }));
+                }
                 if !resume_after_stall(state, reloader, stall_count).await {
                     break;
                 }
@@ -2575,6 +2627,11 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// No throttle report wanted.
+    fn no_report() -> OnThrottled {
+        Box::new(|| {})
+    }
 
     #[test]
     fn trusted_google_host_check() {
@@ -3251,7 +3308,7 @@ mod tests {
         let logs = crate::storage::test_util::LogCapture::start();
         let (store, seen) = pin_local("seekvideo01", 200, song_content()).await;
 
-        let (info, rx) = stream_audio_in(&store, "seekvideo01", Some(CAST), None, 1500).await.unwrap();
+        let (info, rx) = stream_audio_in(&store, "seekvideo01", Some(CAST), None, 1500, no_report()).await.unwrap();
 
         assert_eq!((info.start_offset, info.content_length), (1500, Some(3000)));
         assert_eq!(info.mime_type, AAC);
@@ -3267,7 +3324,7 @@ mod tests {
         // No session and no reachable /player: only the pin can serve this.
         let (store, seen) = pin_local("seekvideo05", 200, song_content()).await;
 
-        let (info, rx) = within_2s("byte-0 reopen", stream_audio_in(&store, "seekvideo05", Some(CAST), None, 0))
+        let (info, rx) = within_2s("byte-0 reopen", stream_audio_in(&store, "seekvideo05", Some(CAST), None, 0, no_report()))
             .await
             .unwrap();
 
@@ -3281,7 +3338,7 @@ mod tests {
     async fn a_pin_of_another_cast_is_not_used_and_is_dropped() {
         let (store, seen) = pin_local("seekvideo06", 200, song_content()).await;
 
-        let err = stream_audio_in(&store, "seekvideo06", Some("CTT-OF-ANOTHER-CAST"), None, 1500).await.unwrap_err();
+        let err = stream_audio_in(&store, "seekvideo06", Some("CTT-OF-ANOTHER-CAST"), None, 1500, no_report()).await.unwrap_err();
 
         assert!(err.to_string().contains("no pinned format"), "{err}");
         assert!(seen.lock().unwrap().is_empty());
@@ -3292,7 +3349,7 @@ mod tests {
     async fn a_failing_pinned_seek_is_an_error_not_another_format() {
         let (store, seen) = pin_local("seekvideo02", 403, vec![0; 3000]).await;
 
-        let err = stream_audio_in(&store, "seekvideo02", Some(CAST), None, 1500).await.unwrap_err();
+        let err = stream_audio_in(&store, "seekvideo02", Some(CAST), None, 1500, no_report()).await.unwrap_err();
 
         assert!(err.to_string().contains("HTTP 403"), "{err}");
         let lines = seen.lock().unwrap().clone();
@@ -3305,7 +3362,7 @@ mod tests {
     async fn a_seek_past_the_end_is_not_satisfiable() {
         let (store, seen) = pin_local("seekvideo03", 200, vec![0; 3000]).await;
 
-        let err = stream_audio_in(&store, "seekvideo03", Some(CAST), None, 3000).await.unwrap_err();
+        let err = stream_audio_in(&store, "seekvideo03", Some(CAST), None, 3000, no_report()).await.unwrap_err();
 
         assert_eq!(err.downcast_ref::<RangeNotSatisfiable>().map(|e| e.content_length), Some(3000));
         assert!(seen.lock().unwrap().is_empty());
@@ -3314,7 +3371,7 @@ mod tests {
     #[tokio::test]
     async fn a_seek_without_a_pin_fails_without_a_player_call() {
         let store = Arc::new(pins::PinStore::default());
-        let err = stream_audio_in(&store, "nopinvideo1", Some(CAST), None, 1500).await.unwrap_err();
+        let err = stream_audio_in(&store, "nopinvideo1", Some(CAST), None, 1500, no_report()).await.unwrap_err();
         assert!(err.to_string().contains("no pinned format"), "{err}");
     }
 
@@ -3502,7 +3559,7 @@ mod tests {
         let seen = spawn_ranges(listener, song_content(), 200);
         test_support::pin_global("globalpin02", CAST, &format!("http://{addr}/videoplayback?itag=141"), 3000);
 
-        let (info, rx) = stream_audio("globalpin02", Some(CAST), None, 1500).await.unwrap();
+        let (info, rx) = stream_audio("globalpin02", Some(CAST), None, 1500, no_report()).await.unwrap();
 
         assert_eq!(info.start_offset, 1500);
         assert_eq!(drain(rx).await, song_content()[1500..]);
@@ -3516,7 +3573,7 @@ mod tests {
         let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
         let (store, seen) = pin_local("longvideo01", 200, content.clone()).await;
 
-        let (_info, rx) = stream_audio_in(&store, "longvideo01", Some(CAST), None, 1500).await.unwrap();
+        let (_info, rx) = stream_audio_in(&store, "longvideo01", Some(CAST), None, 1500, no_report()).await.unwrap();
         // Four minutes pass before the next ranges are fetched...
         store.age("longvideo01", std::time::Duration::from_secs(4 * 60));
         assert_eq!(drain(rx).await, content[1500..]);
@@ -3975,6 +4032,10 @@ mod tests {
     }
 
     impl PlayerReloader for FakeReloader {
+        fn has_ctt(&self) -> bool {
+            true
+        }
+
         fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
             let ReloadReason::Requested { token } = reason else {
                 panic!("only server-requested reloads expected, got {reason:?}");
@@ -4184,6 +4245,10 @@ mod tests {
     async fn reload_fetch_failure_ends_the_stream() {
         struct FailingReloader;
         impl PlayerReloader for FailingReloader {
+            fn has_ctt(&self) -> bool {
+                true
+            }
+
             fn fetch<'a>(&'a mut self, _reason: ReloadReason<'a>) -> ReloadFuture<'a> {
                 Box::pin(async { Err("reload needs WEB_REMIX".into()) })
             }
@@ -4236,9 +4301,15 @@ mod tests {
     struct StallReloader {
         reasons: Vec<String>,
         fail: bool,
+        /// The song has its own ctt (WEB_REMIX); else an anonymous client.
+        ctt: bool,
     }
 
     impl PlayerReloader for StallReloader {
+        fn has_ctt(&self) -> bool {
+            self.ctt
+        }
+
         fn fetch<'a>(&'a mut self, reason: ReloadReason<'a>) -> ReloadFuture<'a> {
             self.reasons.push(format!("{reason:?}"));
             let fail = self.fail;
@@ -4278,7 +4349,7 @@ mod tests {
         let logs = crate::storage::test_util::LogCapture::start();
         let (mut state, tx, mut rx) = stalled_stream();
         let mut cycle = StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() };
-        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false, ctt: true };
 
         drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
 
@@ -4295,6 +4366,73 @@ mod tests {
         assert!(text.contains("resuming with a fresh /player and PoToken (1/3)"), "{text}");
         assert!(!text.contains("giving up"), "{text}");
         assert!(!text.contains("secret") && !text.contains("fresh-potoken"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_throttle_stall_without_a_ctt_gives_the_song_up_without_a_resume() {
+        for status in [2, 3] {
+            let logs = crate::storage::test_util::LogCapture::start();
+            let (mut state, tx, _rx) = stalled_stream();
+            state.stats.protection_statuses = vec![1, status];
+            let mut cycle = StallingCycle { requests: 0, resumed: |_| false, tx: tx.clone() };
+            let mut reloader = StallReloader { reasons: Vec::new(), fail: false, ctt: false };
+
+            let err = drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap_err();
+
+            assert!(err.is::<ThrottledWithoutCtt>(), "{err}");
+            assert!(reloader.reasons.is_empty(), "no fresh /player: {:?}", reloader.reasons);
+            assert_eq!(cycle.requests, 1 + MAX_STALLED_REQUESTS + 1);
+            let text = logs.text();
+            assert!(text.contains("stalled at 60001ms"), "{text}");
+            assert!(text.contains("without a ctt"), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_a_song_given_up_at_the_throttle_is_reported() {
+        let ends: [(&str, Result<(), SabrError>, bool); 3] = [
+            ("complete", Ok(()), false),
+            ("error", Err("SABR failed after 5 retries".into()), false),
+            ("throttled", Err(Box::new(ThrottledWithoutCtt { reached_ms: 60_001 })), true),
+        ];
+        for (name, result, reported) in ends {
+            let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = called.clone();
+            report_stream_end(result, Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)));
+            assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), reported, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_stalls_resume_as_before() {
+        // (the song's ctt, its stream_protection_status values)
+        for (ctt, statuses) in [(false, vec![]), (false, vec![1]), (true, vec![2]), (true, vec![3])] {
+            let (mut state, tx, _rx) = stalled_stream();
+            state.stats.protection_statuses = statuses.clone();
+            let mut cycle = StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() };
+            let mut reloader = StallReloader { reasons: Vec::new(), fail: false, ctt };
+
+            drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
+
+            assert_eq!(reloader.reasons, vec!["Stalled"], "ctt={ctt} {statuses:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_song_streamed_with_its_ctt_has_one_for_a_resume() {
+        let session = std::sync::Arc::new(crate::music_session::test_fixtures::session());
+        let with = HttpReloader {
+            http: reqwest::Client::new(),
+            video_id: "aaaaaaaaaaa".into(),
+            client: ReloadClient::WebRemix { ctt: "ctt".into(), session },
+        };
+        let without = HttpReloader {
+            http: reqwest::Client::new(),
+            video_id: "aaaaaaaaaaa".into(),
+            client: ReloadClient::Anonymous(&IOS_CLIENT),
+        };
+        assert!(with.has_ctt());
+        assert!(!without.has_ctt());
     }
 
     #[test]
@@ -4316,7 +4454,7 @@ mod tests {
         let logs = crate::storage::test_util::LogCapture::start();
         let (mut state, tx, _rx) = stalled_stream();
         let mut cycle = StallingCycle { requests: 0, resumed: |_| false, tx: tx.clone() };
-        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false, ctt: true };
 
         drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
 
@@ -4334,7 +4472,7 @@ mod tests {
         let logs = crate::storage::test_util::LogCapture::start();
         let (mut state, tx, _rx) = stalled_stream();
         let mut cycle = StallingCycle { requests: 0, resumed: |_| false, tx: tx.clone() };
-        let mut reloader = StallReloader { reasons: Vec::new(), fail: true };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: true, ctt: true };
 
         drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
 
@@ -4359,7 +4497,7 @@ mod tests {
             sent: Vec::new(),
             inner: StallingCycle { requests: 0, resumed: |s| s.server_url == RELOADED_URL, tx: tx.clone() },
         };
-        let mut reloader = StallReloader { reasons: Vec::new(), fail: false };
+        let mut reloader = StallReloader { reasons: Vec::new(), fail: false, ctt: true };
 
         drive_loop(&mut state, &tx, &mut cycle, &mut reloader).await.unwrap();
 

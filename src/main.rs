@@ -889,7 +889,20 @@ async fn on_song_end<R, Fut>(
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
 {
     *play_started = false;
-    let mut failure = dial_state.take_stream_failure(&current_video_id(playlist));
+    let failure = dial_state.take_stream_failure(&current_video_id(playlist));
+    // A song given up at the throttle without a ctt: a connected phone,
+    // told it ended, picks the next one with its own ctt. Skipping here as
+    // well would skip twice.
+    if failure == Some(dial::StreamFailure::ThrottledWithoutCtt) && senders.any_connected() {
+        tracing::warn!(
+            "[player] {} (index {}) stalled at YouTube's throttle without a ctt; reported as ended, the sender picks the next song",
+            current_video_id(playlist), playlist.current_index
+        );
+        playlist.last_state = messages::PlayerState::Stopped;
+        state_tx.send(song_ended_message(playlist)).await.ok();
+        return;
+    }
+    let mut failure = failure.map(|failure| failure.to_string());
     loop {
         let ended_vid = current_video_id(playlist);
         let ended_index = playlist.current_index;
@@ -2793,7 +2806,8 @@ mod preroll_wiring_tests {
         for failed in [false, true] {
             let fail = |playlist: &PlaylistState| {
                 if failed {
-                    *dial_state.stream_failure.lock().unwrap() = Some((current_video_id(playlist), "UNPLAYABLE".into()));
+                    *dial_state.stream_failure.lock().unwrap() =
+                        Some((current_video_id(playlist), dial::StreamFailure::Failed("UNPLAYABLE".into())));
                 }
             };
             let mut playlist = queue_at(&dial_state, 2);
@@ -2814,6 +2828,46 @@ mod preroll_wiring_tests {
             assert_eq!(playlist.video_ids.len(), 3, "failed={failed}: the connected sender's cast stays");
             assert_eq!(playlist.tokens.auth_for("aaaaaaaaaaa"), auth("ctt-a"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_song_given_up_at_the_throttle_is_ended_for_the_phone_or_skipped_unattended() {
+        const STATUS: &str = "state: play\nvolume: 50\nelapsed: 0.0\nOK\n";
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let throttled = |playlist: &PlaylistState| {
+            *dial_state.stream_failure.lock().unwrap() =
+                Some((current_video_id(playlist), dial::StreamFailure::ThrottledWithoutCtt));
+        };
+
+        // With a sender: the song is reported as ended, the phone picks the
+        // next one (with its own ctt); the receiver does not skip itself.
+        let mut playlist = queue_at(&dial_state, 0);
+        playlist.current_duration = 200;
+        throttled(&playlist);
+        let mut play_started = true;
+        let (seen, sent, asked) =
+            song_end(&dial_state, &mut playlist, &mut play_started, &mut connected(&["phone"]), playable, vec![]).await;
+        assert!(seen.is_empty() && asked.is_empty(), "{seen:?} {asked:?}");
+        assert!(!play_started);
+        assert_eq!((playlist.current_index, playlist.failed_in_row), (0, 0));
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].command, "onStateChange");
+        assert_eq!(arg(&sent[0], "state"), Some("0"));
+        assert_eq!(arg(&sent[0], "currentTime"), Some(messages::fmt_time(200.0).as_str()));
+        assert_eq!(playlist.video_ids.len(), 3, "the cast stays");
+
+        // Unattended: a failed track, skipped as such.
+        let mut playlist = queue_at(&dial_state, 0);
+        throttled(&playlist);
+        let mut play_started = true;
+        let script = vec![("status", STATUS), ("clear", "OK\n"), ("add", "OK\n"), ("play", "OK\n"), ("status", STATUS)];
+        let (_, sent, asked) =
+            song_end(&dial_state, &mut playlist, &mut play_started, &mut departed(&["phone"]), playable, script).await;
+        assert_eq!(asked, ["bbbbbbbbbbb"]);
+        assert!(play_started);
+        assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1));
+        assert_eq!(arg(&sent[0], "state"), Some(messages::PlayerState::Idle.as_str()), "reported as failed");
     }
 
     #[tokio::test]
