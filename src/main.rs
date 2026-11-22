@@ -40,6 +40,9 @@ struct PlaylistState {
     preroll: preroll::PreRoll,
     /// Tracks in a row whose stream failed (see `stop_action`).
     failed_in_row: u32,
+    /// A song given up at the throttle was reported ended to the sender,
+    /// which should pick the next one; past this the receiver skips it.
+    sender_wait: Option<tokio::time::Instant>,
 }
 
 impl Default for PlaylistState {
@@ -55,6 +58,7 @@ impl Default for PlaylistState {
             last_state: messages::PlayerState::Idle,
             preroll: preroll::PreRoll::default(),
             failed_in_row: 0,
+            sender_wait: None,
         }
     }
 }
@@ -527,6 +531,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 stop_preroll(&mut mpd_client, &mut playlist, &mut play_started, "timed out without a song").await;
             }
 
+            // No sender picked the next song after a throttled one
+            _ = preroll_expired(playlist.sender_wait) => {
+                advance_for_silent_sender(
+                    &mut mpd_client, &state_tx, &mut playlist, &mut play_started, &mut senders, &dial_state,
+                    &resolve, &ask_next,
+                ).await;
+            }
+
             // Position reporting + keepalive (every 3s)
             //
             // Always queries MPD status to keep the command connection alive
@@ -608,6 +620,9 @@ async fn on_command<R, Fut>(
     Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
 {
     use lounge::PlayerCommand;
+    if picks_a_song(&cmd) {
+        playlist.sender_wait = None;
+    }
     // The user took the cast back to the phone: end it as Stop would.
     let taken_back = matches!(&cmd,
         PlayerCommand::StoppedByUser { theme } if *active_theme.read().unwrap() == *theme);
@@ -649,6 +664,13 @@ async fn on_command<R, Fut>(
     };
     // A sender left or was not listed, but another is still connected.
     if !last_left && !taken_back {
+        return;
+    }
+    // The last sender left while the receiver waited for its pick.
+    if playlist.sender_wait.is_some()
+        && matches!(cmd, PlayerCommand::RemoteDisconnected { .. } | PlayerCommand::SendersListed { .. })
+    {
+        advance_for_silent_sender(mpd, state_tx, playlist, play_started, senders, dial_state, resolve, ask_next).await;
         return;
     }
     // After a rebind listed nobody, a cast from a later poll is a sender
@@ -972,9 +994,60 @@ async fn on_song_end<R, Fut>(
         );
         playlist.last_state = messages::PlayerState::Stopped;
         state_tx.send(song_ended_message(playlist)).await.ok();
+        playlist.sender_wait = Some(tokio::time::Instant::now() + SENDER_PICK_WAIT);
         return;
     }
-    let mut failure = failure.map(|failure| failure.to_string());
+    let failure = failure.map(|failure| failure.to_string());
+    end_song(mpd, state_tx, playlist, play_started, senders, dial_state, resolve, ask_next, failure).await;
+}
+
+/// How long a sender may take to pick the next song after a song given up
+/// at the throttle was reported ended to it.
+const SENDER_PICK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The sender picked no next song in time after a song given up at the
+/// throttle (or left meanwhile): the receiver skips the song itself, as a
+/// failed track, as it would unattended.
+#[allow(clippy::too_many_arguments)]
+async fn advance_for_silent_sender<R, Fut>(
+    mpd: &mut mpd::MpdClient,
+    state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
+    playlist: &mut PlaylistState,
+    play_started: &mut bool,
+    senders: &mut senders::Senders,
+    dial_state: &dial::DialState,
+    resolve: R,
+    ask_next: &AskNext,
+) where
+    R: Fn(String, Option<String>, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
+{
+    playlist.sender_wait = None;
+    tracing::warn!(
+        "[player] no sender picked the song after {} (index {}); skipping it",
+        current_video_id(playlist), playlist.current_index
+    );
+    let failure = Some(dial::StreamFailure::ThrottledWithoutCtt.to_string());
+    end_song(mpd, state_tx, playlist, play_started, senders, dial_state, resolve, ask_next, failure).await;
+}
+
+/// After a song: advance, skip a failed one (`failure`), or end the queue
+/// (see `on_song_end`).
+#[allow(clippy::too_many_arguments)]
+async fn end_song<R, Fut>(
+    mpd: &mut mpd::MpdClient,
+    state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
+    playlist: &mut PlaylistState,
+    play_started: &mut bool,
+    senders: &mut senders::Senders,
+    dial_state: &dial::DialState,
+    resolve: R,
+    ask_next: &AskNext,
+    mut failure: Option<String>,
+) where
+    R: Fn(String, Option<String>, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = innertube::Result<Option<innertube::StreamInfo>>>,
+{
     loop {
         let ended_vid = current_video_id(playlist);
         let ended_index = playlist.current_index;
@@ -1148,6 +1221,7 @@ fn forget_queue(playlist: &mut PlaylistState, play_started: &mut bool, dial_stat
     playlist.list_id.clear();
     playlist.current_title.clear();
     playlist.current_duration = 0;
+    playlist.sender_wait = None;
 }
 
 /// A cast that played on without a sender stopped (queue end, failed
@@ -1311,6 +1385,24 @@ fn is_stale_command(any_connected: bool, cmd: &lounge::PlayerCommand) -> bool {
 fn list_kind(list_id: &str) -> &str {
     let len = list_id.bytes().take(6).take_while(u8::is_ascii_uppercase).count();
     if len == 0 { "none" } else { &list_id[..len] }
+}
+
+/// A sender's command that decides what plays (a pick, a step, play/pause,
+/// seek, stop, a queue edit), unlike a query or its comings and goings.
+fn picks_a_song(cmd: &lounge::PlayerCommand) -> bool {
+    use lounge::PlayerCommand;
+    matches!(
+        cmd,
+        PlayerCommand::SetPlaylist { .. }
+            | PlayerCommand::SetVideo { .. }
+            | PlayerCommand::Next
+            | PlayerCommand::Previous
+            | PlayerCommand::Play
+            | PlayerCommand::Pause
+            | PlayerCommand::SeekTo { .. }
+            | PlayerCommand::Stop
+            | PlayerCommand::UpdatePlaylist { .. }
+    )
 }
 
 /// A setPlaylist / setVideo replayed in the receiver's own bind response.
@@ -1841,7 +1933,8 @@ async fn start_preroll(
     }
 }
 
-/// Resolves when the pre-roll's deadline passes; never without a pre-roll.
+/// Resolves once `deadline` passes; never without one (the pre-roll's, or
+/// the wait for a sender's pick).
 async fn preroll_expired(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -3180,6 +3273,131 @@ mod preroll_wiring_tests {
         assert!(play_started);
         assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1));
         assert_eq!(arg(&sent[0], "state"), Some(messages::PlayerState::Idle.as_str()), "reported as failed");
+    }
+
+    /// The fallback for a sender that picked no next song, against a
+    /// scripted MPD; returns the MPD commands and the songs resolved.
+    async fn silent_sender_fallback(
+        dial_state: &Arc<dial::DialState>,
+        playlist: &mut PlaylistState,
+        play_started: &mut bool,
+        senders: &mut senders::Senders,
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Vec<String>, Vec<String>) {
+        let _lock = global_pins_lock();
+        let (port, server) = fake_mpd(script).await;
+        let mut mpd = mpd::MpdClient::connect("127.0.0.1", port).await.unwrap();
+        let (state_tx, _state_rx) = tokio::sync::mpsc::channel(32);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolve = |vid: String, _, _| {
+            asked.borrow_mut().push(vid.clone());
+            let result = playable(&vid);
+            async move { result }
+        };
+        advance_for_silent_sender(&mut mpd, &state_tx, playlist, play_started, senders, dial_state, &resolve, &record_next)
+            .await;
+        drop(mpd);
+        (server.await.unwrap(), asked.into_inner())
+    }
+
+    /// A queue whose first song was given up at the throttle with a sender
+    /// connected: the receiver waits for the sender's pick.
+    async fn waiting_for_the_sender(dial_state: &Arc<dial::DialState>) -> PlaylistState {
+        let mut playlist = queue_at(dial_state, 0);
+        *dial_state.stream_failure.lock().unwrap() =
+            Some((current_video_id(&playlist), dial::StreamFailure::ThrottledWithoutCtt));
+        let before = tokio::time::Instant::now();
+        song_end(dial_state, &mut playlist, &mut true, &mut connected(&["phone"]), playable, vec![]).await;
+        let wait = playlist.sender_wait.expect("waiting for the sender");
+        assert!(wait >= before + SENDER_PICK_WAIT && wait <= tokio::time::Instant::now() + SENDER_PICK_WAIT);
+        playlist
+    }
+
+    const PLAYING: &str = "state: play\nvolume: 50\nelapsed: 0.0\nOK\n";
+
+    fn plays() -> Vec<(&'static str, &'static str)> {
+        vec![("status", PLAYING), ("clear", "OK\n"), ("add", "OK\n"), ("play", "OK\n"), ("status", PLAYING)]
+    }
+
+    #[tokio::test]
+    async fn a_sender_picking_the_next_song_in_time_ends_the_wait_without_a_skip() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        let mut playlist = waiting_for_the_sender(&dial_state).await;
+        let mut play_started = false;
+        on_command_resolving(
+            &active, &dial_state, lounge::PlayerCommand::Next, &mut playlist, &mut play_started,
+            &mut connected(&["phone"]), playable, plays(),
+        )
+        .await;
+        assert_eq!(playlist.sender_wait, None);
+        assert!(play_started);
+        assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 0), "the phone's pick, no skip of ours");
+    }
+
+    #[tokio::test]
+    async fn queries_do_not_end_the_wait_for_the_senders_pick() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = waiting_for_the_sender(&dial_state).await;
+        for query in [lounge::PlayerCommand::GetVolume, lounge::PlayerCommand::GetPlaylist] {
+            let script = vec![("status", STATUS_STOP)];
+            on_command_with(&dial_state, query, &mut playlist, &mut false, &mut connected(&["phone"]), script).await;
+        }
+        assert!(playlist.sender_wait.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_silent_sender_has_the_receiver_skip_the_throttled_song() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = waiting_for_the_sender(&dial_state).await;
+        let mut play_started = false;
+        let (seen, asked) =
+            silent_sender_fallback(&dial_state, &mut playlist, &mut play_started, &mut connected(&["phone"]), plays())
+                .await;
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert_eq!(asked, ["bbbbbbbbbbb"]);
+        assert!(play_started);
+        assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1), "a failed track");
+        assert_eq!(playlist.sender_wait, None);
+    }
+
+    #[tokio::test]
+    async fn a_silent_sender_after_failed_tracks_ends_an_unattended_cast() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let mut playlist = waiting_for_the_sender(&dial_state).await;
+        playlist.failed_in_row = MAX_FAILED_IN_ROW - 1;
+        let mut play_started = false;
+        let (seen, asked) = silent_sender_fallback(
+            &dial_state, &mut playlist, &mut play_started, &mut departed(&["phone"]),
+            vec![("stop", "OK\n"), ("clear", "OK\n")],
+        )
+        .await;
+        assert_eq!(seen, ["stop", "clear"], "3 in a row: the cast ends");
+        assert!(asked.is_empty());
+        assert!(playlist.video_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sender_leaving_while_the_receiver_waits_for_its_pick_plays_on_unattended() {
+        let (preroll_tx, _) = tokio::sync::mpsc::channel(1);
+        let dial_state = dial::DialState::for_tests(preroll_tx);
+        let active = std::sync::RwLock::new("m".to_owned());
+        let mut playlist = waiting_for_the_sender(&dial_state).await;
+        let mut play_started = false;
+        let mut senders = connected(&["phone"]);
+        let (seen, _) = on_command_resolving(
+            &active, &dial_state, disconnect("phone"), &mut playlist, &mut play_started, &mut senders, playable, plays(),
+        )
+        .await;
+        assert_eq!(seen.len(), 5, "the next song plays, the queue is not forgotten: {seen:?}");
+        assert!(play_started);
+        assert_eq!((playlist.current_index, playlist.failed_in_row), (1, 1));
+        assert_eq!(playlist.video_ids.len(), 3);
+        assert_eq!(playlist.sender_wait, None);
     }
 
     #[tokio::test]
